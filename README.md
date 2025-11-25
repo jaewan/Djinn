@@ -1,17 +1,4 @@
 # Djinn
-The user wants me to:
-1. Explain Djinn and why it's a Tensor Operating System
-2. Explain memory management in detail
-3. Walk through a sample dry run of an application to show the end-to-end lifecycle
-
-This is a great request - it will help consolidate all the concepts we've discussed into a coherent narrative with a concrete example.
-
-Let me structure this as:
-1. What is Djinn? (high-level)
-2. Why is it a Tensor OS? (the OS argument)
-3. Memory Management in Detail (VMU, Text/Data/Stack)
-4. End-to-End Dry Run (step by step)
-# Djinn: A Complete Technical Walkthrough
 
 ## Part 1: What is Djinn?
 
