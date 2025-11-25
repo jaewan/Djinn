@@ -2,11 +2,9 @@
 
 ## Part 1: What is Djinn?
 
-### 1.1 The One-Sentence Definition
-
 **Djinn is a Tensor Operating System that makes remote GPU clusters feel like local GPUs by exploiting semantic knowledge about tensor lifecycles.**
 
-### 1.2 The Problem Djinn Solves
+### 1.1 The Problem Djinn Solves
 
 Modern GPU clusters are like 1960s mainframes: expensive, centralized, and shared among many users. Current solutions fail in two ways:
 
@@ -19,7 +17,7 @@ Djinn operates at the **framework layer** (PyTorch), which is the unique point w
 - We have **semantic knowledge** (what tensors mean)
 - We have **generality** (works for any PyTorch model)
 
-### 1.3 The Core Insight
+### 1.2 The Core Insight
 
 ```
 Traditional OS: Manages bytes (pages, heap, stack)
