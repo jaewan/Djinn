@@ -17,6 +17,8 @@ import statistics
 import sys
 import threading
 import time
+import uuid
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -311,6 +313,9 @@ async def generate_turn_remote(
     tokenizer,
     prompt_text: str,
     args: argparse.Namespace,
+    *,
+    session_id: Optional[str] = None,
+    finalize_session: bool = False,
 ) -> Dict[str, Any]:
     """Remote execution path for a single turn."""
     encoded = tokenizer(
@@ -330,6 +335,8 @@ async def generate_turn_remote(
         input_ids,
         args.max_new_tokens,
         args,
+        session_id=session_id,
+        finalize_session=finalize_session,
     )
     total_ms = (time.perf_counter() - start) * 1000.0
 
@@ -358,6 +365,8 @@ async def _remote_generate_sequence(
     prompt_ids: torch.Tensor,
     new_tokens: int,
     args: argparse.Namespace,
+    session_id: Optional[str] = None,
+    finalize_session: bool = False,
 ) -> tuple[torch.Tensor, int, int]:
     """Generate sequence token-by-token using remote execution."""
     generated = prompt_ids.clone()
@@ -368,12 +377,11 @@ async def _remote_generate_sequence(
         return generated, bytes_sent, bytes_received
 
     import djinn
-    import uuid
-    
+
     semantic_aware = getattr(args, 'semantic_aware', True)
     semantic_session_enabled = getattr(args, 'semantic_use_session', True)
     can_persist = semantic_aware and semantic_session_enabled
-    decode_session_id = f"decode_{uuid.uuid4().hex[:12]}" if can_persist else None
+    active_session_id = session_id or (f"decode_{uuid.uuid4().hex[:12]}" if can_persist else None)
 
     with torch.no_grad():
         for token_idx in range(new_tokens):
@@ -399,15 +407,20 @@ async def _remote_generate_sequence(
             
             bytes_sent += bytes_of_tensor(inputs["input_ids"])
 
+            context = nullcontext()
             if semantic_aware:
-                with djinn.session(
-                    phase=phase,
-                    priority="normal",
-                    session_id=decode_session_id if can_persist else None,
-                    expected_tokens=new_tokens - token_idx,
-                ):
-                    result = await manager.execute_model(model, inputs)
-            else:
+                session_kwargs = {
+                    "phase": phase,
+                    "priority": "normal",
+                    "expected_tokens": new_tokens - token_idx,
+                }
+                if can_persist and active_session_id:
+                    session_kwargs["session_id"] = active_session_id
+                if finalize_session and token_idx == new_tokens - 1 and active_session_id:
+                    session_kwargs["session_finalize"] = True
+                context = djinn.session(**session_kwargs)
+
+            with context:
                 result = await manager.execute_model(model, inputs)
             
             logits = _extract_logits_from_result(result)
@@ -431,11 +444,30 @@ async def run_dialogue_remote(
     turn_records: List[Dict[str, Any]] = []
     run_start = time.perf_counter()
 
+    semantic_session_id: Optional[str] = None
+    total_assistant_turns = sum(
+        1 for msg in conversation_template if msg["role"] == "assistant" and not msg.get("content")
+    )
+    generated_turn_idx = 0
+    can_persist = getattr(args, "semantic_aware", True) and getattr(args, "semantic_use_session", True)
+    if can_persist:
+        semantic_session_id = f"conversation_{uuid.uuid4().hex[:12]}"
+
     for msg in conversation_template:
         history.append({"role": msg["role"], "content": msg.get("content", "")})
         if msg["role"] == "assistant" and not msg.get("content"):
+            generated_turn_idx += 1
             prompt_text = build_prompt(history[:-1])  # exclude current placeholder
-            result = await generate_turn_remote(manager, model, tokenizer, prompt_text, args)
+            finalize_session = can_persist and (generated_turn_idx == total_assistant_turns)
+            result = await generate_turn_remote(
+                manager,
+                model,
+                tokenizer,
+                prompt_text,
+                args,
+                session_id=semantic_session_id,
+                finalize_session=finalize_session,
+            )
             history[-1]["content"] = result["generated_text"]
             turn_records.append(
                 {

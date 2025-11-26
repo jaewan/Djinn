@@ -206,6 +206,7 @@ class ModelExecutionSerializer:
             'stage_options': metadata.get('stage_options'),
             'session_id': metadata.get('session_id'),
             'state_handle': metadata.get('state_handle'),
+            'session_finalize': metadata.get('session_finalize'),
             # Phase 3: Extract semantic hints from metadata
             'execution_phase': metadata.get('execution_phase'),
             'priority': metadata.get('priority'),

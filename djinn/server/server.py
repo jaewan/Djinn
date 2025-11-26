@@ -1894,6 +1894,8 @@ class DjinnServer:
         session_id = extras.get('session_id')
         if session_id:
             request['_session_id'] = session_id
+        if extras.get('session_finalize'):
+            request['_session_finalize'] = bool(extras.get('session_finalize'))
 
     def _ensure_request_id(self, request: Dict) -> None:
         """Attach a request identifier if the client did not supply one."""
@@ -2061,6 +2063,8 @@ class DjinnServer:
             else:
                 logger.info(f"🚀 Executing model {fingerprint[:8]} via HybridExecutor (v2.3)...")
             
+            session_finalize = bool(request.get('_session_finalize'))
+            session_id: Optional[str] = None
             # Get v2.3 components
             if logger.isEnabledFor(logging.DEBUG):
                 try:
@@ -2083,21 +2087,17 @@ class DjinnServer:
             # Get or reuse session
             session_mgr = get_session_manager()
             # For semantic phases, reuse client-provided session_id to persist state
-            if execution_phase in ('decode', 'prefill') and session_id_from_client:
-                session_id = session_id_from_client
-                if session_id not in session_mgr.sessions:
-                    logger.debug(f"Creating session {session_id[:12]} for phase {execution_phase}")
-                    with session_mgr.lock:
-                        from .session_manager import SessionLease
-                        lease = SessionLease(
-                            session_id=session_id,
-                            created_at=time.time(),
-                            last_heartbeat=time.time(),
-                            timeout_secs=session_mgr.heartbeat_timeout_secs
-                        )
-                        session_mgr.sessions[session_id] = lease
-                        session_mgr.stats['sessions_created'] += 1
+            phase_alias = (execution_phase or "").lower()
+            decode_phases = {'decode', 'llm_decode'}
+            prefill_phases = {'prefill', 'llm_prefill'}
+            if phase_alias in decode_phases.union(prefill_phases) and session_id_from_client:
+                if session_id_from_client not in session_mgr.sessions:
+                    logger.debug(f"Creating session {session_id_from_client[:12]} for phase {execution_phase}")
+                    session_id = session_mgr.create_session(
+                        session_id=session_id_from_client,
+                    )
                 else:
+                    session_id = session_id_from_client
                     logger.debug(f"Reusing session {session_id[:12]} for phase {execution_phase}")
             else:
                 session_id = session_mgr.create_session()
@@ -2106,7 +2106,7 @@ class DjinnServer:
             kv_session = None
             gpu_index = self.capabilities.gpu_indices[0] if (self.capabilities and self.capabilities.gpu_indices) else 0
 
-            if execution_phase in ('prefill', 'decode') and session_id:
+            if phase_alias in prefill_phases.union(decode_phases) and session_id:
                 kv_manager = get_kv_session_manager()
                 kv_session = await kv_manager.get_or_create(session_id, gpu_index)
                 if execution_phase == 'decode' and kv_session.kv_cache is not None:
@@ -2186,6 +2186,13 @@ class DjinnServer:
                 'status': 'error',
                 'message': str(e)
             }
+        finally:
+            if session_finalize and session_id:
+                try:
+                    session_mgr.kill_session(session_id)
+                    logger.debug(f"Session {session_id[:12]} finalized per client request")
+                except Exception as cleanup_exc:
+                    logger.warning(f"Failed to finalize session {session_id}: {cleanup_exc}")
     
     def _sanitize_result_payload(self, result):
         """
