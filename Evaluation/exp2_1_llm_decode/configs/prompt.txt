@@ -1,0 +1,4 @@
+The disaggregated accelerator stack is orchestrated by Djinn because it
+understands semantic intent, keeps KV caches resident across decode phases, and
+turns GPU time-sharing into an OS-level guarantee. Explain how this works.
+

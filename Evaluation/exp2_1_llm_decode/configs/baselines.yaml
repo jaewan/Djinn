@@ -1,0 +1,61 @@
+# Baseline definitions for Experiment 2.1 (LLM decode with KV cache)
+# Values map directly onto Djinn server/client knobs documented in
+# docs/EvaluationPlan.md and djinn/config.py.
+
+defaults:
+  runs: 30
+  prompt_tokens: 72
+  new_tokens: 50
+  batch_size: 1
+  prompt_file: configs/prompt.txt
+  tokenizer_padding: "max_length"
+  transport_bandwidth_gbps: 25
+  result_dir: "Evaluation/exp2_1_llm_decode/results"
+
+baselines:
+  - name: native_pytorch
+    type: local
+    model_id: "meta-llama/Llama-2-7b-hf"
+    device: "cuda:0"
+    dtype: "float16"
+    notes: "Upper bound: run everything locally with HuggingFace generate()."
+
+  - name: semantic_blind
+    type: djinn_remote
+    server_config:
+      enable_phase_detection: false
+      enable_stateful_caching: false
+      enable_kv_persistence: false
+      enable_plan_cache: false
+      enable_skeletonization: false
+      enable_vmu: true
+      transport: "network"
+    notes: "Djinn infrastructure w/ semantics disabled. Used to show worst-case."
+
+  - name: partially_aware
+    type: djinn_remote
+    server_config:
+      enable_phase_detection: false
+      enable_stateful_caching: false
+      enable_kv_persistence: true
+      enable_plan_cache: true
+      enable_skeletonization: true
+      enable_vmu: true
+      transport: "network"
+    notes: "Caches model + skeletonization but no KV awareness."
+
+  - name: full_djinn
+    type: djinn_remote
+    server_config:
+      enable_phase_detection: true
+      enable_stateful_caching: true
+      enable_kv_persistence: true
+      enable_plan_cache: true
+      enable_skeletonization: true
+      enable_vmu: true
+      transport: "network"
+      qos:
+        qos_class: "realtime"
+        deadline_ms: 10
+    notes: "Target configuration with all semantic features enabled."
+

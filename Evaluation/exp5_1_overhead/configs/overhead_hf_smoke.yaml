@@ -1,0 +1,43 @@
+experiment:
+  device: "cuda:0"
+  dtype: "float16"
+  runs: 2
+  warmup_runs: 1
+  tag: "hf_smoke"
+  result_dir: "Evaluation/exp5_1_overhead/results"
+  reference_baseline: "native_pytorch"
+  blind_baseline: "semantic_blind"
+  target_baseline: "full_djinn"
+
+workloads:
+  - name: hf_tiny_gpt2
+    category: sequential
+    implementation: hf_causal_lm
+    params:
+      model_id: "sshleifer/tiny-gpt2"
+      prompt_text: "Djinn keeps KV caches remote while preserving semantic intent."
+      prompt_length: 64
+      new_tokens: 32
+      batch_size: 1
+      unit_name: "tokens"
+      generation:
+        do_sample: false
+        temperature: 0.0
+        top_p: 1.0
+
+baselines:
+  - name: native_pytorch
+    type: local_synthetic
+    notes: "HuggingFace causal LM running locally (upper bound)."
+
+  - name: semantic_blind
+    type: remote_djinn
+    semantic_aware: false
+    notes: "Djinn remote execution with semantics disabled (high latency + bandwidth)"
+
+  - name: full_djinn
+    type: remote_djinn
+    semantic_aware: true
+    notes: "Djinn remote execution with full semantics (low data, optimized)"
+
+

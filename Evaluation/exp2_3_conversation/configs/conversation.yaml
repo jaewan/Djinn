@@ -1,0 +1,35 @@
+experiment:
+  model_id: "microsoft/DialoGPT-small"
+  max_new_tokens_per_turn: 64
+  temperature: 0.0
+  top_p: 1.0
+  do_sample: false
+  device: "cuda:0"
+  dtype: "float16"
+  conversation_file: "Evaluation/exp2_3_conversation/prompts/conversation.json"
+  result_dir: "Evaluation/exp2_3_conversation/results"
+  runs: 30
+  warmup_runs: 3
+  seed: 1234
+
+baselines:
+  - name: native_pytorch
+    type: local
+    notes: "Upper bound."
+  - name: semantic_blind
+    type: djinn_remote
+    server_config:
+      enable_phase_detection: false
+      enable_stateful_caching: false
+      enable_kv_persistence: false
+      enable_plan_cache: false
+      enable_skeletonization: false
+  - name: full_djinn
+    type: djinn_remote
+    server_config:
+      enable_phase_detection: true
+      enable_stateful_caching: true
+      enable_kv_persistence: true
+      enable_plan_cache: true
+      enable_skeletonization: true
+

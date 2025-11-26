@@ -1,0 +1,97 @@
+experiment:
+  device: "cuda:0"
+  dtype: "float16"
+  runs: 2
+  warmup_runs: 1
+  tag: "smoke"
+  djinn_server_address: "localhost:5556"
+  reference_baseline: "native_pytorch"
+  blind_baseline: "semantic_blind"
+  target_baseline: "full_djinn"
+  result_file: "Evaluation/exp6_1_generality/results/smoke.json"
+
+baselines:
+  - name: native_pytorch
+    type: local_synthetic
+    notes: "Upper bound"
+
+  - name: semantic_blind
+    type: remote_djinn
+    semantic_aware: false
+    notes: "Djinn remote execution with semantics disabled"
+
+  - name: full_djinn
+    type: remote_djinn
+    semantic_aware: true
+    notes: "Djinn remote execution with full semantics"
+
+workload_groups:
+  - name: sequential
+    description: "LLM decode / streaming ASR"
+    workloads:
+      - name: seq_llama_like
+        category: sequential
+        implementation: synthetic_transformer
+        params:
+          batch_size: 1
+          sequence_length: 640
+          hidden_size: 2048
+          num_layers: 16
+          num_heads: 16
+          ff_size: 8192
+          unit_name: "tokens"
+      - name: seq_audio_like
+        category: sequential
+        implementation: synthetic_transformer
+        params:
+          batch_size: 2
+          sequence_length: 1024
+          hidden_size: 1024
+          num_layers: 8
+          num_heads: 8
+          ff_size: 4096
+          unit_name: "frames"
+
+  - name: parallel
+    description: "Vision inference / stateless batching"
+    workloads:
+      - name: par_resnet_like
+        category: parallel
+        implementation: synthetic_cnn
+        params:
+          batch_size: 32
+          in_channels: 3
+          image_size: 224
+          channels: [64, 128, 256, 256]
+          num_classes: 1000
+          unit_name: "images"
+      - name: par_vit_like
+        category: parallel
+        implementation: synthetic_cnn
+        params:
+          batch_size: 16
+          in_channels: 3
+          image_size: 384
+          channels: [96, 192, 384]
+          num_classes: 1000
+          unit_name: "images"
+
+  - name: hybrid
+    description: "Multimodal (e.g., CLIP)"
+    workloads:
+      - name: hybrid_clip_like
+        category: hybrid
+        implementation: synthetic_hybrid
+        params:
+          batch_size: 8
+          in_channels: 3
+          image_size: 224
+          channels: [64, 128]
+          hidden_size: 512
+          num_layers: 4
+          num_heads: 8
+          ff_size: 2048
+          num_classes: 1024
+          unit_name: "image_tokens"
+
+

@@ -1,0 +1,68 @@
+# Streaming audio experiment defaults.
+
+experiment:
+  model_id: "openai/whisper-large-v3"
+  sample_rate: 16000
+  chunk_seconds: 5.0
+  stride_seconds: 1.0
+  total_duration_seconds: 30.0
+  language: "en"
+  task: "transcribe"
+  temperature: 0.0
+  beam_size: 1
+  prompt: ""
+  tokenizer_padding: "max_length"
+
+io:
+  audio_file: "Evaluation/exp2_2_streaming_audio/data/long_sample.wav"
+  result_dir: "Evaluation/exp2_2_streaming_audio/results"
+  chunk_manifest: "Evaluation/exp2_2_streaming_audio/results/chunk_manifest.jsonl"
+
+nvml:
+  enabled: true
+  interval_seconds: 0.02
+
+baselines:
+  shared:
+    runs: 30
+    warmup_runs: 3
+  entries:
+    - name: native_pytorch
+      type: local
+      device: "cuda:0"
+      dtype: "float16"
+      notes: "Upper bound local inference."
+    - name: semantic_blind
+      type: djinn_remote
+      server_config:
+        enable_phase_detection: false
+        enable_stateful_caching: false
+        enable_kv_persistence: false
+        enable_plan_cache: false
+        enable_skeletonization: false
+        enable_vmu: true
+        transport: "network"
+    - name: partially_aware
+      type: djinn_remote
+      server_config:
+        enable_phase_detection: false
+        enable_stateful_caching: false
+        enable_kv_persistence: true
+        enable_plan_cache: true
+        enable_skeletonization: true
+        enable_vmu: true
+        transport: "network"
+    - name: full_djinn
+      type: djinn_remote
+      server_config:
+        enable_phase_detection: true
+        enable_stateful_caching: true
+        enable_kv_persistence: true
+        enable_plan_cache: true
+        enable_skeletonization: true
+        enable_vmu: true
+        transport: "network"
+        qos:
+          qos_class: "realtime"
+          deadline_ms: 10
+

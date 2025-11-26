@@ -1,0 +1,71 @@
+experiment:
+  device: "cuda:0"
+  dtype: "float16"
+  runs: 3
+  warmup_runs: 1
+  tag: "smoke"
+  result_dir: "Evaluation/exp5_1_overhead/results"
+  djinn_server_address: "localhost:5556"
+  reference_baseline: "native_pytorch"
+  blind_baseline: "semantic_blind"
+  target_baseline: "full_djinn"
+
+workloads:
+  - name: llama_like
+    category: sequential
+    implementation: synthetic_transformer
+    params:
+      batch_size: 1
+      sequence_length: 512
+      hidden_size: 2048
+      num_layers: 12
+      num_heads: 16
+      ff_size: 8192
+      unit_name: "tokens"
+
+  - name: bert_like
+    category: encoder
+    implementation: synthetic_transformer
+    params:
+      batch_size: 8
+      sequence_length: 256
+      hidden_size: 1024
+      num_layers: 6
+      num_heads: 8
+      ff_size: 4096
+      unit_name: "tokens"
+
+  - name: vit_like
+    category: vision
+    implementation: synthetic_cnn
+    params:
+      batch_size: 16
+      in_channels: 3
+      image_size: 224
+      channels: [64, 128, 256]
+      num_classes: 1000
+      unit_name: "images"
+
+baselines:
+  - name: native_pytorch
+    type: local_synthetic
+    notes: "Upper bound – pure PyTorch execution"
+
+  - name: semantic_blind
+    type: scaling
+    relative_to: native_pytorch
+    latency_scale: 5.0
+    input_scale: 40.0
+    output_scale: 40.0
+    notes: "Placeholder for Djinn semantics disabled (high latency + bandwidth). NOTE: Synthetic workloads cannot execute remotely - use overhead_hf_smoke.yaml for real remote execution with HuggingFace models."
+
+  - name: full_djinn
+    type: scaling
+    relative_to: native_pytorch
+    latency_scale: 1.05
+    input_scale: 0.02
+    output_scale: 0.02
+    latency_offset_ms: 1.0
+    notes: "Placeholder for Djinn full semantics (low data, slight framework overhead). NOTE: Synthetic workloads cannot execute remotely - use overhead_hf_smoke.yaml for real remote execution with HuggingFace models."
+
+

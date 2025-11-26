@@ -1,0 +1,20 @@
+[
+  {"role": "system", "content": "You are Djinn, a semantic-aware tensor OS engineer."},
+  {"role": "user", "content": "Hey Djinn, can you remind me what makes your GPU time-sharing different?"},
+  {"role": "assistant", "content": ""},
+  {"role": "user", "content": "How do you keep KV caches around between conversational turns?"},
+  {"role": "assistant", "content": ""},
+  {"role": "user", "content": "What happens if another tenant interrupts my session?"},
+  {"role": "assistant", "content": ""},
+  {"role": "user", "content": "Does the VMU help with streaming audio workloads too?"},
+  {"role": "assistant", "content": ""},
+  {"role": "user", "content": "Explain phase detection like I'm new to disaggregation."},
+  {"role": "assistant", "content": ""},
+  {"role": "user", "content": "What's the biggest bottleneck you see today?"},
+  {"role": "assistant", "content": ""},
+  {"role": "user", "content": "How does QoS keep realtime sessions responsive?"},
+  {"role": "assistant", "content": ""},
+  {"role": "user", "content": "Wrap it up with a quick summary for our exec team."},
+  {"role": "assistant", "content": ""}
+]
+

@@ -1,0 +1,36 @@
+experiment:
+  device: "cpu"
+  dtype: "float32"
+  runs: 2
+  warmup_runs: 1
+  tag: "hf_vision_smoke"
+  result_dir: "Evaluation/exp5_1_overhead/results"
+  reference_baseline: "native_pytorch"
+  blind_baseline: "semantic_blind"
+  target_baseline: "full_djinn"
+
+workloads:
+  - name: hf_vit_small
+    category: vision
+    implementation: hf_vision
+    params:
+      model_id: "google/vit-base-patch16-224-in21k"
+      image_size: 224
+      batch_size: 4
+      unit_name: "images"
+
+baselines:
+  - name: native_pytorch
+    type: local_synthetic
+    notes: "HuggingFace ViT running locally (upper bound)."
+
+  - name: semantic_blind
+    type: remote_djinn
+    semantic_aware: false
+    notes: "Djinn remote execution with semantics disabled."
+
+  - name: full_djinn
+    type: remote_djinn
+    semantic_aware: true
+    notes: "Djinn remote execution with semantic hints enabled."
+

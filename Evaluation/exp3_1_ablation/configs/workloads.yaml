@@ -1,0 +1,16 @@
+workloads:
+  llama7b_decode:
+    model_id: "meta-llama/Llama-2-7b-hf"
+    type: "llm"
+    prompt_tokens: 72
+    new_tokens: 50
+    batch_size: 1
+    description: "LLM decode hero workload"
+
+  resnet50_batch:
+    model_id: "resnet50"
+    type: "vision"
+    batch_size: 32
+    input_shape: [32, 3, 224, 224]
+    description: "Vision batch inference"
+

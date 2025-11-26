@@ -1,0 +1,70 @@
+experiment:
+  name: "phase4_smoke_test"
+  description: "Quick smoke test of Phase 4 load test infrastructure"
+  duration_seconds: 120  # 2 minutes for adequate sampling
+  djinn_server_address: "localhost:5556"
+
+  # Adjusted SLA to match realistic workloads
+  sla:
+    p99_latency_ms: 4000
+    error_rate: 0.05
+    gpu_utilization: 0.05
+
+user_classes:
+  llm_users:
+    count: 8
+    percentage: 60
+    workload:
+      implementation: hf_causal_lm
+      params:
+        model_id: "sshleifer/tiny-gpt2"
+        prompt_text: "Djinn orchestrates disaggregated accelerators."
+        prompt_length: 64
+        new_tokens: 24
+        batch_size: 1
+        unit_name: "tokens"
+    request_pattern:
+      requests_per_minute: 20
+      burst_probability: 0.15
+    
+  vision_users:
+    count: 4
+    percentage: 30
+    workload:
+      implementation: hf_vision
+      params:
+        model_id: "microsoft/resnet-50"
+        batch_size: 4
+        image_size: 224
+        unit_name: "images"
+      semantic_hints:
+        phase: "vision"
+        priority: "interactive"
+    request_pattern:
+      requests_per_minute: 12
+      burst_probability: 0.05
+    
+  multimodal_users:
+    count: 2
+    percentage: 10
+    workload:
+      implementation: hf_multimodal
+      params:
+        model_id: "openai/clip-vit-base-patch32"
+        batch_size: 1
+        image_size: 224
+        text_length: 77
+        unit_name: "pairs"
+        execution_mode: "classification"
+      semantic_hints:
+        phase: "vision"
+        priority: "interactive"
+        kv_cache_size_mb: 0
+    request_pattern:
+      requests_per_minute: 6
+      burst_probability: 0.02
+
+metrics:
+  collection_interval_seconds: 0.5
+  output_file: "Evaluation/phase4_load_test/results/smoke_test_{timestamp}.json"
+

@@ -1,0 +1,33 @@
+model:
+  name: "sshleifer/tiny-gpt2"
+  tokenizer: "sshleifer/tiny-gpt2"
+  prompt_path: "Evaluation/exp2_1_llm_decode/configs/prompt.txt"
+  new_tokens: 10
+
+arrival:
+  request_rate_per_user: 1.0   # req/sec
+  arrival_process: "poisson"
+
+load_levels:
+  - concurrency: 1
+  - concurrency: 2
+  - concurrency: 4
+  - concurrency: 8
+  - concurrency: 16
+  - concurrency: 32
+  - concurrency: 64
+
+metrics:
+  latency_percentiles: [50, 90, 99]
+  track_gpu_utilization: true
+  track_memory_bw: true
+
+driver_defaults:
+  synthetic:
+    base_latency_ms: 15
+    saturation_concurrency: 16
+    max_gpu_util_pct: 86
+  djinn:
+    qos_class: "interactive"
+    deadline_ms: 50
+

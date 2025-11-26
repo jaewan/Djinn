@@ -1,0 +1,70 @@
+# Component toggles for Experiment 3.1.
+
+defaults:
+  transport: "network"
+  qos_class: "interactive"
+  deadline_ms: null
+  enable_vmu: true
+
+configurations:
+  full_djinn:
+    description: "Reference system (all semantic features on)."
+    enable_phase_detection: true
+    enable_stateful_caching: true
+    enable_kv_persistence: true
+    enable_plan_cache: true
+    enable_skeletonization: true
+
+  no_vmu:
+    description: "VMU disabled; fall back to cudaMalloc."
+    enable_phase_detection: true
+    enable_stateful_caching: true
+    enable_kv_persistence: true
+    enable_plan_cache: true
+    enable_skeletonization: true
+    enable_vmu: false
+
+  no_phase_detection:
+    description: "Disable phase detection (prefill/decode treated uniformly)."
+    enable_phase_detection: false
+    enable_stateful_caching: true
+    enable_kv_persistence: true
+    enable_plan_cache: true
+    enable_skeletonization: true
+
+  no_stateful_caching:
+    description: "Disable KV cache persistence."
+    enable_phase_detection: true
+    enable_stateful_caching: false
+    enable_kv_persistence: false
+    enable_plan_cache: true
+    enable_skeletonization: true
+
+  no_plan_cache:
+    description: "Always recompute plans."
+    enable_phase_detection: true
+    enable_stateful_caching: true
+    enable_kv_persistence: true
+    enable_plan_cache: false
+    enable_skeletonization: true
+
+  no_skeletonization:
+    description: "Materialize full tensors back to host."
+    enable_phase_detection: true
+    enable_stateful_caching: true
+    enable_kv_persistence: true
+    enable_plan_cache: true
+    enable_skeletonization: false
+
+run_plan:
+  workloads:
+    - llama7b_decode
+    - resnet50_batch
+  configurations:
+    - full_djinn
+    - no_skeletonization
+    - no_stateful_caching
+    - no_phase_detection
+    - no_vmu
+    - no_plan_cache
+

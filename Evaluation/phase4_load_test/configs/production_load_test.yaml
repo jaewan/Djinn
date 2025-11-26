@@ -1,0 +1,90 @@
+experiment:
+  name: "phase4_production_load_test"
+  description: "Production load test with real workloads for OSDI evaluation"
+  duration_seconds: 3600  # 1 hour
+  djinn_server_address: "localhost:5556"
+  
+  # SLA targets (from redesign plan)
+  sla:
+    p99_latency_ms: 100
+    error_rate: 0.01  # <1%
+    gpu_utilization: 0.80  # >80%
+
+# User mix: 60% LLM, 30% Vision, 10% Multimodal (from redesign plan)
+user_classes:
+  llm_users:
+    count: 60
+    percentage: 60
+    workload:
+      implementation: hf_causal_lm
+      params:
+        model_id: "gpt2"  # Start with small model, can scale to GPT-J/LLaMA
+        prompt_text: "Djinn orchestrates disaggregated accelerators by keeping semantic context."
+        prompt_length: 64
+        new_tokens: 32
+        batch_size: 1
+        unit_name: "tokens"
+    request_pattern:
+      requests_per_minute: 10
+      burst_probability: 0.1
+    
+  vision_users:
+    count: 30
+    percentage: 30
+    workload:
+      implementation: hf_vision
+      params:
+        model_id: "microsoft/resnet-50"  # Real ResNet-50 for OSDI
+        batch_size: 8
+        image_size: 224
+        unit_name: "images"
+    request_pattern:
+      requests_per_minute: 5
+      burst_probability: 0.05
+    
+  multimodal_users:
+    count: 10
+    percentage: 10
+    workload:
+      implementation: hf_multimodal
+      params:
+        model_id: "openai/clip-vit-base-patch32"  # Real CLIP for OSDI
+        batch_size: 4
+        image_size: 224
+        text_length: 77
+        unit_name: "pairs"
+    request_pattern:
+      requests_per_minute: 3
+      burst_probability: 0.02
+
+# Alternative: Use larger models for more realistic load
+# Uncomment to use production-scale models:
+# user_classes:
+#   llm_users:
+#     workload:
+#       params:
+#         model_id: "EleutherAI/gpt-j-6b"  # 6B parameter model
+#   vision_users:
+#     workload:
+#       params:
+#         model_id: "google/vit-base-patch16-224"  # ViT-Base
+#   multimodal_users:
+#     workload:
+#       params:
+#         model_id: "openai/clip-vit-large-patch14"  # CLIP-Large
+
+metrics:
+  collection_interval_seconds: 1.0
+  output_file: "Evaluation/phase4_load_test/results/production_load_test_{timestamp}.json"
+  
+  # Metrics to collect
+  latency:
+    percentiles: [50, 90, 95, 99]
+  throughput:
+    per_user_class: true
+    aggregate: true
+  gpu_utilization:
+    sample_interval_ms: 100
+  error_rate:
+    track_by_class: true
+

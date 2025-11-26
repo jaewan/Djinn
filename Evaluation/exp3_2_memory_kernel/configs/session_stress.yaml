@@ -1,0 +1,20 @@
+session_workload:
+  num_sessions: 8
+  operations_per_session: 100
+  alloc_sizes_mb: [0.25, 0.5, 1, 2, 4, 8, 16]
+  reuse_probability: 0.3
+  hold_time_ms: 5
+  max_allocation_mb: 1024
+
+allocators:
+  vmu:
+    type: "vmu"
+    description: "Djinn VMU-backed allocator"
+  cudacache:
+    type: "cuda"
+    description: "cudaMalloc + cudaFree"
+  torch_cache:
+    type: "torch"
+    description: "PyTorch caching allocator"
+
+

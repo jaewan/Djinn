@@ -1,0 +1,78 @@
+# Example configuration file for Genie framework
+# Copy this to genie.yaml and customize as needed
+
+# Network configuration
+network:
+  # Ports
+  control_port: 5555          # TCP control plane port
+  data_port: 5556             # Data plane port (TCP or DPDK)
+  metrics_port: 9095          # Prometheus metrics port
+  result_port_offset: 2000    # Offset for result ports
+
+  # Transport preferences
+  prefer_dpdk: true           # Try DPDK first (requires hardware support)
+  require_dpdk: false         # Allow TCP fallback if DPDK fails
+  tcp_fallback: true          # Always enable TCP as fallback
+
+  # Connection management
+  max_connections_per_target: 5     # Max TCP connections per target
+  connection_timeout: 30.0          # Connection timeout in seconds
+  heartbeat_interval: 30.0          # Heartbeat interval in seconds
+  heartbeat_timeout: 90.0           # Heartbeat timeout in seconds
+
+  # Performance tuning
+  chunk_size: 1048576         # 1MB chunks for data transfer
+  max_message_size: 1048576   # 1MB max message size
+  max_payload_size: 1394      # Ethernet MTU - headers
+
+  # Retry and batching
+  max_retry_attempts: 3       # Max retry attempts for failed transfers
+  retry_backoff: 0.1          # Base backoff time for retries (exponential)
+  batch_size_threshold: 5     # Batch operations when we have 5+ pending
+  batch_timeout: 0.01         # Batch timeout in seconds (10ms)
+
+# Performance configuration
+performance:
+  # Timeouts
+  operation_timeout: 300.0    # Max time for remote operations (5 minutes)
+  transfer_timeout: 30.0      # Max time for individual transfers
+  negotiation_timeout: 10.0   # Max time for control plane negotiation
+
+  # Caching
+  pattern_cache_size: 1000    # Max cached pattern analysis results
+  shape_cache_size: 10000     # Max cached tensor shape calculations
+  metadata_cache_size: 5000   # Max cached metadata entries
+  cache_ttl_seconds: 3600     # Cache TTL in seconds (1 hour)
+
+  # Memory management
+  max_memory_mb: 500          # Max memory usage for framework (MB)
+  memory_pressure_threshold: 0.8  # Memory pressure threshold (80%)
+  gpu_memory_fraction: 0.9    # Fraction of GPU memory to use (90%)
+
+  # GPU settings
+  gpu_id: 0                   # Default GPU ID
+  enable_profiling: false     # Enable detailed performance profiling
+  profile_sample_rate: 0.1    # Sample 10% of operations for profiling
+
+# Server configuration
+server:
+  node_id: "genie-server-0"   # Default server node ID
+  max_concurrent_transfers: 32  # Max concurrent transfer operations
+  max_queue_size: 1000        # Max queue size for operations
+
+  # Resource management
+  enable_resource_discovery: true   # Auto-discover GPU resources
+  resource_check_interval: 60.0     # Resource check interval (seconds)
+  enable_load_balancing: true       # Enable load balancing across GPUs
+  load_balance_threshold: 0.7      # Load balancing threshold (70%)
+
+# Logging configuration
+logging:
+  level: info                 # Log level (debug, info, warning, error, critical)
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file_path: null             # Log file path (null = console only)
+  max_file_size_mb: 100       # Max log file size in MB
+  backup_count: 5             # Number of backup log files to keep
+
+# Global settings
+debug_mode: false              # Enable debug mode for development

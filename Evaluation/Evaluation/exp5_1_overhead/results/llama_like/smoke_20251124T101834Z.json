@@ -1,0 +1,229 @@
+{
+  "config": "exp5_1_overhead/configs/overhead_smoke.yaml",
+  "experiment": {
+    "device": "cuda:0",
+    "dtype": "float16",
+    "runs": 3,
+    "warmup_runs": 1,
+    "tag": "smoke",
+    "result_dir": "Evaluation/exp5_1_overhead/results",
+    "djinn_server_address": "localhost:5556",
+    "reference_baseline": "native_pytorch",
+    "blind_baseline": "semantic_blind",
+    "target_baseline": "full_djinn"
+  },
+  "workload": {
+    "workload": "llama_like",
+    "category": "sequential",
+    "timestamp": "2025-11-24T10:18:34.611539+00:00",
+    "results": [
+      {
+        "baseline": "native_pytorch",
+        "runner_type": "local_synthetic",
+        "runs": [
+          {
+            "run_id": 1,
+            "latency_ms": 10.879596695303917,
+            "input_mb": 2.0,
+            "output_mb": 2.0,
+            "total_data_mb": 4.0,
+            "units_processed": 512.0,
+            "throughput_units_per_s": 47060.56799155068
+          },
+          {
+            "run_id": 2,
+            "latency_ms": 10.84315124899149,
+            "input_mb": 2.0,
+            "output_mb": 2.0,
+            "total_data_mb": 4.0,
+            "units_processed": 512.0,
+            "throughput_units_per_s": 47218.74556970886
+          },
+          {
+            "run_id": 3,
+            "latency_ms": 10.840332135558128,
+            "input_mb": 2.0,
+            "output_mb": 2.0,
+            "total_data_mb": 4.0,
+            "units_processed": 512.0,
+            "throughput_units_per_s": 47231.02517500854
+          }
+        ],
+        "aggregates": {
+          "latency_ms": {
+            "mean": 10.854360026617845,
+            "median": 10.84315124899149,
+            "p95": 10.840614046901464,
+            "min": 10.840332135558128,
+            "max": 10.879596695303917
+          },
+          "throughput_units_per_s": {
+            "mean": 47170.11291208936,
+            "median": 47218.74556970886,
+            "p95": 47229.797214478574,
+            "min": 47060.56799155068,
+            "max": 47231.02517500854
+          },
+          "total_data_mb": {
+            "mean": 4.0,
+            "median": 4.0,
+            "p95": 4.0,
+            "min": 4.0,
+            "max": 4.0
+          }
+        },
+        "metadata": {
+          "unit_name": "tokens",
+          "device": "cuda:0",
+          "dtype": "float16",
+          "spec": {
+            "batch_size": 1,
+            "sequence_length": 512,
+            "hidden_size": 2048,
+            "num_layers": 12,
+            "num_heads": 16,
+            "ff_size": 8192,
+            "unit_name": "tokens"
+          },
+          "baseline": "native_pytorch",
+          "runner_type": "local_synthetic"
+        },
+        "derived": {}
+      },
+      {
+        "baseline": "semantic_blind",
+        "runner_type": "scaling",
+        "runs": [
+          {
+            "run_id": 1,
+            "latency_ms": 54.397983476519585,
+            "input_mb": 80.0,
+            "output_mb": 80.0,
+            "total_data_mb": 160.0,
+            "units_processed": 512.0,
+            "throughput_units_per_s": 9412.113598310136
+          },
+          {
+            "run_id": 2,
+            "latency_ms": 54.21575624495745,
+            "input_mb": 80.0,
+            "output_mb": 80.0,
+            "total_data_mb": 160.0,
+            "units_processed": 512.0,
+            "throughput_units_per_s": 9443.749113941773
+          },
+          {
+            "run_id": 3,
+            "latency_ms": 54.20166067779064,
+            "input_mb": 80.0,
+            "output_mb": 80.0,
+            "total_data_mb": 160.0,
+            "units_processed": 512.0,
+            "throughput_units_per_s": 9446.205035001707
+          }
+        ],
+        "aggregates": {
+          "latency_ms": {
+            "mean": 54.27180013308922,
+            "median": 54.21575624495745,
+            "p95": 54.20307023450732,
+            "min": 54.20166067779064,
+            "max": 54.397983476519585
+          },
+          "throughput_units_per_s": {
+            "mean": 9434.022582417872,
+            "median": 9443.749113941773,
+            "p95": 9445.959442895713,
+            "min": 9412.113598310136,
+            "max": 9446.205035001707
+          },
+          "total_data_mb": {
+            "mean": 160.0,
+            "median": 160.0,
+            "p95": 160.0,
+            "min": 160.0,
+            "max": 160.0
+          }
+        },
+        "metadata": {
+          "baseline": "semantic_blind",
+          "runner_type": "scaling",
+          "reference": "native_pytorch",
+          "notes": "Placeholder for Djinn semantics disabled (high latency + bandwidth). NOTE: Synthetic workloads cannot execute remotely - use overhead_hf_smoke.yaml for real remote execution with HuggingFace models."
+        },
+        "derived": {
+          "latency_overhead_pct_vs_native_pytorch": 399.9999999999999
+        }
+      },
+      {
+        "baseline": "full_djinn",
+        "runner_type": "scaling",
+        "runs": [
+          {
+            "run_id": 1,
+            "latency_ms": 12.423576530069113,
+            "input_mb": 0.04,
+            "output_mb": 0.04,
+            "total_data_mb": 0.08,
+            "units_processed": 512.0,
+            "throughput_units_per_s": 44819.58856338159
+          },
+          {
+            "run_id": 2,
+            "latency_ms": 12.385308811441064,
+            "input_mb": 0.04,
+            "output_mb": 0.04,
+            "total_data_mb": 0.08,
+            "units_processed": 512.0,
+            "throughput_units_per_s": 44970.233875913196
+          },
+          {
+            "run_id": 3,
+            "latency_ms": 12.382348742336035,
+            "input_mb": 0.04,
+            "output_mb": 0.04,
+            "total_data_mb": 0.08,
+            "units_processed": 512.0,
+            "throughput_units_per_s": 44981.928738103365
+          }
+        ],
+        "aggregates": {
+          "latency_ms": {
+            "mean": 12.397078027948737,
+            "median": 12.385308811441064,
+            "p95": 12.382644749246538,
+            "min": 12.382348742336035,
+            "max": 12.423576530069113
+          },
+          "throughput_units_per_s": {
+            "mean": 44923.91705913272,
+            "median": 44970.233875913196,
+            "p95": 44980.75925188435,
+            "min": 44819.58856338159,
+            "max": 44981.928738103365
+          },
+          "total_data_mb": {
+            "mean": 0.08,
+            "median": 0.08,
+            "p95": 0.08,
+            "min": 0.08,
+            "max": 0.08
+          }
+        },
+        "metadata": {
+          "baseline": "full_djinn",
+          "runner_type": "scaling",
+          "reference": "native_pytorch",
+          "notes": "Placeholder for Djinn full semantics (low data, slight framework overhead). NOTE: Synthetic workloads cannot execute remotely - use overhead_hf_smoke.yaml for real remote execution with HuggingFace models."
+        },
+        "derived": {
+          "latency_overhead_pct_vs_native_pytorch": 14.21288770178737,
+          "speedup_vs_semantic_blind": 4.377789670334859,
+          "data_savings_pct_vs_semantic_blind": 99.94999999999999,
+          "semantic_efficiency_ratio": 7.032349941625908
+        }
+      }
+    ]
+  },
+  "generated_at": "20251124T101834Z"
+}
