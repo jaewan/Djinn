@@ -18,10 +18,13 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, UTC
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-
+try:  # Python 3.11+ exposes datetime.UTC; fall back for 3.10 runtimes.
+    from datetime import UTC  # type: ignore
+except ImportError:  # pragma: no cover
+    UTC = timezone.utc
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))

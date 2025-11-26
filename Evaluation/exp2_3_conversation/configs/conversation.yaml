@@ -1,5 +1,5 @@
 experiment:
-  model_id: "microsoft/DialoGPT-small"
+  model_id: "EleutherAI/gpt-j-6b"
   max_new_tokens_per_turn: 64
   temperature: 0.0
   top_p: 1.0

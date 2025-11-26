@@ -21,6 +21,7 @@ requests>=2.31.0
 
 # HuggingFace models and evaluation workloads
 transformers>=4.20.0
+huggingface-hub>=0.34.0,<1.0
 Pillow>=9.0.0
 scipy>=1.10.0
 
