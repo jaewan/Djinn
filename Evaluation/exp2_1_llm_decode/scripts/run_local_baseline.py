@@ -173,7 +173,14 @@ def prepare_inputs(tokenizer, prompt: str, prompt_len: int, batch_size: int):
     return encoded["input_ids"], encoded["attention_mask"]
 
 
-def load_model(model_id: str, dtype: str, device: str):
+def load_model(model_id: str, dtype: str, device: str, *, backend: str) -> torch.nn.Module:
+    if backend == "djinn":
+        from djinn.core.ghost_loader import create_hf_ghost_model
+
+        model = create_hf_ghost_model(model_id, task="causal-lm")
+        model.eval()
+        return model
+
     torch_dtype = {
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
@@ -302,7 +309,7 @@ async def run_remote_llm_baseline(args: argparse.Namespace) -> None:
     input_ids, attention_mask = prepare_inputs(
         tokenizer, prompt, args.prompt_length, args.batch_size
     )
-    model = load_model(args.model_id, args.dtype, device="cpu")
+    model = load_model(args.model_id, args.dtype, device="cpu", backend=args.backend)
 
     coordinator = get_coordinator()
     if coordinator is None:
@@ -474,12 +481,15 @@ async def _remote_generate_sequence(
             bytes_sent += bytes_of_tensor(inputs["attention_mask"])
 
             if semantic_aware:
-                with djinn.session(
-                    phase=phase,
-                    priority="normal",
-                    session_id=decode_session_id if can_persist else None,
-                    expected_tokens=new_tokens - token_idx,
-                ):
+                session_kwargs = {
+                    "phase": phase,
+                    "priority": "normal",
+                    "session_id": decode_session_id if can_persist else None,
+                    "expected_tokens": new_tokens - token_idx,
+                }
+                if can_persist and decode_session_id and token_idx == new_tokens - 1:
+                    session_kwargs["session_finalize"] = True
+                with djinn.session(**session_kwargs):
                     result = await manager.execute_model(model, inputs)
             else:
                 result = await manager.execute_model(model, inputs)
@@ -510,7 +520,7 @@ def main() -> None:
     input_ids, attention_mask = prepare_inputs(
         tokenizer, prompt, args.prompt_length, args.batch_size
     )
-    model = load_model(args.model_id, args.dtype, args.device)
+    model = load_model(args.model_id, args.dtype, args.device, backend=args.backend)
 
     device_obj = torch.device(args.device)
     if device_obj.type == "cuda" and torch.cuda.is_available():
