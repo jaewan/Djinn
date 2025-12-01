@@ -266,6 +266,24 @@ Source: Your IP (for dashboard access)
 
 **Important**: If you only opened ports 5000-6000, Ray will fail because it needs ports 10001-10020 for worker communication!
 
+**⚠️ CRITICAL: Check Server-Side Firewall (ufw)**
+
+Even if AWS Security Group allows the ports, **ufw on the server machine might be blocking them**:
+
+```bash
+# On SERVER machine, check ufw status
+sudo ufw status
+
+# If ufw is active and blocking, allow the ports:
+sudo ufw allow 6379/tcp
+sudo ufw allow 10001:10020/tcp
+
+# Or disable ufw if you're using AWS Security Groups:
+sudo ufw disable  # (only if you trust AWS Security Groups)
+```
+
+**Common Issue**: Security group allows ports, but `ufw` on server blocks them → ports appear unreachable from client!
+
 #### 1. Ray Baselines (Keep-Alive & Serverless)
 
 **On Server Machine:**

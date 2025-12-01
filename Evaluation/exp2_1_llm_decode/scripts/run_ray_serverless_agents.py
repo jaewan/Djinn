@@ -201,7 +201,9 @@ def main() -> None:
             print(f"[ray-serverless] ✓ Raylet/Object Store ports (10001-10020) are reachable")
         else:
             print(f"[ray-serverless] ✗ Some Raylet ports are NOT reachable: {failed_ports}")
-            print(f"[ray-serverless]   Fix: Open ports 10001-10020 in AWS Security Group")
+            print(f"[ray-serverless]   Fix 1: Open ports 10001-10020 in AWS Security Group")
+            print(f"[ray-serverless]   Fix 2: Check ufw on SERVER machine:")
+            print(f"[ray-serverless]     sudo ufw allow 10001:10020/tcp")
             print(f"[ray-serverless]   This is required for Ray worker communication")
             print(f"[ray-serverless]   Without these ports, Ray will try to start locally and fail")
     
@@ -224,10 +226,8 @@ def main() -> None:
         
         if ray_address:
             init_kwargs["address"] = ray_address
-            # Set a longer timeout for remote connections
-            init_kwargs["_system_config"] = {
-                "object_timeout_milliseconds": 200000,
-            }
+            # NOTE: Cannot use _system_config when connecting to existing cluster
+            # Ray will use the cluster's system config automatically
         
         ray.init(**init_kwargs)
         
