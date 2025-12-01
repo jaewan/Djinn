@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,6 +21,10 @@ from typing import Dict, List
 import ray
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# Add repo root to path for module imports
+REPO_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(REPO_ROOT))
 
 from Evaluation.common.metrics import summarize_fields
 

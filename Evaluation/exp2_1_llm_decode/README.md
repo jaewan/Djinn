@@ -215,7 +215,7 @@ python Evaluation/exp2_1_llm_decode/scripts/run_djinn_agents.py \
   --output-dir Evaluation/exp2_1_llm_decode/results/djinn_agents
 ```
 
-### Distributed Setup (Server + Client Machines) (Read experiment)
+### Distributed Setup (Server + Client Machines) (Real experiment)
 
 For production experiments, run servers on GPU machines and clients on separate machines.
 
@@ -246,11 +246,11 @@ ray start --head \
 
 ```bash
 # Connect to Ray cluster
-export RAY_ADDRESS="SERVER_IP:6379"
+export RAY_ADDRESS="SERVER_IP:5379"
 
 # Or pass directly via --ray-address flag
 python Evaluation/exp2_1_llm_decode/scripts/run_ray_keepalive_agents.py \
-  --ray-address SERVER_IP:6379 \
+  --ray-address SERVER_IP:5379 \
   --agent-counts 1 2 4 8 \
   --iterations 1 \
   --new-tokens 50 \
@@ -258,7 +258,7 @@ python Evaluation/exp2_1_llm_decode/scripts/run_ray_keepalive_agents.py \
   --output-dir Evaluation/exp2_1_llm_decode/results/ray_keepalive
 
 python Evaluation/exp2_1_llm_decode/scripts/run_ray_serverless_agents.py \
-  --ray-address SERVER_IP:6379 \
+  --ray-address SERVER_IP:5379 \
   --agent-counts 1 2 4 8 16 32 \
   --iterations 1 \
   --new-tokens 50 \
@@ -403,6 +403,24 @@ python -m djinn.server.server_main --gpu 0 --port 5556 --host 0.0.0.0
 - Tenant policy: 10 concurrent requests
 
 These were insufficient for agent scaling experiments with N >= 10.
+
+**Ray Module Import Error:**
+
+If you see: `ModuleNotFoundError: No module named 'Evaluation'`
+
+**Solution**: Ensure you're running from the repo root:
+
+```bash
+cd ~/Djinn  # Navigate to repo root
+python Evaluation/exp2_1_llm_decode/scripts/run_ray_serverless_agents.py \
+  --ray-address SERVER_IP:6379 \
+  --agent-counts 1 2 4 8 16 32 \
+  ...
+```
+
+**Important**: Ray uses port 6379 (not 5379). Verify correct port in command:
+- `--ray-address SERVER_IP:6379` ✓ (correct)
+- `--ray-address13.233.162.65:5379` ✗ (missing space and wrong port)
 
 ### Full Experiment (Paper Results)
 
