@@ -145,6 +145,7 @@ class SessionManager:
         *,
         model_kv_bytes: Optional[int] = None,
         expected_tokens: Optional[int] = None,
+        session_id: Optional[str] = None,
     ) -> str:
         """
         Create new session.
@@ -152,9 +153,16 @@ class SessionManager:
         Returns:
             session_id
         """
-        session_id = f"session_{uuid.uuid4().hex[:12]}"
+        if session_id is None:
+            session_id = f"session_{uuid.uuid4().hex[:12]}"
         
         with self.lock:
+            if session_id in self.sessions:
+                lease = self.sessions[session_id]
+                lease.last_heartbeat = time.time()
+                logger.debug(f"Session {session_id} already exists; refreshing heartbeat")
+                return session_id
+            
             self.sessions[session_id] = SessionLease(
                 session_id=session_id,
                 created_at=time.time(),

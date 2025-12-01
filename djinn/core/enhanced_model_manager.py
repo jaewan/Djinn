@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 
 from .fingerprint_policy import FingerprintPolicy
+from djinn.core.semantic_hints import get_hints_dict
 
 logger = logging.getLogger(__name__)
 
@@ -187,10 +188,17 @@ class EnhancedModelManager:
             await self.register_model(model, model_id)
             logger.info("✅ Model %s auto-registered", fingerprint[:8])
 
+        semantic_hints: Dict[str, Any] = {}
+        context_hints = get_hints_dict()
+        if context_hints:
+            semantic_hints.update(context_hints)
+        if hints:
+            semantic_hints.update(hints)
+
         return await self._execute_via_cache(
             fingerprint=fingerprint,
             inputs=inputs,
-            hints=hints,
+            hints=semantic_hints or None,
             profile_id=profile_id,
         )
 
@@ -218,6 +226,11 @@ class EnhancedModelManager:
         if self.coordinator:
             try:
                 qos_hints = hints or {}
+                semantic_payload = {
+                    k: v
+                    for k, v in qos_hints.items()
+                    if k not in ("qos_class", "deadline_ms")
+                } or None
                 result, metrics = await self.coordinator.execute_remote_model(
                     fingerprint=fingerprint,
                     inputs=inputs,
@@ -225,6 +238,7 @@ class EnhancedModelManager:
                     qos_class=qos_hints.get("qos_class"),
                     deadline_ms=qos_hints.get("deadline_ms"),
                     return_metrics=True,
+                    semantic_hints=semantic_payload,
                 )
                 self._last_execution_metrics = metrics or {}
                 return result

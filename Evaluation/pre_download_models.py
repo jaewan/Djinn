@@ -55,7 +55,8 @@ sys.path.insert(0, str(REPO_ROOT))
 from transformers import (
     AutoTokenizer, AutoModelForCausalLM, AutoModelForMaskedLM,
     AutoModelForImageClassification, AutoImageProcessor,
-    AutoModelForSeq2SeqLM, AutoProcessor, CLIPModel, CLIPProcessor
+    AutoModelForSeq2SeqLM, AutoProcessor, CLIPModel, CLIPProcessor,
+    WhisperForConditionalGeneration
 )
 from huggingface_hub import login
 
@@ -177,9 +178,16 @@ def download_model(model_id: str, model_config: dict) -> bool:
             model = CLIPModel.from_pretrained(model_id, torch_dtype="auto", low_cpu_mem_usage=True)
 
         elif model_type == "seq2seq":
-            # Download processor and model for Whisper
+            # Download processor and model for Whisper-style seq2seq workloads
             processor = AutoProcessor.from_pretrained(model_id)
-            model = AutoModelForSeq2SeqLM.from_pretrained(model_id, torch_dtype="auto", low_cpu_mem_usage=True)
+            if "whisper" in model_id:
+                model = WhisperForConditionalGeneration.from_pretrained(
+                    model_id, torch_dtype="auto", low_cpu_mem_usage=True
+                )
+            else:
+                model = AutoModelForSeq2SeqLM.from_pretrained(
+                    model_id, torch_dtype="auto", low_cpu_mem_usage=True
+                )
 
         else:
             logger.error(f"Unknown model type: {model_type}")
@@ -267,7 +275,7 @@ def main():
 
     # Calculate total expected size
     total_size_gb = sum(config['size_gb'] for config in MODELS_TO_DOWNLOAD.values())
-    logger.info(".1f")
+    logger.info(f"Approximate download size: {total_size_gb:.1f} GB")
 
     # Check authentication first
     if not check_huggingface_auth():

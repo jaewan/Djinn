@@ -9,10 +9,15 @@ import argparse
 import logging
 import sys
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+def configure_logging(level_name: str) -> None:
+    level = getattr(logging, level_name.upper(), logging.WARNING)
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    logging.getLogger('asyncio').setLevel(level)
+    logging.getLogger('asyncio').propagate = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -21,7 +26,9 @@ async def main():
     parser.add_argument('--port', type=int, default=5556, help='Server port')
     parser.add_argument('--host', type=str, default='0.0.0.0', help='Server host')
     parser.add_argument('--gpu', type=int, default=0, help='GPU device ID')
+    parser.add_argument('--log-level', default='warning', help='Server logging level')
     args = parser.parse_args()
+    configure_logging(args.log_level)
     
     logger.info(f"🚀 Starting Djinn Server v2.3")
     logger.info(f"   Host: {args.host}")

@@ -47,6 +47,7 @@ class SemanticHints:
     kv_cache_size_mb: Optional[float] = None
     expected_tokens: Optional[int] = None
     session_id: Optional[str] = None
+    session_finalize: Optional[bool] = None
     
     def to_dict(self) -> dict:
         """Convert to dictionary for serialization."""
@@ -61,6 +62,8 @@ class SemanticHints:
             result['expected_tokens'] = self.expected_tokens
         if self.session_id:
             result['session_id'] = self.session_id
+        if self.session_finalize is not None:
+            result['session_finalize'] = self.session_finalize
         return result
     
     @classmethod
@@ -86,6 +89,7 @@ class SemanticHints:
             kv_cache_size_mb=data.get('kv_cache_size_mb'),
             expected_tokens=data.get('expected_tokens'),
             session_id=data.get('session_id'),
+            session_finalize=data.get('session_finalize'),
         )
 
 
