@@ -353,6 +353,7 @@ async def _genie_init_async_impl(
                 
                 coordinator_config = CoordinatorConfig(
                     node_id='djinn-client',
+                    is_server=False,  # Client mode - don't start control plane server
                     tcp_fallback=True,
                     control_port=control_port,  # Use free port or configured port
                     data_port=data_port,        # Use free port or configured port

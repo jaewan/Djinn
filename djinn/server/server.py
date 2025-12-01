@@ -1455,8 +1455,8 @@ class DjinnServer:
                 if revision:
                     hf_common_kwargs['revision'] = revision
                 if hf_access_token:
+                    # Use 'token' parameter (newer Transformers versions don't allow both)
                     hf_common_kwargs['token'] = hf_access_token
-                    hf_common_kwargs['use_auth_token'] = hf_access_token
                 config = None
                 try:
                     config = AutoConfig.from_pretrained(model_id, **hf_common_kwargs)

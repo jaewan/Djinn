@@ -1,0 +1,138 @@
+experiment:
+  name: "agent_scaling_hero"
+  description: "Hero experiment for OSDI paper Section 6.2 - Agent Scaling"
+  version: "2.0"
+  purpose: |
+    Demonstrate Djinn's 'parking lot' solution by spawning N concurrent agents
+    that perform Reason → Act (sleep) → Reflect loops. Proves that:
+    1. Djinn enables 20x higher tenant density than Ray-Persistent (no OOM at high N)
+    2. Djinn maintains 10x lower latency than Ray-Serverless (efficient KV reuse)
+    3. GPU time-sharing works (free during Act phase, busy during Reason/Reflect)
+
+workload:
+  model_id: "meta-llama/Llama-2-7b-hf"
+  dtype: "float16"
+  new_tokens: 50
+  sleep_seconds: 10
+  iterations: 1
+
+baselines:
+  - name: "ray_keepalive"
+    description: "Ray persistent actors (each pins full model + KV cache)"
+    script: "scripts/run_ray_keepalive_agents.py"
+    failure_mode: "OOMs at low N (~2-3 agents on A100-40GB)"
+    args:
+      gpu_per_actor: 1.0
+      agent_counts: [1, 2, 3, 4]  # Stop early since OOM expected
+      stop_on_oom: true
+
+  - name: "ray_serverless"
+    description: "Ray stateless tasks (reload model/KV per step)"
+    script: "scripts/run_ray_serverless_agents.py"
+    failure_mode: "High latency (~5-8s), scales but inefficient"
+    args:
+      agent_counts: [1, 2, 4, 8, 16, 32]
+
+  - name: "djinn"
+    description: "Djinn semantic aware (shared weights, per-session KV cache)"
+    script: "scripts/run_djinn_agents.py"
+    failure_mode: "Should NOT fail; scales to N=32 with low latency"
+    args:
+      agent_counts: [1, 2, 4, 8, 16, 32]
+      sample_gpu: false
+
+results:
+  output_dir: "results"
+  figure: "figure_6_agent_scaling.png"
+  table: "table_2_summary.txt"
+  claims:
+    tenant_density: "20x higher than Ray-Persistent"
+    latency_advantage: "10x lower than Ray-Serverless"
+    scaling_stability: "Flat P99 latency curve from 1→32 agents"
+
+hardware:
+  gpu_type: "NVIDIA A100-80GB"
+  note: "Results may vary on A100-40GB (OOM threshold may be lower)"
+
+instructions:
+  setup: |
+    1. Start Djinn server:
+       python -m djinn.server.server_main --gpus 0
+    
+    2. Ensure models are cached:
+       python - <<'EOF'
+       from transformers import AutoModelForCausalLM, AutoTokenizer
+       model_id = "meta-llama/Llama-2-7b-hf"
+       AutoModelForCausalLM.from_pretrained(model_id, torch_dtype="float16")
+       AutoTokenizer.from_pretrained(model_id)
+       EOF
+    
+    3. Start Ray (for Ray baselines):
+       ray start --head --num-gpus=1 --include-dashboard=false
+  
+  run_ray_keepalive: |
+    python Evaluation/exp2_1_llm_decode/scripts/run_ray_keepalive_agents.py \
+      --agent-counts 1 2 3 4 \
+      --gpu-per-actor 1.0 \
+      --stop-on-oom \
+      --new-tokens 50 \
+      --sleep-seconds 10 \
+      --iterations 1 \
+      --output-dir Evaluation/exp2_1_llm_decode/results/ray_keepalive
+  
+  run_ray_serverless: |
+    python Evaluation/exp2_1_llm_decode/scripts/run_ray_serverless_agents.py \
+      --agent-counts 1 2 4 8 16 32 \
+      --new-tokens 50 \
+      --sleep-seconds 10 \
+      --iterations 1 \
+      --output-dir Evaluation/exp2_1_llm_decode/results/ray_serverless
+  
+  run_djinn: |
+    python Evaluation/exp2_1_llm_decode/scripts/run_djinn_agents.py \
+      --agent-counts 1 2 4 8 16 32 \
+      --new-tokens 50 \
+      --sleep-seconds 10 \
+      --iterations 1 \
+      --djinn-server localhost:5556 \
+      --output-dir Evaluation/exp2_1_llm_decode/results/djinn_agents
+  
+  analyze: |
+    python Evaluation/exp2_1_llm_decode/scripts/analyze_agent_scaling.py \
+      --ray-keepalive Evaluation/exp2_1_llm_decode/results/ray_keepalive/latest.json \
+      --ray-serverless Evaluation/exp2_1_llm_decode/results/ray_serverless/latest.json \
+      --djinn Evaluation/exp2_1_llm_decode/results/djinn_agents/latest.json \
+      --output-figure Evaluation/exp2_1_llm_decode/results/figure_6_agent_scaling.png \
+      --output-summary Evaluation/exp2_1_llm_decode/results/table_2_summary.txt
+
+expected_results:
+  ray_keepalive:
+    max_agents: 2
+    p99_1_agent: "~100ms"
+    p99_2_agents: "~110ms"
+    oom_at: 3
+  ray_serverless:
+    max_agents: 32
+    p99_1_agent: "~5000ms"
+    p99_8_agents: "~8000ms"
+    p99_32_agents: "~10000ms"
+  djinn:
+    max_agents: 32
+    p99_1_agent: "~120ms"
+    p99_8_agents: "~150ms"
+    p99_32_agents: "~180ms"
+
+metrics:
+  - name: "p99_latency"
+    unit: "milliseconds"
+    description: "P99 latency per Reason/Reflect step"
+  - name: "tenant_density"
+    unit: "agents"
+    description: "Maximum concurrent agents before OOM"
+  - name: "latency_ratio"
+    unit: "ratio"
+    description: "Ray Serverless latency / Djinn latency"
+  - name: "kv_reuse"
+    unit: "count"
+    description: "Number of decode phases with KV reuse"
+

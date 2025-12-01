@@ -141,9 +141,105 @@ Each `Reason`/`Reflect` step executes as a fresh Ray task that reloads the
 weights, recomputes the prompt, and discards state afterwards, capturing the
 cold-start costs inherent to this design.
 
+## Experiment 2.2: Agent Scaling (Hero Experiment)
+
+This is the main hero figure for the paper. We compare three baselines on the
+"Parking Lot" problem: running N concurrent agents that do Reason → Act (sleep) → Reflect.
+
+### Baselines
+
+1. **Ray Keep-Alive** (`run_ray_keepalive_agents.py`):
+   - Each agent holds model + KV cache exclusively
+   - Expected: Flat latency, but OOMs at low N (~2-3 agents)
+
+2. **Ray Serverless** (`run_ray_serverless_agents.py`):
+   - Each step reloads model + KV cache
+   - Expected: Scales to N=32, but latency is high (~5-8s per step)
+
+3. **Djinn** (`run_djinn_agents.py`):
+   - Shared weights (Text Segment), per-session KV cache (Data Segment)
+   - Expected: Scales to N=32 with low latency (~150ms per step)
+
+### Quick Start (Smoke Test)
+
+```bash
+# Terminal 1: Start Djinn server
+python -m djinn.server.server_main --gpus 0
+
+# Terminal 2: Run smoke test (1-2 agents only)
+# Ray Keep-Alive
+python Evaluation/exp2_1_llm_decode/scripts/run_ray_keepalive_agents.py \
+  --agent-counts 1 2 \
+  --iterations 1 \
+  --new-tokens 50 \
+  --sleep-seconds 1 \
+  --output-dir Evaluation/exp2_1_llm_decode/results/ray_keepalive
+
+# Ray Serverless
+python Evaluation/exp2_1_llm_decode/scripts/run_ray_serverless_agents.py \
+  --agent-counts 1 2 \
+  --iterations 1 \
+  --new-tokens 50 \
+  --sleep-seconds 1 \
+  --output-dir Evaluation/exp2_1_llm_decode/results/ray_serverless
+
+# Djinn (requires Djinn server running)
+python Evaluation/exp2_1_llm_decode/scripts/run_djinn_agents.py \
+  --agent-counts 1 2 \
+  --iterations 1 \
+  --new-tokens 50 \
+  --sleep-seconds 1 \
+  --output-dir Evaluation/exp2_1_llm_decode/results/djinn_agents
+```
+
+### Full Experiment (Paper Results)
+
+For the paper, use the config:
+```bash
+python Evaluation/exp2_1_llm_decode/scripts/run_ray_keepalive_agents.py \
+  --agent-counts 1 2 3 4 \
+  --stop-on-oom \
+  --gpu-per-actor 1.0 \
+  --iterations 1 \
+  --new-tokens 50 \
+  --sleep-seconds 10
+
+python Evaluation/exp2_1_llm_decode/scripts/run_ray_serverless_agents.py \
+  --agent-counts 1 2 4 8 16 32 \
+  --iterations 1 \
+  --new-tokens 50 \
+  --sleep-seconds 10
+
+python Evaluation/exp2_1_llm_decode/scripts/run_djinn_agents.py \
+  --agent-counts 1 2 4 8 16 32 \
+  --iterations 1 \
+  --new-tokens 50 \
+  --sleep-seconds 10 \
+  --djinn-server localhost:5556
+```
+
+### Analysis
+
+Once all three baselines complete:
+```bash
+python Evaluation/exp2_1_llm_decode/scripts/analyze_agent_scaling.py
+```
+
+This generates:
+- **Figure 6**: P99 Latency vs Number of Concurrent Agents
+- **Table 2**: Summary statistics (mean, p50, p99, OOM thresholds)
+- **Claims validation**: Tenant density and latency improvement ratios
+
+### Validation Checklist
+
+- [ ] Ray Keep-Alive OOMs at expected N (2-3 agents)
+- [ ] Ray Serverless scales to N=32, latency grows >5000ms
+- [ ] Djinn scales to N=32, latency stays <200ms
+- [ ] Djinn session persistence verified (check server logs: "Reusing session")
+- [ ] Analysis script correctly computes 20x density and 10x latency claims
+
 ## Open Tasks
-- [ ] Add Djinn remote executor harness with semantic toggles.
-- [ ] Stream GPU utilization samples via NVML instead of relying on `nvidia-smi`.
-- [ ] Build `analyze_results.py` to emit Figures 6a–6c.
-- [ ] Automate prompt + seed selection to match paper artifact.
+- [ ] Run full agent scaling experiment on production cluster
+- [ ] Verify claims (20x density, 10x latency) match expected paper values
+- [ ] Generate final figures for OSDI submission
 

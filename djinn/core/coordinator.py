@@ -219,33 +219,42 @@ class DjinnCoordinator:
         """Initialize coordinator and all transports."""
         logger.info(f"Starting DjinnCoordinator: {self.node_id}")
 
-        # 1. Initialize control plane (TCP, always available)
-        try:
-            from djinn.backend.runtime.control_plane import ControlPlane
-        except ImportError:
-            from ...backend.runtime.control_plane import ControlPlane
-        network_config = self.config.get_network_config()
-        logger.debug(f"Coordinator network config: {network_config}")
-        self.control_plane = ControlPlane(
-            self.node_id,
-            network_config.get('control_port', 5555)
-        )
-        await self.control_plane.start()
-        logger.info("✓ Control plane started")
+        # Check if this is a server or client coordinator
+        is_server = getattr(self.config, 'is_server', False)
         
-        # Register cleanup hook for graceful shutdown
-        self._register_cleanup_hook()
-
-        # 2. Initialize memory manager
-        try:
-            from djinn.backend.memory import GPUMemoryManager
-        except ImportError:
-            from ...backend.memory import GPUMemoryManager
-        self.memory_manager = GPUMemoryManager()
-        logger.info("✓ Memory manager initialized")
+        # 1. Initialize control plane (only for servers, not for clients connecting to remote server)
+        if is_server:
+            try:
+                from djinn.backend.runtime.control_plane import ControlPlane
+            except ImportError:
+                from ...backend.runtime.control_plane import ControlPlane
+            network_config = self.config.get_network_config()
+            logger.debug(f"Coordinator network config: {network_config}")
+            self.control_plane = ControlPlane(
+                self.node_id,
+                network_config.get('control_port', 5555)
+            )
+            await self.control_plane.start()
+            logger.info("✓ Control plane started")
+        else:
+            logger.info("✓ Client coordinator (no control plane server needed)")
         
-        # 3. Try to initialize DPDK transport
-        if self.config.prefer_dpdk:
+        # 2. Initialize memory manager (only for servers)
+        if is_server:
+            try:
+                from djinn.backend.memory import GPUMemoryManager
+            except ImportError:
+                from ...backend.memory import GPUMemoryManager
+            self.memory_manager = GPUMemoryManager()
+            logger.info("✓ Memory manager initialized")
+            
+            # Register cleanup hook for graceful shutdown
+            self._register_cleanup_hook()
+        else:
+            logger.debug("✓ Client coordinator (no memory manager needed)")
+        
+        # 3. Try to initialize DPDK transport (only for servers)
+        if is_server and self.config.prefer_dpdk:
             try:
                 try:
                     from djinn.server.transport.dpdk_transport import DPDKTransport
@@ -260,32 +269,36 @@ class DjinnCoordinator:
                     raise
                 logger.info("  → Will use TCP fallback")
 
-        # 4. Initialize TCP fallback (but not for server coordinators)
-        if self.config.tcp_fallback:
+        # 4. Initialize TCP fallback
+        if not is_server and self.config.tcp_fallback:
+            # Client-only: just initialize TCP for sending requests, no server
             try:
                 from djinn.server.transport.tcp_transport import TCPTransport
             except ImportError:
                 from ...server.transport.tcp_transport import TCPTransport
             self.transports['tcp'] = TCPTransport(self.config)
-            # Only initialize TCP server for client coordinators (not servers)
-            # Servers will use their own TCP server
-            is_server_coordinator = (hasattr(self.config, 'is_server') and self.config.is_server)
-            if not is_server_coordinator:
-                # ✅ FIX: Register callback BEFORE initialize() to avoid race condition
-                self.transports['tcp']._result_callback = self._result_manager.handle_result_received
-                logger.info("✓ Result callback registered")
-
-                # Client coordinators need to initialize TCP to receive results from servers
-                success = await self.transports['tcp'].initialize()
-                if success:
-                    logger.info("✓ TCP fallback available")
-                    # ✅ FIX: Add operation callback to handle incoming operation requests
-                    # (Client might also act as server in some scenarios)
-                    self.transports['tcp']._operation_callback = self._handle_operation_request
-                    logger.info("✓ Operation callback registered")
-                else:
-                    logger.warning("✗ TCP transport initialization failed, removing transport")
-                    del self.transports['tcp']
+            # Register callback BEFORE initialize() to avoid race condition
+            self.transports['tcp']._result_callback = self._result_manager.handle_result_received
+            logger.info("✓ Result callback registered")
+            
+            # Client coordinators need to initialize TCP to receive results from servers
+            success = await self.transports['tcp'].initialize()
+            if success:
+                logger.info("✓ TCP fallback available")
+                # Add operation callback to handle incoming operation requests
+                self.transports['tcp']._operation_callback = self._handle_operation_request
+                logger.info("✓ Operation callback registered")
+            else:
+                logger.warning("✗ TCP transport initialization failed, removing transport")
+                del self.transports['tcp']
+        elif is_server and self.config.tcp_fallback:
+            # Server-only: initialize TCP for server operations
+            try:
+                from djinn.server.transport.tcp_transport import TCPTransport
+            except ImportError:
+                from ...server.transport.tcp_transport import TCPTransport
+            self.transports['tcp'] = TCPTransport(self.config)
+            logger.info("✓ TCP transport initialized (server-side)")
         
         if not self.transports:
             raise RuntimeError("No transports available!")

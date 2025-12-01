@@ -1,6 +1,6 @@
 # Experiment 5.1 – OSDI/SOSP Microbenchmark Suite: Djinn Performance vs. State-of-the-Art Systems
 
-**Goal**: Demonstrate Djinn's raw performance advantage in disaggregated inference through comprehensive microbenchmarks. This experiment provides the empirical foundation for OSDI/SOSP claims by measuring end-to-end latency, throughput, data movement, and internal timing breakdowns across five baseline systems: native PyTorch, semantic-blind disaggregation, full semantic disaggregation (Djinn), PyTorch RPC, and vLLM.
+**Goal**: Demonstrate Djinn's raw performance advantage in disaggregated inference through comprehensive microbenchmarks. This experiment provides the empirical foundation for OSDI/SOSP claims by measuring end-to-end latency, throughput, data movement, and internal timing breakdowns across six baseline systems: native PyTorch, semantic-blind disaggregation, full semantic disaggregation (Djinn), PyTorch RPC, Ray Core (Actors), and vLLM.
 
 ## ⚡ NEW: Apples-to-Apples Architecture
 
@@ -21,6 +21,8 @@
 - `scripts/rpc_server.py` – PyTorch RPC baseline server
 - `scripts/launch_all_servers.sh` – **NEW**: Sequential/parallel server launcher with .venv support
 - `scripts/native_server.py` – **NEW**: Dedicated native PyTorch server for fair comparison
+- `scripts/ray_actor_server.py` – **NEW**: Ray Core Actor baseline server (Pickle + Plasma)
+- `scripts/launch_ray_baseline.sh` – **NEW**: Ray head node launcher
 - `results/` – JSON output (one file per workload/run)
 
 ## Usage
@@ -133,6 +135,21 @@ python Evaluation/exp5_1_overhead/scripts/run_overhead_sweep.py \
 
 This allows single-machine testing without manual environment setup. The server must still be started separately with RANK=0.
 
+**Ray Core Baseline** (requires Ray head node running):
+```bash
+# Terminal 1: Start Ray head node
+bash Evaluation/exp5_1_overhead/scripts/launch_ray_baseline.sh
+
+# Terminal 2: Run client
+export RAY_ADDRESS=127.0.0.1:6379
+python Evaluation/exp5_1_overhead/scripts/run_overhead_sweep.py \
+  --config Evaluation/exp5_1_overhead/configs/overhead_hf_smoke.yaml \
+  --workloads hf_tiny_gpt2 --tag ray_baseline
+
+# Terminal 3: Stop Ray (when done)
+ray stop
+```
+
 **vLLM Baseline** (requires vLLM server running):
 ```bash
 # Terminal 1: Start vLLM server
@@ -171,6 +188,7 @@ The experiment connects to a Djinn server for remote baselines (`semantic_blind`
 - **native_pytorch**: Dedicated server process on GPU (apples-to-apples isolation)
 - **semantic_blind/full_djinn**: Require server with GPU
 - **pytorch_rpc**: Server needs GPU, client can run on CPU or GPU
+- **ray_actor**: Actor needs GPU (allocated via Ray), client can run on CPU
 - **vllm**: Server needs GPU, client can run on CPU
 
 **NEW: All baselines now run in dedicated server processes for fair comparison**
@@ -228,20 +246,22 @@ This microbenchmark suite establishes Djinn's performance advantage through:
 2. **Comprehensive Profiling**: Internal timing breakdowns expose where overhead occurs
 3. **Semantic Value**: Quantifies the benefit of framework-level vs driver-level disaggregation
 4. **Production Ready**: Results directly support claims about Djinn's low virtualization tax
-5. **State-of-the-Art**: Compares against PyTorch RPC (canonical), vLLM (optimized), and custom Djinn implementations
+5. **State-of-the-Art**: Compares against PyTorch RPC (canonical), Ray Core (SOTA distributed ML), vLLM (optimized), and custom Djinn implementations
+6. **Reviewer Question Addressed**: Ray Core baseline directly answers "Why custom protocol vs Ray's Pickle+Plasma?"
 
 The results demonstrate that Djinn achieves the paper's key claim: **framework-level Tensor OS enables efficient disaggregated inference with minimal overhead**.
 
 ## OSDI/SOSP Baselines
 
-This experiment evaluates five baseline systems to establish Djinn's performance advantage:
+This experiment evaluates six baseline systems to establish Djinn's performance advantage:
 
 | Name | Type | Status | Purpose |
 |------|------|--------|---------|
 | `native_pytorch` | `native_server` | ✅ **Working** | Dedicated PyTorch server (upper bound - apples-to-apples) |
 | `semantic_blind` | `remote_djinn` | ✅ **Working** | Djinn remote without semantic hints (driver-level disaggregation) |
 | `full_djinn` | `remote_djinn` | ✅ **Working** | Djinn remote with full semantics (framework-level disaggregation) |
-| `pytorch_rpc` | `pytorch_rpc` | ✅ **Working** | PyTorch distributed RPC baseline (canonical remote PyTorch) |
+| `pytorch_rpc` | `pytorch_rpc` | ✅ **Working** | PyTorch distributed RPC baseline (TensorPipe serialization) |
+| `ray_actor` | `ray_actor` | ✅ **Working** | Ray Core Actor baseline (Pickle + Plasma Object Store - SOTA distributed ML) |
 | `vllm` | `vllm` | ✅ **Working** | vLLM with PagedAttention (specialized kernel optimizations) |
 
 All baselines capture detailed profiling data including serialization, network,
@@ -255,15 +275,21 @@ and server-side timing breakdowns for comprehensive performance analysis.
    now use `model.generate()` with identical generation parameters. This ensures fair comparison 
    of autoregressive generation (32 token decode loops, not single forward passes).
 
-2. **vLLM Comparison Caveat**: vLLM uses highly optimized C++ PagedAttention kernels. 
+2. **Ray Core Baseline (Critical for OSDI/SOSP)**: Ray Actor uses Pickle + Plasma Object Store,
+   which is the **standard distributed ML framework** used by data scientists. This baseline
+   directly answers the reviewer question: "Why did you build a custom binary protocol instead
+   of using Ray?" Expected performance: 5-12% overhead vs native (Pickle serialization + Plasma
+   indirection). Djinn should match or beat Ray in Exp 5.1, and dominate in Exp 2 (Agent Loop).
+
+3. **vLLM Comparison Caveat**: vLLM uses highly optimized C++ PagedAttention kernels. 
    For fair *architectural* comparison (RPC overhead), compare `native_pytorch` vs `pytorch_rpc` 
-   vs `semantic_blind` vs `full_djinn` (all using same HuggingFace code). vLLM numbers are 
+   vs `ray_actor` vs `semantic_blind` vs `full_djinn` (all using same HuggingFace code). vLLM numbers are 
    provided for context on specialized kernel optimizations.
 
-3. **Small Model Warning**: TinyGPT2 and similar small models may show HTTP overhead dominating 
+4. **Small Model Warning**: TinyGPT2 and similar small models may show HTTP overhead dominating 
    vLLM latency (~2-5ms HTTP vs <1ms compute). Use larger models (Llama-2-7B+) for valid vLLM comparison.
 
-4. **Metric Interpretation**: 
+5. **Metric Interpretation**: 
    - `latency_delta_vs_native_ms`: Positive = slower than native (overhead), Negative = faster
    - Negative values typically indicate different computations or lazy evaluation effects
 
@@ -338,6 +364,7 @@ Each baseline captures comprehensive timing breakdowns to isolate sources of ove
 | semantic_blind | TBD | TBD | TBD | TBD | TBD | +4-10% |
 | **full_djinn** | TBD | TBD | TBD | TBD | TBD | +6-15% |
 | pytorch_rpc | TBD | TBD | TBD | TBD | TBD | +2-5% |
+| **ray_actor** | TBD | TBD | TBD | TBD | TBD | **+5-12%** (Pickle+Plasma) |
 | vllm | TBD | TBD | TBD | TBD | TBD | TBD (HTTP overhead) |
 
 **Key Findings**:
@@ -352,6 +379,7 @@ Each baseline captures comprehensive timing breakdowns to isolate sources of ove
 - **Data Savings**: Significant reduction in network data movement via semantic hints
 - **Semantic Value**: Framework-level disaggregation should beat driver-level (semantic-blind)
 - **RPC Overhead**: PyTorch RPC baseline provides canonical comparison point (+2-5%)
+- **Ray Core Baseline**: Critical for OSDI/SOSP - answers "Why custom protocol vs Ray?" (+5-12%)
 - **Sequential Mode**: Prevents resource contention for scientific rigor
 
 **Two-Machine Considerations**:
@@ -367,7 +395,8 @@ Each baseline captures comprehensive timing breakdowns to isolate sources of ove
 
 ## OSDI/SOSP Submission Status
 
-- **All 5 Core Baselines Working**: native_pytorch, pytorch_rpc, semantic_blind, full_djinn, vllm ✅
+- **All 6 Core Baselines Working**: native_pytorch, pytorch_rpc, ray_actor, semantic_blind, full_djinn, vllm ✅
+  - **NEW: Ray Core Baseline** - Ray Actor with Pickle + Plasma (SOTA distributed ML framework)
   - **NEW: Apples-to-Apples Architecture** - All baselines run in dedicated server processes
   - **NEW: Sequential Mode** - Servers run one-at-a-time for scientific rigor (no resource contention)
   - **NEW: .venv Support** - Auto-detects and activates virtual environment
@@ -382,6 +411,7 @@ Each baseline captures comprehensive timing breakdowns to isolate sources of ove
   4. CUDA synchronization before RPC returns
   5. **NEW: NativeServerBaselineRunner** for apples-to-apples comparison
   6. **NEW: launch_all_servers.sh** with sequential/.venv support
+  7. **NEW: RayActorBaselineRunner** for Ray Core baseline (critical for OSDI/SOSP)
 
 - **All OSDI Senior Review Critiques Addressed**:
   1. "Impossible Speedup" - Fixed by ensuring all baselines call model.generate()
@@ -392,7 +422,7 @@ Each baseline captures comprehensive timing breakdowns to isolate sources of ove
 
 - **Results Analysis**: `analyze_overhead.py` generates publication-ready tables ✅
 - **Performance Baseline Measured**: Native PyTorch = 236.97 ms (tiny-gpt2, 32 tokens)
-- **Expected Results**: RPC +2-5%, Djinn Semantic-Blind +4-10%, Djinn Full +6-15%
+- **Expected Results**: RPC +2-5%, Ray Actor +5-12%, Djinn Semantic-Blind +4-10%, Djinn Full +6-15%
 
 ## Next Steps for OSDI/SOSP
 

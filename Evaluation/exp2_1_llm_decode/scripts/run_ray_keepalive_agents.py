@@ -46,11 +46,14 @@ class LLMKeepAliveActor:
         self.tokenizer = AutoTokenizer.from_pretrained(model_id)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            torch_dtype=torch_dtype,
-            low_cpu_mem_usage=True,
-        ).to(device)
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                torch_dtype=torch_dtype,
+                low_cpu_mem_usage=True,
+            ).to(device)
+        except torch.cuda.OutOfMemoryError as e:
+            raise RuntimeError(f"OOM during model loading: {e}")
         self.model.eval()
         self.device = device
 
@@ -71,11 +74,14 @@ class LLMKeepAliveActor:
             gen_kwargs["do_sample"] = False
             gen_kwargs.pop("temperature", None)
             gen_kwargs.pop("top_p", None)
-        outputs = self.model.generate(
-            **inputs,
-            **gen_kwargs,
-            pad_token_id=self.tokenizer.eos_token_id,
-        )
+        try:
+            outputs = self.model.generate(
+                **inputs,
+                **gen_kwargs,
+                pad_token_id=self.tokenizer.eos_token_id,
+            )
+        except torch.cuda.OutOfMemoryError as e:
+            raise RuntimeError(f"OOM during generation: {e}")
         decoded = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
         tokens_generated = int(outputs.shape[-1] - inputs["input_ids"].shape[-1])
         return {"text": decoded, "tokens_generated": tokens_generated}
@@ -137,7 +143,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("Evaluation/exp2_1_llm_decode/results/ray_keepalive"))
     parser.add_argument("--tag", type=str, default="ray_keepalive")
     parser.add_argument("--ray-address", type=str, help="Optional Ray cluster address (default: local).")
-    parser.add_argument("--gpu-per-actor", type=float, default=1.0, help="GPU fraction requested per actor.")
+    parser.add_argument("--gpu-per-actor", type=float, default=0.01, help="GPU fraction per actor (0.01 forces physical OOM at low N by bypassing Ray scheduler)")
+    parser.add_argument("--stop-on-oom", action="store_true", help="Stop sweep when OOM is encountered (for hero comparison).")
     return parser.parse_args()
 
 
@@ -164,37 +171,86 @@ def main() -> None:
         "generated_at": timestamp,
     }
 
+    oom_encountered = False
     for agent_count in args.agent_counts:
-        print(f"[ray-keepalive] Running {agent_count} concurrent agents...")
-        actors = [
-            LLMKeepAliveActor.options(num_gpus=args.gpu_per_actor).remote(
-                args.model_id,
-                args.dtype,
-                "cuda" if torch.cuda.is_available() else "cpu",
-            )
-            for _ in range(agent_count)
-        ]
-        records = run_reason_act_reflect(
-            actors,
-            prompt,
-            args.new_tokens,
-            args.sleep_seconds,
-            args.iterations,
-            args.temperature,
-            args.top_p,
-        )
-        aggregates = summarize_agent_runs(records)
-        payload["agent_counts"].append(
-            {
+        if oom_encountered:
+            print(f"[ray-keepalive] Skipping N={agent_count} (OOM already encountered)")
+            payload["agent_counts"].append({
                 "agents": agent_count,
-                "records": records,
-                "aggregates": aggregates,
-            }
-        )
-        # Terminate actors gracefully
-        for actor in actors:
-            ray.kill(actor)
-        ray.wait([actor.__ray_terminate__.remote() for actor in actors], timeout=5)
+                "records": [],
+                "aggregates": {},
+                "oom": True,
+            })
+            continue
+        
+        print(f"[ray-keepalive] Running {agent_count} concurrent agents...")
+        actors = []
+        try:
+            # Try to create and initialize actors
+            for i in range(agent_count):
+                try:
+                    actor = LLMKeepAliveActor.options(num_gpus=args.gpu_per_actor).remote(
+                        args.model_id,
+                        args.dtype,
+                        "cuda" if torch.cuda.is_available() else "cpu",
+                    )
+                    # Test actor by calling a simple method to catch OOM early
+                    ray.get(actor.generate.remote(prompt, 1, args.temperature, args.top_p))
+                    actors.append(actor)
+                except Exception as e:
+                    if "OutOfMemoryError" in str(e) or "OOM" in str(e):
+                        print(f"[ray-keepalive] OOM at agent {i} (N={agent_count}): {e}")
+                        oom_encountered = True
+                        # Clean up any actors we created
+                        for a in actors:
+                            ray.kill(a)
+                        payload["agent_counts"].append({
+                            "agents": agent_count,
+                            "records": [],
+                            "aggregates": {},
+                            "oom": True,
+                            "oom_at_agent": i,
+                        })
+                        break
+                    else:
+                        raise
+            else:
+                # All actors created successfully, run the loop
+                records = run_reason_act_reflect(
+                    actors,
+                    prompt,
+                    args.new_tokens,
+                    args.sleep_seconds,
+                    args.iterations,
+                    args.temperature,
+                    args.top_p,
+                )
+                aggregates = summarize_agent_runs(records)
+                payload["agent_counts"].append(
+                    {
+                        "agents": agent_count,
+                        "records": records,
+                        "aggregates": aggregates,
+                    }
+                )
+                # Terminate actors gracefully
+                for actor in actors:
+                    ray.kill(actor)
+                ray.wait([actor.__ray_terminate__.remote() for actor in actors], timeout=5)
+        except Exception as e:
+            if "OutOfMemoryError" in str(e) or "OOM" in str(e):
+                print(f"[ray-keepalive] OOM during execution (N={agent_count}): {e}")
+                oom_encountered = True
+                payload["agent_counts"].append({
+                    "agents": agent_count,
+                    "records": [],
+                    "aggregates": {},
+                    "oom": True,
+                })
+                if args.stop_on_oom:
+                    break
+            else:
+                raise
 
     output_path = args.output_dir / f"{args.tag}_{timestamp}.json"
     with output_path.open("w", encoding="utf-8") as handle:
