@@ -164,9 +164,10 @@ class DjinnServer:
         from .tenant_resource_policy import TenantLimits
         
         # Default tenant (for backward compatibility)
+        # OSDI FIX: Increased limits to support high-concurrency agent scaling experiments
         self.tenant_resource_policy.configure_tenant('default', TenantLimits(
-            max_vram_gb=40.0,
-            max_concurrent_requests=10,
+            max_vram_gb=80.0,  # Full A100-80GB allocation
+            max_concurrent_requests=64,  # Support up to 64 concurrent requests (agents)
             priority=1,
         ))
         

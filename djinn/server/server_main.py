@@ -27,6 +27,10 @@ async def main():
     parser.add_argument('--host', type=str, default='0.0.0.0', help='Server host')
     parser.add_argument('--gpu', type=int, default=0, help='GPU device ID')
     parser.add_argument('--log-level', default='warning', help='Server logging level')
+    parser.add_argument('--max-concurrent', type=int, default=64, 
+                        help='Max concurrent requests (default: 64 for high-concurrency experiments)')
+    parser.add_argument('--max-vram-gb', type=float, default=80.0,
+                        help='Max VRAM per tenant in GB (default: 80 for A100-80GB)')
     args = parser.parse_args()
     configure_logging(args.log_level)
     
@@ -34,9 +38,15 @@ async def main():
     logger.info(f"   Host: {args.host}")
     logger.info(f"   Port: {args.port}")
     logger.info(f"   GPU:  {args.gpu}")
+    logger.info(f"   Max concurrent requests: {args.max_concurrent}")
+    logger.info(f"   Max VRAM per tenant: {args.max_vram_gb} GB")
     
     # Initialize server components
     from .server import DjinnServer, ServerConfig
+    import os
+    
+    # Set environment variables to control server configuration
+    os.environ['GENIE_QOS_MAX_CONCURRENCY'] = str(args.max_concurrent)
     
     config = ServerConfig(
         node_id='djinn-server',
@@ -45,6 +55,14 @@ async def main():
     )
     
     server = DjinnServer(config)
+    
+    # Configure tenant limits with CLI parameters
+    from .tenant_resource_policy import TenantLimits
+    server.tenant_resource_policy.configure_tenant('default', TenantLimits(
+        max_vram_gb=args.max_vram_gb,
+        max_concurrent_requests=args.max_concurrent,
+        priority=1,
+    ))
     
     # Start server
     success = await server.start()

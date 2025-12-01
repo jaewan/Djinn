@@ -164,7 +164,7 @@ This is the main hero figure for the paper. We compare three baselines on the
 
 ### Quick Start (Smoke Test)
 
-**Option 1: Sequential Runner (Recommended)**
+**Option 1: Sequential Runner (Recommended for Local Testing)**
 
 Run all three baselines sequentially with automatic server management:
 
@@ -182,7 +182,7 @@ python Evaluation/exp2_1_llm_decode/scripts/run_all_baselines_sequential.py \
   --output-dir /tmp/test_agent_scaling
 ```
 
-**Option 2: Manual Execution**
+**Option 2: Manual Execution (Local)**
 
 ```bash
 # Terminal 1: Start Djinn server
@@ -215,9 +215,199 @@ python Evaluation/exp2_1_llm_decode/scripts/run_djinn_agents.py \
   --output-dir Evaluation/exp2_1_llm_decode/results/djinn_agents
 ```
 
+### Distributed Setup (Server + Client Machines) (Read experiment)
+
+For production experiments, run servers on GPU machines and clients on separate machines.
+
+#### Prerequisites
+
+1. **Server Machine**: GPU-enabled (A100/H100) with CUDA installed
+2. **Client Machine**: CPU-only is fine, needs network access to server
+3. **Network**: Ensure firewall allows:
+   - Ray: Ports 10001-10010 (default), 6379 (GCS)
+   - Djinn: Ports 5555 (control), 5556 (data)
+
+#### 1. Ray Baselines (Keep-Alive & Serverless)
+
+**On Server Machine:**
+
+```bash
+# Start Ray head node (replace SERVER_IP with actual server IP)
+ray start --head \
+  --node-ip-address=SERVER_IP \
+  --port=6379 \
+  --num-gpus=1 \
+  --include-dashboard=false
+
+# Note the Ray address shown (e.g., "SERVER_IP:6379")
+```
+
+**On Client Machine:**
+
+```bash
+# Connect to Ray cluster
+export RAY_ADDRESS="SERVER_IP:6379"
+
+# Or pass directly via --ray-address flag
+python Evaluation/exp2_1_llm_decode/scripts/run_ray_keepalive_agents.py \
+  --ray-address SERVER_IP:6379 \
+  --agent-counts 1 2 4 8 \
+  --iterations 1 \
+  --new-tokens 50 \
+  --sleep-seconds 10 \
+  --output-dir Evaluation/exp2_1_llm_decode/results/ray_keepalive
+
+python Evaluation/exp2_1_llm_decode/scripts/run_ray_serverless_agents.py \
+  --ray-address SERVER_IP:6379 \
+  --agent-counts 1 2 4 8 16 32 \
+  --iterations 1 \
+  --new-tokens 50 \
+  --sleep-seconds 10 \
+  --output-dir Evaluation/exp2_1_llm_decode/results/ray_serverless
+```
+
+**Finding Ray Address:**
+
+- If Ray head started successfully, it prints: `Ray runtime started. Next: ray.init(address="SERVER_IP:6379")`
+- Or check: `ray status` on server machine
+
+#### 2. Djinn Baseline
+
+**On Server Machine:**
+
+```bash
+# Start Djinn server (replace SERVER_IP with actual server IP)
+# Bind to 0.0.0.0 to accept connections from client machines
+# OSDI FIX: Increased default concurrency limits for high-concurrency experiments
+python -m djinn.server.server_main \
+  --gpu 0 \
+  --port 5556 \
+  --host 0.0.0.0 \
+  --max-concurrent 64 \
+  --max-vram-gb 80
+
+# Server will listen on:
+# - Control plane: SERVER_IP:5555
+# - Data plane: SERVER_IP:5556
+```
+
+**Concurrency Configuration (OSDI Fixes):**
+
+The server now supports high-concurrency experiments with configurable limits:
+
+- `--max-concurrent` (default: 64): Maximum concurrent requests the server accepts
+  - Set to match your agent count: `--max-concurrent 32` for 32 agents
+  - Replaces hard-coded limit of 10 that was causing "Concurrency limit exceeded" errors at N>=10
+
+- `--max-vram-gb` (default: 80): Maximum VRAM allocation per tenant
+  - Set to your GPU capacity: `--max-vram-gb 80` for A100-80GB
+
+For distributed experiments with 16-32 agents:
+
+```bash
+python -m djinn.server.server_main \
+  --gpu 0 \
+  --port 5556 \
+  --host 0.0.0.0 \
+  --max-concurrent 64 \
+  --max-vram-gb 80
+```
+
+**On Client Machine:**
+
+```bash
+# Connect to Djinn server (replace SERVER_IP with actual server IP)
+python Evaluation/exp2_1_llm_decode/scripts/run_djinn_agents.py \
+  --agent-counts 1 2 4 8 16 32 \
+  --iterations 1 \
+  --new-tokens 50 \
+  --sleep-seconds 10 \
+  --djinn-server SERVER_IP:5556 \
+  --output-dir Evaluation/exp2_1_llm_decode/results/djinn_agents
+```
+
+**Verifying Connectivity:**
+
+```bash
+# From client machine, test Djinn server connection
+nc -zv SERVER_IP 5556
+
+# Test Ray cluster connection
+ray status --address SERVER_IP:6379
+```
+
+#### 3. Sequential Runner (Distributed)
+
+The sequential runner can also work in distributed mode, but requires manual server management:
+
+**On Server Machine:**
+
+```bash
+# Terminal 1: Start Ray head
+ray start --head --node-ip-address=SERVER_IP --port=6379 --num-gpus=1
+
+# Terminal 2: Start Djinn server
+python -m djinn.server.server_main --gpu 0 --port 5556 --host 0.0.0.0
+```
+
+**On Client Machine:**
+
+```bash
+# Note: Sequential runner currently assumes localhost for Djinn server
+# For distributed setup, run baselines individually (see above)
+# Or modify run_all_baselines_sequential.py to accept --djinn-server-ip
+```
+
+#### Troubleshooting Distributed Setup
+
+**Connection Refused:**
+- Verify server IP is correct (use `hostname -I` or `ip addr` on server)
+- Check firewall: `sudo ufw allow 5556/tcp` (Djinn) or `sudo ufw allow 6379/tcp` (Ray)
+- Ensure server binds to `0.0.0.0`, not `127.0.0.1`
+
+**Ray Connection Timeout:**
+- Verify Ray head is running: `ray status` on server
+- Check Ray logs: `tail -f /tmp/ray/session_latest/logs/raylet.out`
+- Ensure port 6379 is accessible from client
+
+**Djinn Connection Failed:**
+- Check server logs for errors
+- Verify model registration succeeds (check server stdout)
+- Test with `curl SERVER_IP:5556` (should fail gracefully, not timeout)
+
+**Concurrency Limit Exceeded (OSDI Fix):**
+
+If you see: `Concurrency limit exceeded: X active requests >= Y limit`
+
+**Solution**: Increase server concurrency when starting Djinn server:
+
+```bash
+# Adjust --max-concurrent based on your agent count
+# For N agents, use --max-concurrent at least N+10 for headroom
+python -m djinn.server.server_main \
+  --gpu 0 \
+  --port 5556 \
+  --host 0.0.0.0 \
+  --max-concurrent 64  # Increased from default 4
+```
+
+Or use environment variable:
+
+```bash
+export GENIE_QOS_MAX_CONCURRENCY=64
+python -m djinn.server.server_main --gpu 0 --port 5556 --host 0.0.0.0
+```
+
+**Root Cause**: Prior to OSDI fixes, Djinn had hard-coded concurrency limits:
+- QoS scheduler: 4 concurrent requests
+- Tenant policy: 10 concurrent requests
+
+These were insufficient for agent scaling experiments with N >= 10.
+
 ### Full Experiment (Paper Results)
 
-For the paper, use the config:
+**Local Setup (Single Machine):**
+
 ```bash
 # Ray Keep-Alive: Default --gpu-per-actor 0.01 forces physical OOM (not scheduler queuing)
 python Evaluation/exp2_1_llm_decode/scripts/run_ray_keepalive_agents.py \
@@ -239,6 +429,56 @@ python Evaluation/exp2_1_llm_decode/scripts/run_djinn_agents.py \
   --new-tokens 50 \
   --sleep-seconds 10 \
   --djinn-server localhost:5556
+```
+
+**Distributed Setup (Server + Client):**
+
+First, start the servers on the server machine:
+
+```bash
+# Terminal 1: Start Ray head (replace SERVER_IP)
+ray start --head \
+  --node-ip-address=SERVER_IP \
+  --port=6379 \
+  --num-gpus=1 \
+  --include-dashboard=false
+
+# Terminal 2: Start Djinn server with high-concurrency settings (OSDI FIX)
+python -m djinn.server.server_main \
+  --gpu 0 \
+  --port 5556 \
+  --host 0.0.0.0 \
+  --max-concurrent 64 \
+  --max-vram-gb 80
+```
+
+Then, run the baselines from the client machine (replace `SERVER_IP` with your actual server IP):
+
+```bash
+# Ray Keep-Alive (from client machine)
+python Evaluation/exp2_1_llm_decode/scripts/run_ray_keepalive_agents.py \
+  --ray-address SERVER_IP:6379 \
+  --agent-counts 1 2 3 4 \
+  --stop-on-oom \
+  --iterations 1 \
+  --new-tokens 50 \
+  --sleep-seconds 10
+
+# Ray Serverless (from client machine)
+python Evaluation/exp2_1_llm_decode/scripts/run_ray_serverless_agents.py \
+  --ray-address SERVER_IP:6379 \
+  --agent-counts 1 2 4 8 16 32 \
+  --iterations 1 \
+  --new-tokens 50 \
+  --sleep-seconds 10
+
+# Djinn (from client machine) - Now works up to N=32 without "Concurrency limit" errors
+python Evaluation/exp2_1_llm_decode/scripts/run_djinn_agents.py \
+  --agent-counts 1 2 4 8 16 32 \
+  --iterations 1 \
+  --new-tokens 50 \
+  --sleep-seconds 10 \
+  --djinn-server SERVER_IP:5556
 ```
 
 **Note:** The default `--gpu-per-actor 0.01` for Ray Keep-Alive bypasses Ray's logical scheduler and forces physical GPU memory contention, ensuring OOM crashes (not infinite queuing) at low N. This properly demonstrates the "Parking Lot" problem.

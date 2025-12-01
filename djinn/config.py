@@ -210,7 +210,7 @@ class ServerConfig:
 
     # QoS scheduling (Phase 1)
     enable_qos: bool = True
-    qos_max_concurrency: int = 4
+    qos_max_concurrency: int = 64  # OSDI FIX: Increased from 4 to support high-concurrency experiments
     qos_class_shares: Dict[str, float] = field(default_factory=lambda: dict(DEFAULT_QOS_SHARES))
     qos_default_class: str = 'interactive'
     qos_escalation_delay_ms: float = 800.0
