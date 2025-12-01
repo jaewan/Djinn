@@ -212,6 +212,15 @@ class ModelExecutionSerializer:
             'priority': metadata.get('priority'),
             'kv_cache_size_mb': metadata.get('kv_cache_size_mb'),
             'expected_tokens': metadata.get('expected_tokens'),
+            # OSDI FIX: Extract generation parameters for causal LM fair comparison
+            'use_generate': metadata.get('use_generate'),
+            'max_new_tokens': metadata.get('max_new_tokens'),
+            'pad_token_id': metadata.get('pad_token_id'),
+            'top_k': metadata.get('top_k'),
+            'top_p': metadata.get('top_p'),
+            'temperature': metadata.get('temperature'),
+            'do_sample': metadata.get('do_sample'),
+            'num_beams': metadata.get('num_beams'),
         }
 
         return fingerprint, inputs, profile_id, extras

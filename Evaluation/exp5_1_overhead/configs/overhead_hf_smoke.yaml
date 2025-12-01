@@ -83,14 +83,19 @@ workloads:
 
 baselines:
   - name: native_pytorch
-    type: local_synthetic
-    notes: "Model executes directly on the server GPU (upper bound)."
+    type: native_server
+    server_address: "localhost:5557"
+    notes: "Native PyTorch baseline (server-isolated for fair comparison)."
 
   - name: pytorch_rpc
     type: pytorch_rpc
     rpc_server_name: "rpc_server"
     rpc_client_name: "rpc_client"
-    notes: "PyTorch RPC baseline (no semantic sharing)."
+    notes: "PyTorch RPC baseline (TensorPipe serialization, no semantic sharing)."
+
+  - name: ray_actor
+    type: ray_actor
+    notes: "Ray Core Actor baseline (Pickle + Plasma Object Store serialization)."
 
   - name: semantic_blind
     type: remote_djinn

@@ -93,12 +93,13 @@ def load_rows(path: Path) -> List[Dict[str, Any]]:
         derived = baseline.get("derived", {})
         latency_ms = _safe_get(aggregates, "latency_ms", "mean")
         
-        # CRITICAL: overhead_per_request_ms shows absolute overhead
-        # This distinguishes between constant overhead (good) vs proportional (leaky abstraction)
+        # CRITICAL: latency_delta_vs_native_ms shows the difference from native baseline
+        # Positive = slower than native (overhead), Negative = faster than native (improvement)
+        # Note: "Faster than native" typically indicates different computations being measured
         # See: OSDI Review - Critique 2
-        overhead_per_request_ms = None
+        latency_delta_vs_native_ms = None
         if latency_ms is not None and native_latency_ms is not None:
-            overhead_per_request_ms = latency_ms - native_latency_ms
+            latency_delta_vs_native_ms = latency_ms - native_latency_ms
         
         row = {
             "workload": workload_name,
@@ -107,7 +108,7 @@ def load_rows(path: Path) -> List[Dict[str, Any]]:
             "runner_type": baseline.get("runner_type"),
             "latency_mean_ms": latency_ms,
             "latency_p95_ms": _safe_get(aggregates, "latency_ms", "p95"),
-            "overhead_per_request_ms": overhead_per_request_ms,
+            "latency_delta_vs_native_ms": latency_delta_vs_native_ms,
             "data_mean_mb": _safe_get(aggregates, "total_data_mb", "mean"),
             "throughput_mean_units_s": _safe_get(aggregates, "throughput_units_per_s", "mean"),
         }
@@ -156,7 +157,7 @@ def write_csv(rows: List[Dict[str, Any]], output: Optional[Path]) -> None:
         "baseline",
         "latency_mean_ms",
         "latency_p95_ms",
-        "overhead_per_request_ms",  # NEW: OSDI Review - Critique 2 (absolute overhead)
+        "latency_delta_vs_native_ms",  # OSDI FIX: Renamed from 'overhead' - can be negative
         "data_mean_mb",
         "throughput_mean_units_s",
         "latency_overhead_pct_vs_native_pytorch",
@@ -198,7 +199,7 @@ def print_markdown(rows: List[Dict[str, Any]]) -> None:
         "Baseline",
         "Latency (ms)",
         "P95 (ms)",
-        "Overhead (ms)",
+        "Delta vs Native (ms)",  # OSDI FIX: Renamed - can be negative
         "Data (MB)",
         "Speedup vs Blind",
         "Data Savings (%)",
@@ -209,13 +210,16 @@ def print_markdown(rows: List[Dict[str, Any]]) -> None:
     for row in rows:
         # Use .3f for sub-millisecond precision to avoid losing information
         # See: OSDI Review - Code Nit #3 (Markdown Precision)
+        delta = row.get("latency_delta_vs_native_ms", 0.0) or 0.0
+        # Format delta with sign for clarity (positive = slower, negative = faster)
+        delta_str = f"+{delta:.3f}" if delta >= 0 else f"{delta:.3f}"
         print(
-            "| {workload} | {baseline} | {lat:.3f} | {p95:.3f} | {ovh:.3f} | {data:.3f} | {speedup:.2f} | {savings:.2f} | {eff:.2f} |".format(
+            "| {workload} | {baseline} | {lat:.3f} | {p95:.3f} | {delta} | {data:.3f} | {speedup:.2f} | {savings:.2f} | {eff:.2f} |".format(
                 workload=row["workload"],
                 baseline=row["baseline"],
                 lat=row.get("latency_mean_ms", 0.0) or 0.0,
                 p95=row.get("latency_p95_ms", 0.0) or 0.0,
-                ovh=row.get("overhead_per_request_ms", 0.0) or 0.0,  # NEW: show absolute overhead
+                delta=delta_str,
                 data=row.get("data_mean_mb", 0.0) or 0.0,
                 speedup=row.get("speedup_vs_semantic_blind") or 0.0,
                 savings=row.get("data_savings_pct_vs_semantic_blind") or 0.0,

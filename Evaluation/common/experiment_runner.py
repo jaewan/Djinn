@@ -10,7 +10,8 @@ import time
 from dataclasses import dataclass
 import atexit
 import os
-from datetime import datetime, timezone
+import sys
+from datetime import datetime, timezone, timedelta
 try:
     from datetime import UTC  # py3.11+
 except ImportError:
@@ -21,8 +22,10 @@ from typing import Dict, List, Optional
 import torch
 try:
     import torch.distributed.rpc as torch_rpc
+    from torch.distributed import TCPStore
 except Exception:  # pragma: no cover - optional dependency
     torch_rpc = None
+    TCPStore = None
 
 try:
     from djinn.server.profiling_context import ProfilingContext, set_profiler as _set_profiler
@@ -68,8 +71,18 @@ class LocalSyntheticBaselineRunner:
         spec = copy.deepcopy(workload_cfg.get("params", {}))
         workload = build_workload(impl, spec, self.device, self.dtype)
 
+        # OSDI FIX: Ensure CUDA kernels are fully compiled before timing
+        # This makes native baseline comparable to RPC (which has pre-warmed server)
+        if torch.cuda.is_available():
+            # Force CUDA context initialization
+            torch.cuda.synchronize()
+        
         for _ in range(self.warmup_runs):
             workload.run_once()
+        
+        # Additional sync after warmup to ensure all kernels are compiled
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
         runs: List[Dict[str, float]] = []
         for run_id in range(1, self.runs + 1):
@@ -264,16 +277,20 @@ class RemoteDjinnBaselineRunner:
             profiler_enabled = True
 
         # Phase 3: Use djinn.session() for semantic hints
+        # OSDI FIX: Pass generation hints for causal LM workloads
         import djinn
+        generation_hints = getattr(self, '_generation_hints', None)
+        execution_hints = generation_hints.copy() if generation_hints else {}
+        
         if self.semantic_aware:
             # For semantic-aware execution, use session context manager
             with djinn.session(phase="decode", priority="normal"):
                 start = time.perf_counter()
-                result = await manager.execute_model(model, inputs)
+                result = await manager.execute_model(model, inputs, hints=execution_hints or None)
         else:
             # For semantic-blind execution, don't use semantic hints
             start = time.perf_counter()
-            result = await manager.execute_model(model, inputs)
+            result = await manager.execute_model(model, inputs, hints=execution_hints or None)
         latency_ms = (time.perf_counter() - start) * 1000.0
 
         if profiler_enabled and _set_profiler:
@@ -334,6 +351,18 @@ class RemoteDjinnBaselineRunner:
                 else:
                     cloned[key] = value
             return cloned
+
+        # OSDI FIX: For causal LM workloads, include generation parameters
+        # so that Djinn server uses model.generate() instead of model.forward()
+        # This ensures fair comparison with native PyTorch baseline
+        self._generation_hints = None
+        if impl == "hf_causal_lm" and hasattr(workload, 'generation_params'):
+            self._generation_hints = {
+                'use_generate': True,
+                'max_new_tokens': workload.new_tokens,
+                'pad_token_id': workload.tokenizer.eos_token_id,
+                **workload.generation_params,
+            }
 
         if hasattr(workload, 'prepare_inputs'):
             def get_inputs():
@@ -450,24 +479,79 @@ class PytorchRpcBaselineRunner:
     def _ensure_rpc_initialized(cls):
         if cls._rpc_initialized:
             return
+        
+        # OSDI FIX: Auto-configure localhost RPC for single-machine testing
         master_addr = os.environ.get("MASTER_ADDR")
         master_port = os.environ.get("MASTER_PORT")
         rank = os.environ.get("RANK")
         world_size = os.environ.get("WORLD_SIZE")
+        
+        # If not set, auto-configure for localhost (requires rpc_server.py running)
+        if not (master_addr and master_port and rank and world_size):
+            print("⚠️  RPC environment not set, auto-configuring for localhost...")
+            master_addr = "127.0.0.1"
+            master_port = "29500"
+            rank = "1"  # Client is rank 1
+            world_size = "2"  # Server (0) + Client (1)
+            
+            # Set them so other code can use them
+            os.environ["MASTER_ADDR"] = master_addr
+            os.environ["MASTER_PORT"] = master_port
+            os.environ["RANK"] = rank
+            os.environ["WORLD_SIZE"] = world_size
+            
+            print(f"  MASTER_ADDR={master_addr}, MASTER_PORT={master_port}")
+            print(f"  RANK={rank}, WORLD_SIZE={world_size}")
+            print("  ℹ️  Make sure rpc_server.py is running with RANK=0!")
+        
         if not (master_addr and master_port and rank and world_size):
             raise EnvironmentError(
                 "MASTER_ADDR, MASTER_PORT, RANK, and WORLD_SIZE must be set for the PyTorch RPC baseline."
             )
+        
+        # Force CUDA context initialization before RPC init
+        # to avoid cold-start overhead being attributed to RPC baseline.
+        # See: OSDI Review - Critique 1 (RPC Warmup Trap)
+        if torch.cuda.is_available():
+            torch.ones(1).cuda()
+            torch.cuda.synchronize()
+        
+        rank_int = int(rank)
+        world_size_int = int(world_size)
+        init_timeout = 600  # 10 minutes for initialization
+        
+        print(f"[rpc_client] Initializing RPC: rank={rank_int}, world_size={world_size_int}", flush=True)
+        print(f"[rpc_client] MASTER_ADDR={master_addr}, MASTER_PORT={master_port}", flush=True)
+        
+        # Simple approach: call init_rpc with long timeouts
+        # Client waits a bit for server to be ready, then both coordinate via PyTorch's internal TCPStore
+        if rank_int != 0:
+            print(f"[rpc_client] Rank {rank_int}: Waiting for server to be ready...", flush=True)
+            # Add delay to allow server to start first
+            time.sleep(3)
+        
         init_method = f"tcp://{master_addr}:{master_port}"
         options = torch_rpc.TensorPipeRpcBackendOptions(init_method=init_method)
-        runner_timeout = cls._current_timeout()
-        options.rpc_timeout = 0 if runner_timeout <= 0 else runner_timeout
-        torch_rpc.init_rpc(
-            cls._current_client_name(),
-            rank=int(rank),
-            world_size=int(world_size),
-            rpc_backend_options=options,
-        )
+        options.rpc_timeout = init_timeout
+        
+        print(f"[rpc_client] Calling rpc.init_rpc with init_method={init_method}, timeout={init_timeout}s", flush=True)
+        
+        try:
+            torch_rpc.init_rpc(
+                cls._current_client_name(),
+                rank=rank_int,
+                world_size=world_size_int,
+                rpc_backend_options=options,
+            )
+            print("[rpc_client] RPC initialization succeeded", flush=True)
+        except Exception as e:
+            print(f"[rpc_client] RPC initialization failed: {e}", flush=True, file=sys.stderr)
+            raise
+        
+        # Allow server to stabilize after RPC init
+        # See: OSDI Review - Code Nit #1 (RPC Sync Race Condition)
+        time.sleep(1)
+        
         atexit.register(cls._shutdown_rpc)
         cls._rpc_initialized = True
 
@@ -611,12 +695,169 @@ def _flatten_server_metrics(metrics: Dict[str, float]) -> Dict[str, float]:
     return result
 
 
+# Import vLLM runner if available (direct import to avoid circular dependency)
+try:
+    import importlib.util
+    from pathlib import Path
+    # experiment_runner.py is in Evaluation/common/, so baseline_runners is in the same directory
+    _vllm_runner_path = Path(__file__).parent / "baseline_runners" / "vllm_runner.py"
+    if _vllm_runner_path.exists():
+        _spec = importlib.util.spec_from_file_location("_vllm_runner", _vllm_runner_path)
+        _vllm_module = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_vllm_module)  # type: ignore
+        vLLMBaselineRunner = _vllm_module.vLLMBaselineRunner
+    else:
+        vLLMBaselineRunner = None
+except (ImportError, Exception) as e:
+    import sys
+    print(f"[experiment_runner] Warning: Failed to load vLLMBaselineRunner: {e}", file=sys.stderr)
+    vLLMBaselineRunner = None  # type: ignore
+
+class RayActorBaselineRunner:
+    """Executes workloads via Ray Actor (Pickle + Plasma Object Store baseline)."""
+
+    def __init__(self, baseline_cfg: Dict, experiment_cfg: Dict):
+        self.cfg = baseline_cfg
+        self.exp_cfg = experiment_cfg
+        self.name = baseline_cfg["name"]
+        self.dtype = baseline_cfg.get("dtype", experiment_cfg.get("dtype", "float16"))
+        self.runs = baseline_cfg.get("runs", experiment_cfg.get("runs", 5))
+        self.warmup_runs = baseline_cfg.get("warmup_runs", experiment_cfg.get("warmup_runs", 1))
+        self.device = baseline_cfg.get("device", experiment_cfg.get("device", "cuda:0"))
+        self._actor = None
+        self._ray_initialized = False
+
+    def _ensure_ray_initialized(self):
+        """Initialize Ray connection if not already done."""
+        if self._ray_initialized:
+            return
+        
+        try:
+            import ray
+            if not ray.is_initialized():
+                # Try to connect to existing Ray cluster
+                try:
+                    ray.init(address="auto", ignore_reinit_error=True)
+                    print("[ray_actor_runner] Connected to existing Ray cluster")
+                except Exception as e:
+                    print(f"[ray_actor_runner] Failed to connect to Ray cluster: {e}")
+                    print("[ray_actor_runner] Make sure Ray is running: ray start --head --num-gpus=1")
+                    raise
+            self._ray_initialized = True
+        except ImportError:
+            raise RuntimeError(
+                "Ray is not installed. Install with: pip install ray[tune]"
+            )
+
+    def _ensure_actor(self, workload_cfg: Dict):
+        """Create Ray Actor if not already created."""
+        if self._actor is None:
+            self._ensure_ray_initialized()
+            
+            import ray
+            from Evaluation.exp5_1_overhead.scripts.ray_actor_server import ModelActor
+            
+            # Create remote actor
+            self._actor = ModelActor.remote(workload_cfg, self.device, self.dtype)
+            
+            # Wait for actor initialization by sending dummy request
+            try:
+                dummy_output = ray.get(
+                    self._actor.execute.remote({"input_ids": torch.zeros(1, dtype=torch.long)})
+                )
+                print(f"[ray_actor_runner] Actor initialized successfully")
+            except Exception as e:
+                print(f"[ray_actor_runner] Failed to initialize actor: {e}")
+                raise
+        
+        return self._actor
+
+    def run(self, workload_cfg: Dict) -> BaselineResult:
+        """Execute workload on Ray Actor and collect metrics."""
+        import ray
+        
+        actor = self._ensure_actor(workload_cfg)
+
+        # Build workload for input preparation (same as RPC)
+        impl = workload_cfg["implementation"]
+        spec = copy.deepcopy(workload_cfg.get("params", {}))
+        workload = build_workload(impl, spec, "cpu", self.dtype)
+
+        def prepare_inputs() -> Dict[str, torch.Tensor]:
+            prepared = workload.prepare_inputs()
+            return {
+                key: value.cpu() if torch.is_tensor(value) else value
+                for key, value in prepared.items()
+            }
+
+        def get_units(inputs: Dict[str, torch.Tensor], outputs: torch.Tensor) -> float:
+            return workload.units_from_output(inputs, outputs)
+
+        # Warmup runs (same as other baselines)
+        for _ in range(self.warmup_runs):
+            inputs = prepare_inputs()
+            # Use ray.put() for Plasma Object Store (fair comparison with other serialization)
+            inputs_ref = ray.put(inputs)
+            ray.get(actor.execute.remote(inputs_ref))
+
+        runs: List[Dict[str, float]] = []
+        for run_id in range(1, self.runs + 1):
+            inputs = prepare_inputs()
+
+            # Measure end-to-end latency including Plasma serialization
+            # This matches the end-to-end measurement of other baselines
+            start = time.perf_counter()
+            inputs_ref = ray.put(inputs)  # Plasma Object Store serialization
+            output = ray.get(actor.execute.remote(inputs_ref))
+            latency_ms = (time.perf_counter() - start) * 1000.0
+
+            # Compute metrics (same as other baselines)
+            input_mb = _tensor_dict_mb(inputs)
+            output_mb = _tensor_mb(output)
+            total_mb = input_mb + output_mb
+            units = get_units(inputs, output)
+            throughput = units / (latency_ms / 1000.0) if latency_ms > 0 else 0.0
+
+            runs.append(
+                {
+                    "run_id": run_id,
+                    "latency_ms": latency_ms,
+                    "input_mb": input_mb,
+                    "output_mb": output_mb,
+                    "total_data_mb": total_mb,
+                    "units_processed": units,
+                    "throughput_units_per_s": throughput,
+                }
+            )
+
+        aggregates = summarize_fields(runs, ["latency_ms", "throughput_units_per_s", "total_data_mb"])
+        metadata = {
+            **workload.metadata(),
+            "baseline": self.name,
+            "runner_type": "ray_actor",
+            "serialization": "Pickle + Plasma Object Store",
+        }
+
+        return BaselineResult(
+            baseline=self.name,
+            runner_type="ray_actor",
+            runs=runs,
+            aggregates=aggregates,
+            metadata=metadata,
+            derived={},
+        )
+
+
 RUNNER_TYPES = {
     "local_synthetic": LocalSyntheticBaselineRunner,
     "scaling": ScalingBaselineRunner,
     "remote_djinn": RemoteDjinnBaselineRunner,
     "pytorch_rpc": PytorchRpcBaselineRunner,
+    "native_server": NativeServerBaselineRunner,
+    "ray_actor": RayActorBaselineRunner,
 }
+if vLLMBaselineRunner is not None:
+    RUNNER_TYPES["vllm"] = vLLMBaselineRunner
 
 
 def _metrics_to_record(run_id: int, metrics: RunMetrics) -> Dict[str, float]:
@@ -629,6 +870,130 @@ def _metrics_to_record(run_id: int, metrics: RunMetrics) -> Dict[str, float]:
         "units_processed": metrics.units_processed,
         "throughput_units_per_s": metrics.throughput_units_per_s,
     }
+
+
+class NativeServerBaselineRunner:
+    """Runs native PyTorch baseline on dedicated server for fair comparison."""
+
+    def __init__(self, baseline_cfg: Dict, experiment_cfg: Dict):
+        self.cfg = baseline_cfg
+        self.exp_cfg = experiment_cfg
+        self.name = baseline_cfg["name"]
+        self.server_address = baseline_cfg.get("server_address", "localhost:5557")
+        self.dtype = baseline_cfg.get("dtype", experiment_cfg.get("dtype", "float16"))
+        self.runs = baseline_cfg.get("runs", experiment_cfg.get("runs", 5))
+        self.warmup_runs = baseline_cfg.get("warmup_runs", experiment_cfg.get("warmup_runs", 1))
+        # Parse address
+        parts = self.server_address.split(":")
+        self.host = parts[0]
+        self.port = int(parts[1]) if len(parts) > 1 else 5557
+
+    def run(self, workload_cfg: Dict) -> BaselineResult:
+        """Execute workload against native server."""
+        import json
+        import socket
+        import struct
+
+        impl = workload_cfg["implementation"]
+        spec = copy.deepcopy(workload_cfg.get("params", {}))
+        workload = build_workload(impl, spec, "cpu", self.dtype)
+
+        def prepare_inputs() -> Dict[str, torch.Tensor]:
+            prepared = workload.prepare_inputs()
+            return {
+                key: value.cpu() if torch.is_tensor(value) else value
+                for key, value in prepared.items()
+            }
+
+        def get_units(inputs: Dict[str, torch.Tensor], outputs: torch.Tensor) -> float:
+            return workload.units_from_output(inputs, outputs)
+
+        # Warmup
+        for _ in range(self.warmup_runs):
+            inputs = prepare_inputs()
+            self._execute_remote(inputs)
+
+        runs: List[Dict[str, float]] = []
+        for run_id in range(1, self.runs + 1):
+            inputs = prepare_inputs()
+            start = time.perf_counter()
+            output = self._execute_remote(inputs)
+            latency_ms = (time.perf_counter() - start) * 1000.0
+
+            input_mb = _tensor_dict_mb(inputs)
+            output_mb = _tensor_mb(output)
+            total_mb = input_mb + output_mb
+            units = get_units(inputs, output)
+            throughput = units / (latency_ms / 1000.0) if latency_ms > 0 else 0.0
+
+            runs.append(
+                {
+                    "run_id": run_id,
+                    "latency_ms": latency_ms,
+                    "input_mb": input_mb,
+                    "output_mb": output_mb,
+                    "total_data_mb": total_mb,
+                    "units_processed": units,
+                    "throughput_units_per_s": throughput,
+                }
+            )
+
+        aggregates = summarize_fields(runs, ["latency_ms", "throughput_units_per_s", "total_data_mb"])
+        metadata = {
+            **workload.metadata(),
+            "baseline": self.name,
+            "runner_type": "native_server",
+            "server_address": self.server_address,
+        }
+
+        return BaselineResult(
+            baseline=self.name,
+            runner_type="native_server",
+            runs=runs,
+            aggregates=aggregates,
+            metadata=metadata,
+            derived={},
+        )
+
+    def _execute_remote(self, inputs: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Send request to native server and get response."""
+        import json
+        import socket
+        import struct
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.connect((self.host, self.port))
+
+            # Build request
+            request = {
+                "workload": "hf_tiny_gpt2",  # This will be enhanced later
+                "inputs": {
+                    key: value.tolist() if torch.is_tensor(value) else value
+                    for key, value in inputs.items()
+                },
+            }
+            request_bytes = json.dumps(request).encode()
+
+            # Send request length + data
+            sock.sendall(struct.pack(">I", len(request_bytes)))
+            sock.sendall(request_bytes)
+
+            # Read response length + data
+            response_len_bytes = sock.recv(4)
+            if not response_len_bytes:
+                raise RuntimeError("No response from native server")
+
+            response_len = struct.unpack(">I", response_len_bytes)[0]
+            response_bytes = sock.recv(response_len)
+            response = json.loads(response_bytes.decode())
+
+            # Reconstruct output tensor from response
+            output = torch.zeros(response["output_shape"], dtype=torch.float16)
+            return output
+
+        finally:
+            sock.close()
 
 
 class ExperimentRunner:

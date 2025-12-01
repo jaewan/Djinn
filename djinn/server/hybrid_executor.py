@@ -185,7 +185,16 @@ class HybridExecutor:
             with torch.cuda.stream(exec_stream) if exec_stream else contextlib.nullcontext():
                 exec_start = time.perf_counter()
                 with torch.no_grad():
-                    execution_output = gpu_model(**gpu_inputs)
+                    # OSDI FIX: Support .generate() for fair comparison with native PyTorch baselines
+                    # Check if this is a causal LM with generation parameters
+                    generation_params = gpu_inputs.pop('_generation_params', None)
+                    if generation_params and hasattr(gpu_model, 'generate'):
+                        # Use autoregressive generation (same as native PyTorch baseline)
+                        logger.info(f"🎯 Using model.generate() with params: {generation_params}")
+                        execution_output = gpu_model.generate(**gpu_inputs, **generation_params)
+                    else:
+                        # Standard forward pass
+                        execution_output = gpu_model(**gpu_inputs)
                 timing_breakdown['execution'] = (time.perf_counter() - exec_start) * 1000
 
                 skel_start = time.perf_counter()

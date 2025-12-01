@@ -266,6 +266,7 @@ class HuggingFaceCausalLMWorkload:
                     self.model_id,
                     dtype=self.dtype,
                     low_cpu_mem_usage=True,
+                    use_safetensors=True,  # Bypass torch.load security requirement
                 ).to(self.device)
                 self.model.eval()
         except ImportError:
@@ -274,6 +275,7 @@ class HuggingFaceCausalLMWorkload:
                 self.model_id,
                 dtype=self.dtype,
                 low_cpu_mem_usage=True,
+                use_safetensors=True,  # Bypass torch.load security requirement
             ).to(self.device)
             self.model.eval()
 

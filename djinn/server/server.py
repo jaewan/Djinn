@@ -1877,6 +1877,19 @@ class DjinnServer:
                 request['_expected_tokens'] = int(expected_tokens)
             except (TypeError, ValueError):
                 pass
+        
+        # OSDI FIX: Extract generation parameters for causal LM workloads
+        # This enables fair comparison with native PyTorch .generate() baseline
+        use_generate = extras.get('use_generate') or request.get('use_generate')
+        if use_generate:
+            generation_params = {}
+            for key in ['max_new_tokens', 'temperature', 'top_p', 'top_k', 
+                        'do_sample', 'pad_token_id', 'num_beams']:
+                value = extras.get(key) or request.get(key)
+                if value is not None:
+                    generation_params[key] = value
+            if generation_params:
+                request['_generation_params'] = generation_params
 
     def _attach_stage_metadata(self, request: Dict, extras: Optional[Dict[str, Any]]) -> None:
         """Attach stage-execution metadata derived from serializer extras."""
@@ -2122,6 +2135,29 @@ class DjinnServer:
                     'status': 'error',
                     'message': f'Model {fingerprint} not found in cache. Register it first.'
                 }
+            
+            # OSDI FIX: Pass generation parameters for causal LM fair comparison
+            # This enables model.generate() instead of model.forward() when requested
+            # Check for generation hints (use_generate, max_new_tokens, etc.)
+            generation_params = {}
+            if request.get('use_generate'):
+                generation_params['use_generate'] = True
+                # Extract generation parameters from request
+                if 'max_new_tokens' in request:
+                    generation_params['max_new_tokens'] = request['max_new_tokens']
+                if 'pad_token_id' in request:
+                    generation_params['pad_token_id'] = request['pad_token_id']
+                # Pass any other generation-related params (top_k, temperature, etc.)
+                for key in ['top_k', 'top_p', 'temperature', 'do_sample', 'num_beams']:
+                    if key in request:
+                        generation_params[key] = request[key]
+                
+            if generation_params or request.get('_generation_params'):
+                inputs = dict(inputs)  # Ensure we don't modify the original
+                if generation_params:
+                    inputs['_generation_params'] = generation_params
+                elif request.get('_generation_params'):
+                    inputs['_generation_params'] = request.get('_generation_params')
             
             # Execute via HybridExecutor
             executor = get_hybrid_executor()

@@ -73,6 +73,21 @@ def _resolve_server_address(exp_cfg: Dict[str, Any]) -> Optional[str]:
     return exp_cfg.get("djinn_server_address") or os.environ.get("GENIE_SERVER_ADDRESS")
 
 
+def _verify_profiling_enabled() -> None:
+    """
+    OSDI FIX: Verify server profiling is enabled.
+    
+    Without profiling, timing breakdown columns will be empty, making the results
+    less useful for OSDI analysis. Warn the user if profiling appears disabled.
+    """
+    profiling_env = os.environ.get("GENIE_ENABLE_PROFILING", "").lower()
+    if profiling_env not in ("1", "true", "yes"):
+        print("⚠️  WARNING: GENIE_ENABLE_PROFILING is not set on the server.")
+        print("   Timing breakdown columns (server_plan_ms, server_execution_ms, etc.)")
+        print("   will be empty. Set 'GENIE_ENABLE_PROFILING=true' when starting server.")
+        print()
+
+
 def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
@@ -82,6 +97,9 @@ def main() -> None:
 
     server_address = _resolve_server_address(experiment_cfg)
     ensure_initialized(server_address)
+    
+    # OSDI FIX: Warn if profiling might be disabled
+    _verify_profiling_enabled()
 
     if args.workloads:
         workloads_cfg = filter_workloads(workloads_cfg, args.workloads)
