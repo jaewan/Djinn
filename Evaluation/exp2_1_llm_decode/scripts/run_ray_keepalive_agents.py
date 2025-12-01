@@ -205,25 +205,34 @@ def main() -> None:
             print(f"[ray-keepalive]   Without these ports, Ray will try to start locally and fail")
     
     try:
-        # OSDI FIX: Clean up any existing Ray sessions before connecting
-        # This prevents "node_ip_address.json" errors from stale sessions
+        # OSDI FIX: Use Ray client mode for pure client connections
+        # This prevents Ray from trying to start a local node
         import os
         ray_session_dir = "/tmp/ray"
         if os.path.exists(ray_session_dir):
             # Don't delete everything, just log that we're connecting fresh
             print(f"[ray-keepalive] Note: Existing Ray sessions in {ray_session_dir} (will use remote cluster)")
         
-        # OSDI FIX: Explicitly configure for remote cluster connection
-        # When connecting to remote cluster, we're a pure client (no local worker)
-        init_kwargs = {
-            "ignore_reinit_error": True,
-            "include_dashboard": False,
-        }
-        
+        # OSDI FIX: Use Ray client mode explicitly for remote connections
+        # This prevents Ray from trying to start a local node
         if ray_address:
-            init_kwargs["address"] = ray_address
-            # NOTE: Cannot use _system_config when connecting to existing cluster
-            # Ray will use the cluster's system config automatically
+            # Use ray:// protocol to force client mode
+            # This tells Ray to connect as a pure client, not try to start a local node
+            if not ray_address.startswith("ray://"):
+                ray_address = f"ray://{ray_address}"
+            
+            init_kwargs = {
+                "address": ray_address,
+                "ignore_reinit_error": True,
+                "include_dashboard": False,
+            }
+            print(f"[ray-keepalive] Connecting in client mode with: {ray_address}")
+        else:
+            # Local mode (not expected for this experiment)
+            init_kwargs = {
+                "ignore_reinit_error": True,
+                "include_dashboard": False,
+            }
         
         ray.init(**init_kwargs)
         

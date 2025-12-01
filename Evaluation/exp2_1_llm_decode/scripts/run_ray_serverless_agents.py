@@ -217,17 +217,26 @@ def main() -> None:
             # Don't delete everything, just log that we're connecting fresh
             print(f"[ray-serverless] Note: Existing Ray sessions in {ray_session_dir} (will use remote cluster)")
         
-        # OSDI FIX: Explicitly configure for remote cluster connection
-        # When connecting to remote cluster, we're a pure client (no local worker)
-        init_kwargs = {
-            "ignore_reinit_error": True,
-            "include_dashboard": False,
-        }
-        
+        # Use Ray client mode explicitly for remote connections
+        # This prevents Ray from trying to start a local node
         if ray_address:
-            init_kwargs["address"] = ray_address
-            # NOTE: Cannot use _system_config when connecting to existing cluster
-            # Ray will use the cluster's system config automatically
+            # Use ray:// protocol to force client mode
+            # This tells Ray to connect as a pure client, not try to start a local node
+            if not ray_address.startswith("ray://"):
+                ray_address = f"ray://{ray_address}"
+            
+            init_kwargs = {
+                "address": ray_address,
+                "ignore_reinit_error": True,
+                "include_dashboard": False,
+            }
+            print(f"[ray-serverless] Connecting in client mode with: {ray_address}")
+        else:
+            # Local mode (not expected for this experiment)
+            init_kwargs = {
+                "ignore_reinit_error": True,
+                "include_dashboard": False,
+            }
         
         ray.init(**init_kwargs)
         
