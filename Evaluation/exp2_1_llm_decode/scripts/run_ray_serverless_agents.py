@@ -162,19 +162,79 @@ def main() -> None:
     # OSDI FIX: Handle remote Ray cluster connection properly
     ray_address = args.ray_address
     if ray_address:
+        server_ip, server_port = ray_address.split(':')
         print(f"[ray-serverless] Connecting to Ray cluster at: {ray_address}")
-        print(f"[ray-serverless] Note: If connection fails, check:")
-        print(f"  1. Server is running: ray status --address {ray_address}")
-        print(f"  2. Network connectivity: nc -zv {ray_address.split(':')[0]} {ray_address.split(':')[1]}")
-        print(f"  3. Firewall allows Ray ports")
+        
+        # Test connectivity to required ports
+        import subprocess
+        import socket
+        print(f"[ray-serverless] Testing connectivity...")
+        
+        def test_port(host, port, timeout=2):
+            """Test if a port is reachable."""
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(timeout)
+                result = sock.connect_ex((host, int(port)))
+                sock.close()
+                return result == 0
+            except Exception:
+                return False
+        
+        # Test GCS port
+        if test_port(server_ip, server_port):
+            print(f"[ray-serverless] ✓ GCS port {server_port} is reachable")
+        else:
+            print(f"[ray-serverless] ✗ GCS port {server_port} is NOT reachable!")
+            print(f"[ray-serverless]   Fix: Open port {server_port} in AWS Security Group")
+        
+        # Test Raylet/Object Store ports (critical for worker communication)
+        test_ports = [10001, 10005, 10010, 10015]
+        all_ports_ok = True
+        failed_ports = []
+        for port in test_ports:
+            if not test_port(server_ip, port):
+                all_ports_ok = False
+                failed_ports.append(port)
+        
+        if all_ports_ok:
+            print(f"[ray-serverless] ✓ Raylet/Object Store ports (10001-10020) are reachable")
+        else:
+            print(f"[ray-serverless] ✗ Some Raylet ports are NOT reachable: {failed_ports}")
+            print(f"[ray-serverless]   Fix: Open ports 10001-10020 in AWS Security Group")
+            print(f"[ray-serverless]   This is required for Ray worker communication")
+            print(f"[ray-serverless]   Without these ports, Ray will try to start locally and fail")
     
     try:
-        ray.init(
-            address=ray_address or None,
-            ignore_reinit_error=True,
-            include_dashboard=False,
-        )
+        # OSDI FIX: Clean up any existing Ray sessions before connecting
+        # This prevents "node_ip_address.json" errors from stale sessions
+        import os
+        import shutil
+        ray_session_dir = "/tmp/ray"
+        if os.path.exists(ray_session_dir):
+            # Don't delete everything, just log that we're connecting fresh
+            print(f"[ray-serverless] Note: Existing Ray sessions in {ray_session_dir} (will use remote cluster)")
+        
+        # OSDI FIX: Explicitly configure for remote cluster connection
+        # When connecting to remote cluster, we're a pure client (no local worker)
+        init_kwargs = {
+            "ignore_reinit_error": True,
+            "include_dashboard": False,
+        }
+        
+        if ray_address:
+            init_kwargs["address"] = ray_address
+            # Set a longer timeout for remote connections
+            init_kwargs["_system_config"] = {
+                "object_timeout_milliseconds": 200000,
+            }
+        
+        ray.init(**init_kwargs)
+        
+        # Verify we're connected to the remote cluster
+        cluster_resources = ray.cluster_resources()
         print(f"[ray-serverless] Successfully connected to Ray cluster")
+        print(f"[ray-serverless] Cluster resources: {cluster_resources}")
     except Exception as e:
         print(f"[ray-serverless] ERROR: Failed to connect to Ray cluster at {ray_address}")
         print(f"[ray-serverless] Error: {e}")

@@ -474,6 +474,32 @@ If you see: `Can't find a node_ip_address.json file... Did you do ray start or r
    # Look for connection attempts from client IP
    ```
 
+7. **Verify ALL required ports are accessible from client:**
+   ```bash
+   # On client machine, test each port:
+   SERVER_IP=13.235.0.179
+   nc -zv $SERVER_IP 6379      # GCS port
+   nc -zv $SERVER_IP 10001     # Raylet/Object Store (start)
+   nc -zv $SERVER_IP 10010     # Raylet/Object Store (end)
+   nc -zv $SERVER_IP 10015     # Raylet/Object Store (middle)
+   ```
+   
+   **If any of these fail, your security group is still blocking ports!**
+
+8. **Clean up stale Ray sessions on client (if connection still fails):**
+   ```bash
+   # On client machine
+   ray stop  # Stop any local Ray instance
+   rm -rf /tmp/ray/session_*  # Remove stale sessions (be careful!)
+   ```
+
+9. **Ray version mismatch check:**
+   ```bash
+   # On both server and client
+   ray --version
+   # Versions should match (or be compatible)
+   ```
+
 **Djinn Connection Failed:**
 - Check server logs for errors
 - Verify model registration succeeds (check server stdout)
