@@ -160,7 +160,14 @@ def main() -> None:
     # OSDI FIX: Handle remote Ray cluster connection properly
     ray_address = args.ray_address
     if ray_address:
-        server_ip, server_port = ray_address.split(':')
+        # Parse address, handling both "IP:PORT" and "ray://IP:PORT" formats
+        if "://" in ray_address:
+            # Remove ray:// prefix if present
+            ray_address_clean = ray_address.split("://")[1]
+        else:
+            ray_address_clean = ray_address
+        
+        server_ip, server_port = ray_address_clean.split(':')
         print(f"[ray-keepalive] Connecting to Ray cluster at: {ray_address}")
         
         # Test connectivity to required ports
@@ -213,20 +220,18 @@ def main() -> None:
             # Don't delete everything, just log that we're connecting fresh
             print(f"[ray-keepalive] Note: Existing Ray sessions in {ray_session_dir} (will use remote cluster)")
         
-        # OSDI FIX: Use Ray client mode explicitly for remote connections
-        # This prevents Ray from trying to start a local node
+        # Connect to Ray cluster (use simple address format without ray://)
         if ray_address:
-            # Use ray:// protocol to force client mode
-            # This tells Ray to connect as a pure client, not try to start a local node
-            if not ray_address.startswith("ray://"):
-                ray_address = f"ray://{ray_address}"
+            # Use clean address (remove ray:// prefix if it was added)
+            if "://" in ray_address:
+                ray_address = ray_address.split("://")[1]
             
             init_kwargs = {
                 "address": ray_address,
                 "ignore_reinit_error": True,
                 "include_dashboard": False,
             }
-            print(f"[ray-keepalive] Connecting in client mode with: {ray_address}")
+            print(f"[ray-keepalive] Connecting with address: {ray_address}")
         else:
             # Local mode (not expected for this experiment)
             init_kwargs = {
