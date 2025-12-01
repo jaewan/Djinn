@@ -15,7 +15,7 @@ import time
 import random
 from pathlib import Path
 from statistics import mean
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import torch
 
@@ -72,6 +72,11 @@ class MemoryKernelRunner:
         self.max_sessions = max(int(self.workload.get("num_sessions", 1)), 1)
         self.ops_per_session = max(int(self.workload.get("operations_per_session", 1)), 1)
         self.alloc_sizes_mb = self.workload.get("alloc_sizes_mb", [1])
+        self.reuse_probability = float(self.workload.get("reuse_probability", 0.0))
+        self.hold_time_ms = float(self.workload.get("hold_time_ms", 0.0))
+        if self.hold_time_ms <= 0:
+            raise ValueError("session_workload.hold_time_ms must be > 0 to model live compute pressure")
+        self.metrics_sample_interval = max(int(self.workload.get("metrics_sample_interval", 100)), 1)
         self.min_alloc_bytes = int(min(self.alloc_sizes_mb) * MB)
         self.max_session_mb = int(
             self.workload.get(
@@ -87,6 +92,25 @@ class MemoryKernelRunner:
 
     def run(self) -> Dict[str, Any]:
         raise NotImplementedError
+
+    def _simulate_hold_work(self) -> None:
+        if self.hold_time_ms <= 0:
+            return
+        time.sleep(self.hold_time_ms / 1000.0)
+
+    def _maybe_record_metrics(
+        self,
+        op_counter: int,
+        events: List[Dict[str, Any]],
+        sampler: Callable[[], Optional[Dict[str, Any]]],
+    ) -> None:
+        if self.metrics_sample_interval <= 0:
+            return
+        if op_counter % self.metrics_sample_interval != 0:
+            return
+        sample = sampler()
+        if sample:
+            events.append(sample)
 
 
 class VMUMemoryKernelRunner(MemoryKernelRunner):
@@ -107,7 +131,7 @@ class VMUMemoryKernelRunner(MemoryKernelRunner):
         events: List[Dict[str, Any]] = []
         session_stats: List[Dict[str, Any]] = []
         active_sessions: Dict[str, Dict[str, Any]] = {}
-        sessions_launched = 0
+        op_counter = 0
 
         for session_idx in range(self.max_sessions):
             session_id = f"vmu_session_{session_idx}"
@@ -119,20 +143,31 @@ class VMUMemoryKernelRunner(MemoryKernelRunner):
             for session_id in list(active_sessions.keys())[::-1]:
                 session_info = active_sessions[session_id]
                 arena_used = self._arena_used(session_id)
+                op_counter += 1
                 if session_info["allocs_done"] >= self.ops_per_session:
                     stats = self._finish_session(session_id)
                     session_stats.append(stats)
                     session_info["allocs_done"] = 0
                     session_info["bytes_allocated"] = self._arena_used(session_id)
+                    self._maybe_record_metrics(op_counter, events, self._collect_vmu_metrics)
+                    continue
+                if (
+                    session_info["bytes_allocated"] > 0
+                    and self.rng.random() < self.reuse_probability
+                ):
+                    self._maybe_record_metrics(op_counter, events, self._collect_vmu_metrics)
                     continue
                 if arena_used + self.min_alloc_bytes > self.session_quota_bytes:
                     stats = self._finish_session(session_id)
                     session_stats.append(stats)
                     session_info["allocs_done"] = 0
                     session_info["bytes_allocated"] = self._arena_used(session_id)
+                    self._maybe_record_metrics(op_counter, events, self._collect_vmu_metrics)
                     continue
                 allocation_event = self._allocate(session_id, session_info)
                 events.append(allocation_event)
+                self._simulate_hold_work()
+                self._maybe_record_metrics(op_counter, events, self._collect_vmu_metrics)
 
         final_metrics = self.vmu.get_metrics().to_dict()
         summary = summarize_run(events, session_stats, final_metrics)
@@ -203,6 +238,26 @@ class VMUMemoryKernelRunner(MemoryKernelRunner):
         arena = self.vmu.data_segment.sessions.get(session_id)
         return arena.used if arena else 0
 
+    def _collect_vmu_metrics(self) -> Optional[Dict[str, Any]]:
+        metrics = self.vmu.get_metrics().to_dict()
+        reserved = metrics.get("data_reserved_bytes", 0)
+        capacity = metrics.get("data_capacity_bytes", 0)
+        external_gap = metrics.get("data_external_gap_bytes", 0)
+        internal_waste = metrics.get("data_internal_waste_bytes", 0)
+        return {
+            "kind": "metrics",
+            "allocator": "vmu",
+            "timestamp": time.time(),
+            "data_reserved_bytes": reserved,
+            "data_capacity_bytes": capacity,
+            "data_external_gap_bytes": external_gap,
+            "data_internal_waste_bytes": internal_waste,
+            "fragmentation_external": (external_gap / reserved) if reserved else 0.0,
+            "fragmentation_internal": (internal_waste / reserved) if reserved else 0.0,
+            "data_utilization": (reserved / capacity) if capacity else 0.0,
+            "active_sessions": metrics.get("active_sessions"),
+        }
+
 
 class TorchMemoryKernelRunner(MemoryKernelRunner):
     def run(self) -> Dict[str, Any]:
@@ -210,29 +265,71 @@ class TorchMemoryKernelRunner(MemoryKernelRunner):
         events: List[Dict[str, Any]] = []
         session_stats: List[Dict[str, Any]] = []
         active_sessions: Dict[str, Dict[str, Any]] = {}
-        sessions_launched = 0
+        max_session_bytes = self.max_session_mb * MB
+        op_counter = 0
+
+        for session_idx in range(self.max_sessions):
+            session_id = f"torch_session_{session_idx}"
+            active_sessions[session_id] = {
+                "allocs_done": 0,
+                "allocations": [],
+                "bytes_allocated": 0,
+            }
 
         while (time.perf_counter() - start) < self.duration_s and len(events) < self.max_events:
-            while len(active_sessions) < self.max_sessions:
-                session_id = f"torch_session_{sessions_launched}"
-                active_sessions[session_id] = {"allocs_done": 0, "tensors": []}
-                sessions_launched += 1
-
             for session_id in list(active_sessions.keys()):
                 session_info = active_sessions[session_id]
-                if session_info["allocs_done"] >= self.ops_per_session:
-                    stats = self._finish_session(session_id, session_info["tensors"])
+                op_counter += 1
+
+                if session_info["allocs_done"] >= self.ops_per_session or session_info["bytes_allocated"] >= max_session_bytes:
+                    stats = self._finish_session(session_id, session_info)
                     session_stats.append(stats)
-                    del active_sessions[session_id]
+                    self._maybe_record_metrics(op_counter, events, self._collect_torch_metrics)
+                    continue
+
+                if session_info["bytes_allocated"] > 0 and self.rng.random() < self.reuse_probability:
+                    self._maybe_record_metrics(op_counter, events, self._collect_torch_metrics)
+                    continue
+
+                action = "alloc"
+                if session_info["allocations"]:
+                    if self.rng.random() < 0.4:
+                        action = "free_one"
+
+                if action == "free_one":
+                    self._free_one_allocation(session_info)
+                    self._maybe_record_metrics(op_counter, events, self._collect_torch_metrics)
                     continue
 
                 size_mb = self.rng.choice(self.alloc_sizes_mb)
                 size_bytes = int(size_mb * MB)
-                t0 = time.perf_counter()
-                tensor = torch.empty(size_bytes, dtype=torch.uint8, device=f"cuda:{self.device_idx}")
-                latency_us = (time.perf_counter() - t0) * 1e6
-                session_info["tensors"].append(tensor)
+                if session_info["bytes_allocated"] + size_bytes > max_session_bytes:
+                    stats = self._finish_session(session_id, session_info)
+                    session_stats.append(stats)
+                    self._maybe_record_metrics(op_counter, events, self._collect_torch_metrics)
+                    continue
+
+                try:
+                    t0 = time.perf_counter()
+                    tensor = torch.empty(size_bytes, dtype=torch.uint8, device=f"cuda:{self.device_idx}")
+                    latency_us = (time.perf_counter() - t0) * 1e6
+                except torch.cuda.OutOfMemoryError as exc:
+                    events.append(
+                        {
+                            "kind": "oom",
+                            "session_id": session_id,
+                            "requested_bytes": size_bytes,
+                            "timestamp": time.time(),
+                            "message": str(exc),
+                        }
+                    )
+                    torch.cuda.empty_cache()
+                    self._maybe_record_metrics(op_counter, events, self._collect_torch_metrics)
+                    continue
+
                 session_info["allocs_done"] += 1
+                session_info["bytes_allocated"] += size_bytes
+                session_info["allocations"].append({"tensor": tensor, "size_bytes": size_bytes})
                 events.append(
                     {
                         "kind": "alloc",
@@ -243,6 +340,8 @@ class TorchMemoryKernelRunner(MemoryKernelRunner):
                         "timestamp": time.time(),
                     }
                 )
+                self._simulate_hold_work()
+                self._maybe_record_metrics(op_counter, events, self._collect_torch_metrics)
 
         torch.cuda.synchronize(self.device_idx)
         final_metrics = torch_allocator_metrics(self.device_idx)
@@ -257,17 +356,41 @@ class TorchMemoryKernelRunner(MemoryKernelRunner):
             "final_metrics": final_metrics,
         }
 
-    def _finish_session(self, session_id: str, tensors: List[torch.Tensor]) -> Dict[str, Any]:
-        for tensor in tensors:
-            del tensor
-        torch.cuda.empty_cache()
+    def _free_one_allocation(self, session_info: Dict[str, Any]) -> None:
+        idx = self.rng.randint(0, len(session_info["allocations"]) - 1)
+        entry = session_info["allocations"].pop(idx)
+        session_info["bytes_allocated"] = max(session_info["bytes_allocated"] - entry["size_bytes"], 0)
+        del entry["tensor"]
+
+    def _finish_session(self, session_id: str, session_info: Dict[str, Any]) -> Dict[str, Any]:
+        for entry in session_info["allocations"]:
+            del entry["tensor"]
+        session_info["allocations"].clear()
+        session_info["bytes_allocated"] = 0
+        session_info["allocs_done"] = 0
+        torch.cuda.synchronize(self.device_idx)
         metrics = torch_allocator_metrics(self.device_idx)
         return {
             "session_id": session_id,
             "torch_allocated_bytes": metrics["allocated_bytes"],
             "torch_reserved_bytes": metrics["reserved_bytes"],
-            "fragmentation_ratio": metrics["fragmentation_ratio"],
+            "allocator_fragmentation_ratio": metrics["fragmentation_ratio"],
+            "driver_fragmentation_ratio": metrics.get("driver_fragmentation_ratio"),
             "timestamp": time.time(),
+        }
+
+    def _collect_torch_metrics(self) -> Optional[Dict[str, Any]]:
+        metrics = torch_allocator_metrics(self.device_idx)
+        return {
+            "kind": "metrics",
+            "allocator": "torch",
+            "timestamp": time.time(),
+            "allocated_bytes": metrics["allocated_bytes"],
+            "reserved_bytes": metrics["reserved_bytes"],
+            "allocator_fragmentation_ratio": metrics["fragmentation_ratio"],
+            "driver_free_bytes": metrics.get("driver_free_bytes"),
+            "driver_total_bytes": metrics.get("driver_total_bytes"),
+            "driver_fragmentation_ratio": metrics.get("driver_fragmentation_ratio"),
         }
 
 
@@ -278,10 +401,15 @@ def torch_allocator_metrics(device_idx: int) -> Dict[str, Any]:
     frag = 0.0
     if reserved > 0:
         frag = max(reserved - allocated, 0) / reserved
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    driver_frag = 1.0 - (free_bytes / total_bytes) if total_bytes else 0.0
     return {
         "allocated_bytes": allocated,
         "reserved_bytes": reserved,
         "fragmentation_ratio": frag,
+        "driver_free_bytes": free_bytes,
+        "driver_total_bytes": total_bytes,
+        "driver_fragmentation_ratio": driver_frag,
     }
 
 

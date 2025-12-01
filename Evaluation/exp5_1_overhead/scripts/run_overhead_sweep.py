@@ -13,7 +13,11 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import datetime, UTC
+from datetime import datetime, timezone
+try:
+    from datetime import UTC  # Python 3.11+
+except ImportError:
+    UTC = timezone.utc
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import os

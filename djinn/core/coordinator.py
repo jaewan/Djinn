@@ -1777,14 +1777,42 @@ class DjinnCoordinator:
             if semantic_hints:
                 extra_metadata.update(semantic_hints)
             
-            serialized = ModelExecutionSerializer.serialize_execute_request(
-                fingerprint=fingerprint,
-                inputs=inputs,
-                profile_id=profile_id,
-                qos_class=qos_class,
-                deadline_ms=deadline_ms,
-                extra_metadata=extra_metadata if extra_metadata else None
-            )
+            profiler = None
+            try:
+                from djinn.server.profiling_context import get_profiler
+                profiler = get_profiler()
+            except ImportError:
+                profiler = None
+
+            def _serialize_request():
+                return ModelExecutionSerializer.serialize_execute_request(
+                    fingerprint=fingerprint,
+                    inputs=inputs,
+                    profile_id=profile_id,
+                    qos_class=qos_class,
+                    deadline_ms=deadline_ms,
+                    extra_metadata=extra_metadata if extra_metadata else None
+                )
+
+            if profiler and profiler.enabled:
+                serialize_start = time.perf_counter()
+                serialized = _serialize_request()
+                tensor_bytes = 0
+                tensor_count = 0
+                for value in inputs.values():
+                    if torch.is_tensor(value):
+                        tensor_bytes += value.element_size() * value.numel()
+                        tensor_count += 1
+                profiler.record_phase(
+                    'client_serialize',
+                    (time.perf_counter() - serialize_start) * 1000,
+                    metadata={
+                        'tensor_count': tensor_count,
+                        'tensor_bytes': tensor_bytes,
+                    },
+                )
+            else:
+                serialized = _serialize_request()
 
             # Send with EXECUTE_MODEL message type
             logger.debug(f"Sending EXECUTE_MODEL request to {server_address}")
@@ -1800,7 +1828,16 @@ class DjinnCoordinator:
             
             # Deserialize response using binary protocol
             try:
-                result, metrics, status, error_message = ModelExecutionSerializer.deserialize_execute_response(response_data)
+                if profiler and profiler.enabled:
+                    deserialize_start = time.perf_counter()
+                    result, metrics, status, error_message = ModelExecutionSerializer.deserialize_execute_response(response_data)
+                    profiler.record_phase(
+                        'client_deserialize',
+                        (time.perf_counter() - deserialize_start) * 1000,
+                        metadata={'response_bytes': len(response_data)},
+                    )
+                else:
+                    result, metrics, status, error_message = ModelExecutionSerializer.deserialize_execute_response(response_data)
             except Exception:
                 logger.error(f"⚠️  Failed to parse EXECUTE_MODEL response ({len(response_data)} bytes)")
                 logger.error(f"Response head: {response_data[:32].hex()}")

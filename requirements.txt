@@ -42,5 +42,22 @@ matplotlib>=3.5.0
 pandas>=2.0.0
 seaborn>=0.13.0
 
-# Distributed computing (for benchmarks)
-ray>=2.0.0
+# Distributed computing (for benchmarks and baselines)
+# ray[default] includes tune, air, client, server
+# For additional tools, install: pip install -U ray[data,train,tune,air]
+ray[default]>=2.10.0
+
+# RPC and distributed execution (for PyTorch RPC baseline)
+# PyTorch distributed is bundled with torch
+
+# vLLM for serving baseline (optional - requires compatible CUDA)
+# Install separately: pip install vllm>=0.4.0
+vllm>=0.4.0
+
+# Evaluation and monitoring utilities
+xxhash>=3.4.0
+prometheus-client>=0.18.0
+
+# Optional: For vLLM support (uncomment when needed)
+# lm-format-enforcer>=0.4.3
+# flash-attn>=2.3.0

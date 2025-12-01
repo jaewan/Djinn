@@ -52,7 +52,7 @@ import torch
 import torch.nn as nn
 from typing import Dict, Any, List, Optional, Tuple, Union
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 from .optimizations.phase_executor import PhaseAwareExecutor, ExecutionPhase
@@ -71,6 +71,7 @@ class ExecutionMetrics:
     output_refs_count: int
     success: bool
     plan_summary: Optional[Dict[str, Any]] = None
+    timing_breakdown: Dict[str, float] = field(default_factory=dict)
 
 
 class StageType(Enum):
@@ -217,7 +218,8 @@ class HybridExecutor:
                 activations_count=self._count_activations(execution_output),
                 output_refs_count=1,
                 success=True,
-                plan_summary=plan.semantic_summary if plan else None
+                plan_summary=plan.semantic_summary if plan else None,
+                timing_breakdown=dict(timing_breakdown),
             )
 
             vmu_stats = self.vmu.get_stats()
@@ -253,7 +255,8 @@ class HybridExecutor:
                 activations_count=0,
                 output_refs_count=0,
                 success=False,
-                plan_summary=None
+                plan_summary=None,
+                timing_breakdown=dict(timing_breakdown),
             )
             
             raise

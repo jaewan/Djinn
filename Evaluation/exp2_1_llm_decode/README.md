@@ -105,6 +105,42 @@ python Evaluation/exp2_1_llm_decode/scripts/run_local_baseline.py \
 Tail the Djinn server logs to ensure transport/connectivity and compare the
 `backend`, `djinn_server`, and latency fields in the resulting JSON.
 
+## Ray Keep-Alive Baseline
+To reproduce the “persistent actor” comparison, launch Ray locally (or point to
+an existing cluster) and run:
+
+```bash
+python Evaluation/exp2_1_llm_decode/scripts/run_ray_keepalive_agents.py \
+  --model-id meta-llama/Llama-2-7b-hf \
+  --prompt-file Evaluation/exp2_1_llm_decode/configs/prompt.txt \
+  --agent-counts 1 2 4 8 \
+  --iterations 1 \
+  --sleep-seconds 10 \
+  --output-dir Evaluation/exp2_1_llm_decode/results/ray_keepalive
+```
+
+Each agent receives a dedicated Ray actor that pins the full model + KV cache on
+GPU memory for the duration of the experiment.  The output JSON matches the
+structure used by other hero baselines, enabling direct comparison of per-stage
+latency across concurrency levels.
+
+## Ray Serverless Baseline
+For the stateless/serverless comparison (load/unload per step), run:
+
+```bash
+python Evaluation/exp2_1_llm_decode/scripts/run_ray_serverless_agents.py \
+  --model-id meta-llama/Llama-2-7b-hf \
+  --prompt-file Evaluation/exp2_1_llm_decode/configs/prompt.txt \
+  --agent-counts 1 2 4 8 \
+  --iterations 1 \
+  --sleep-seconds 10 \
+  --output-dir Evaluation/exp2_1_llm_decode/results/ray_serverless
+```
+
+Each `Reason`/`Reflect` step executes as a fresh Ray task that reloads the
+weights, recomputes the prompt, and discards state afterwards, capturing the
+cold-start costs inherent to this design.
+
 ## Open Tasks
 - [ ] Add Djinn remote executor harness with semantic toggles.
 - [ ] Stream GPU utilization samples via NVML instead of relying on `nvidia-smi`.

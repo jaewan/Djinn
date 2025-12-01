@@ -169,14 +169,18 @@ This document summarizes the evaluation suite, the exact pre-work required befor
 ### Experiment 3.2 – Memory Kernel Deep Dive
 
 1. **Config**: `Evaluation/exp3_2_memory_kernel/configs/session_stress.yaml`.
-2. **Synthetic quick run**:
+2. **Isolation sanity check** (quick verification that VMU session offsets stay private):
+   ```bash
+   python Evaluation/exp3_2_memory_kernel/scripts/check_vmu_isolation.py --device 0
+   ```
+3. **Synthetic quick run**:
    ```bash
    python Evaluation/exp3_2_memory_kernel/scripts/run_memory_stress.py \
        --config Evaluation/exp3_2_memory_kernel/configs/session_stress.yaml \
        --allocator vmu --duration 30 \
        --output Evaluation/exp3_2_memory_kernel/results/vmu_synth.json
    ```
-3. **24‑hour real run**:
+4. **24‑hour real run**:
    ```bash
    python Evaluation/exp3_2_memory_kernel/scripts/run_memory_kernel.py \
        --config Evaluation/exp3_2_memory_kernel/configs/session_stress.yaml \
@@ -184,7 +188,7 @@ This document summarizes the evaluation suite, the exact pre-work required befor
        --output Evaluation/exp3_2_memory_kernel/results/vmu_real.json
    ```
    Repeat with `--allocator torch`.
-4. **Plot**: `scripts/analyze_memory_kernel.py` (to be added) for Fig 9 / Table 3.
+5. **Plot**: `scripts/analyze_memory_kernel.py` (to be added) for Fig 9 / Table 3.
 
 ---
 
@@ -225,6 +229,30 @@ This document summarizes the evaluation suite, the exact pre-work required befor
        --tag hf_smoke_run --workloads hf_tiny_gpt2
    ```
    For full sweep, point config to expanded list, increase `experiment.runs` to 30, and ensure both semantic/blind baselines use true remote executions (no scaling placeholders). Use `analyze_overhead.py` to produce Figure 12.
+4. **PyTorch RPC baseline**:
+   - Launch the RPC server (set `MASTER_ADDR/PORT`, `WORLD_SIZE=2`, `RANK=0`):
+     ```bash
+     python Evaluation/exp5_1_overhead/scripts/rpc_server.py \
+         --config Evaluation/exp5_1_overhead/configs/overhead_hf_smoke.yaml
+     ```
+   - Run the client baseline (set `RANK=1` with same env):
+     ```bash
+     python Evaluation/exp5_1_overhead/scripts/run_overhead_sweep.py \
+         --config Evaluation/exp5_1_overhead/configs/overhead_hf_smoke.yaml \
+         --workloads llama_prefill_1k --tag pytorch_rpc
+     ```
+5. **vLLM baseline**:
+   - Start vLLM’s OpenAI-compatible server (example):
+     ```bash
+     python -m vllm.entrypoints.openai.api_server \
+         --model meta-llama/Llama-2-7b-hf --port 8000 --host 0.0.0.0
+     ```
+   - Capture microbench numbers:
+     ```bash
+     python Evaluation/exp5_1_overhead/scripts/run_vllm_client.py \
+         --workloads llama_prefill_1k llama_decode_1tok \
+         --runs 20 --tag vllm_remote
+     ```
 
 ---
 

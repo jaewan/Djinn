@@ -374,8 +374,15 @@ class DataSegment(MemorySegment):
             if session_id not in self.sessions:
                 raise RuntimeError(f"Session {session_id} not found in Data Segment")
 
-            if offset + size > self.capacity:
-                raise RuntimeError(f"Invalid offset/size for session {session_id}")
+            arena = self.sessions[session_id]
+
+            arena_start = arena.base_offset
+            arena_end = arena.base_offset + arena.capacity
+            if offset < arena_start or (offset + size) > arena_end:
+                raise RuntimeError(
+                    f"Session {session_id} attempted to access offset {offset}:{offset + size} "
+                    f"outside its arena [{arena_start}, {arena_end})"
+                )
 
             buffer = self.slab
             return buffer[offset:offset + size].view(dtype)

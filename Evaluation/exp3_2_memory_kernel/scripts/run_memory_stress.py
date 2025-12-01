@@ -2,9 +2,10 @@
 """
 Synthetic memory stress harness for Experiment 3.2.
 
-Simulates concurrent sessions performing allocate/use/free cycles to validate
-fragmentation and allocation latency instrumentation before hooking into real
-VMU/allocator backends.
+NOTE: Development-only harness. This script exists purely to smoke test logging and plotting
+infrastructure before exercising the real VMU/Torch harness in
+`run_memory_kernel.py`. Its latency/fragmentation values are synthetic and MUST
+NOT be used in any figure or table.
 """
 
 from __future__ import annotations
@@ -82,7 +83,7 @@ class CudaAllocator(BaseAllocator):
         return record
 
     def fragmentation(self) -> float:
-        return min(0.35, len(self.active_allocations) * 0.02)
+        return 0.0  # Synthetic harness: fragmentation is not modeled
 
 
 class TorchAllocator(BaseAllocator):
@@ -98,7 +99,7 @@ class TorchAllocator(BaseAllocator):
         return record
 
     def fragmentation(self) -> float:
-        return min(0.2, len(self.active_allocations) * 0.01)
+        return 0.0  # Synthetic harness: fragmentation is not modeled
 
 
 ALLOCATORS = {

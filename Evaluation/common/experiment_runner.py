@@ -8,14 +8,31 @@ import asyncio
 import copy
 import time
 from dataclasses import dataclass
-from datetime import datetime, UTC
+import atexit
+import os
+from datetime import datetime, timezone
+try:
+    from datetime import UTC  # py3.11+
+except ImportError:
+    UTC = timezone.utc
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import torch
+try:
+    import torch.distributed.rpc as torch_rpc
+except Exception:  # pragma: no cover - optional dependency
+    torch_rpc = None
+
+try:
+    from djinn.server.profiling_context import ProfilingContext, set_profiler as _set_profiler
+except Exception:  # pragma: no cover - profiling optional
+    ProfilingContext = None  # type: ignore
+    _set_profiler = None  # type: ignore
 
 from .metrics import summarize_fields
 from .workloads import RunMetrics, build_workload
+from . import pytorch_rpc_ops
 
 
 def _default_device() -> str:
@@ -219,7 +236,7 @@ class RemoteDjinnBaselineRunner:
         manager = await self._ensure_manager()
         await manager.register_model(model, model_id=model_id)
 
-    async def _run_once_remote(self, model: torch.nn.Module, inputs: Dict[str, torch.Tensor]) -> tuple[torch.Tensor, float, float, float]:
+    async def _run_once_remote(self, model: torch.nn.Module, inputs: Dict[str, torch.Tensor]) -> tuple[torch.Tensor, float, float, float, Dict[str, float], Dict[str, float]]:
         """Execute one run remotely and return (output, input_mb, output_mb, latency_ms)."""
         manager = await self._ensure_manager()
         
@@ -238,6 +255,14 @@ class RemoteDjinnBaselineRunner:
         # Track data transfer
         input_bytes = sum(t.element_size() * t.numel() for t in inputs.values())
         
+        profiler = None
+        profiler_enabled = False
+        if ProfilingContext and _set_profiler:
+            profiler = ProfilingContext(enabled=True)
+            profiler.start()
+            _set_profiler(profiler)
+            profiler_enabled = True
+
         # Phase 3: Use djinn.session() for semantic hints
         import djinn
         if self.semantic_aware:
@@ -250,6 +275,13 @@ class RemoteDjinnBaselineRunner:
             start = time.perf_counter()
             result = await manager.execute_model(model, inputs)
         latency_ms = (time.perf_counter() - start) * 1000.0
+
+        if profiler_enabled and _set_profiler:
+            _set_profiler(None)
+        client_phases: Dict[str, float] = {}
+        if profiler:
+            client_phases = profiler.get_phase_dict()
+        server_metrics = manager.last_execution_metrics or {}
         
         # Extract output tensor
         if torch.is_tensor(result):
@@ -277,7 +309,7 @@ class RemoteDjinnBaselineRunner:
         input_mb = input_bytes / (1024**2)
         output_mb = output_bytes / (1024**2)
         
-        return output.cpu(), input_mb, output_mb, latency_ms
+        return output.cpu(), input_mb, output_mb, latency_ms, client_phases, server_metrics
 
     async def run_async(self, workload_cfg: Dict) -> BaselineResult:
         """Async version of run() for remote execution."""
@@ -334,7 +366,7 @@ class RemoteDjinnBaselineRunner:
         runs: List[Dict[str, float]] = []
         for run_id in range(1, self.runs + 1):
             inputs = get_inputs()
-            output, input_mb, output_mb, latency_ms = await self._run_once_remote(model, inputs)
+            output, input_mb, output_mb, latency_ms, client_phases, server_metrics = await self._run_once_remote(model, inputs)
             
             units = get_units(inputs, output)
             throughput = units / (latency_ms / 1000.0) if latency_ms > 0 else 0.0
@@ -347,9 +379,28 @@ class RemoteDjinnBaselineRunner:
                 "total_data_mb": input_mb + output_mb,
                 "units_processed": units,
                 "throughput_units_per_s": throughput,
+                **_flatten_client_phases(client_phases),
+                **_flatten_server_metrics(server_metrics),
             })
         
-        aggregates = summarize_fields(runs, ["latency_ms", "throughput_units_per_s", "total_data_mb"])
+        summary_fields = [
+            "latency_ms",
+            "throughput_units_per_s",
+            "total_data_mb",
+            "client_serialize_ms",
+            "client_deserialize_ms",
+            "client_network_c2s_ms",
+            "client_network_s2c_ms",
+            "server_duration_ms",
+            "server_executor_time_ms",
+            "server_queue_latency_ms",
+            "server_plan_ms",
+            "server_placement_ms",
+            "server_execution_ms",
+            "server_skeletonization_ms",
+            "server_cleanup_ms",
+        ]
+        aggregates = summarize_fields(runs, summary_fields)
         metadata = {
             **workload.metadata(),
             "baseline": self.name,
@@ -373,10 +424,198 @@ class RemoteDjinnBaselineRunner:
         return asyncio.run(self.run_async(workload_cfg))
 
 
+class PytorchRpcBaselineRunner:
+    """Executes workloads via a user-managed PyTorch RPC server."""
+
+    _rpc_initialized = False
+    _client_worker_name: Optional[str] = None
+
+    def __init__(self, baseline_cfg: Dict, experiment_cfg: Dict):
+        if torch_rpc is None:
+            raise RuntimeError("torch.distributed.rpc is not available")
+        self.cfg = baseline_cfg
+        self.exp_cfg = experiment_cfg
+        self.name = baseline_cfg["name"]
+        self.dtype = baseline_cfg.get("dtype", experiment_cfg.get("dtype", "float16"))
+        self.runs = baseline_cfg.get("runs", experiment_cfg.get("runs", 5))
+        self.warmup_runs = baseline_cfg.get("warmup_runs", experiment_cfg.get("warmup_runs", 1))
+        self.server_worker = baseline_cfg.get("rpc_server_name", "rpc_server")
+        self.client_worker = baseline_cfg.get("rpc_client_name", f"rpc_client_{os.getpid()}")
+        self.rpc_timeout_s = baseline_cfg.get("rpc_timeout_s", 0.0)
+        self._set_client_name(self.client_worker)
+        self._set_timeout(self.rpc_timeout_s)
+        self._ensure_rpc_initialized()
+
+    @classmethod
+    def _ensure_rpc_initialized(cls):
+        if cls._rpc_initialized:
+            return
+        master_addr = os.environ.get("MASTER_ADDR")
+        master_port = os.environ.get("MASTER_PORT")
+        rank = os.environ.get("RANK")
+        world_size = os.environ.get("WORLD_SIZE")
+        if not (master_addr and master_port and rank and world_size):
+            raise EnvironmentError(
+                "MASTER_ADDR, MASTER_PORT, RANK, and WORLD_SIZE must be set for the PyTorch RPC baseline."
+            )
+        init_method = f"tcp://{master_addr}:{master_port}"
+        options = torch_rpc.TensorPipeRpcBackendOptions(init_method=init_method)
+        runner_timeout = cls._current_timeout()
+        options.rpc_timeout = 0 if runner_timeout <= 0 else runner_timeout
+        torch_rpc.init_rpc(
+            cls._current_client_name(),
+            rank=int(rank),
+            world_size=int(world_size),
+            rpc_backend_options=options,
+        )
+        atexit.register(cls._shutdown_rpc)
+        cls._rpc_initialized = True
+
+    @classmethod
+    def _current_client_name(cls) -> str:
+        if cls._client_worker_name is None:
+            cls._client_worker_name = f"rpc_client_{os.getpid()}"
+        return cls._client_worker_name
+
+    @classmethod
+    def _set_client_name(cls, value: str) -> None:
+        cls._client_worker_name = value
+
+    @classmethod
+    def _current_timeout(cls) -> float:
+        return getattr(cls, "_rpc_timeout_value", 0.0)
+
+    @classmethod
+    def _set_timeout(cls, value: float) -> None:
+        cls._rpc_timeout_value = max(0.0, float(value))
+
+    @classmethod
+    def _shutdown_rpc(cls) -> None:
+        if cls._rpc_initialized:
+            torch_rpc.shutdown()
+            cls._rpc_initialized = False
+
+    def run(self, workload_cfg: Dict) -> BaselineResult:
+        impl = workload_cfg["implementation"]
+        spec = copy.deepcopy(workload_cfg.get("params", {}))
+        workload = build_workload(impl, spec, "cpu", self.dtype)
+
+        def prepare_inputs() -> Dict[str, torch.Tensor]:
+            prepared = workload.prepare_inputs()
+            return {
+                key: value.cpu() if torch.is_tensor(value) else value
+                for key, value in prepared.items()
+            }
+
+        def get_units(inputs: Dict[str, torch.Tensor], outputs: torch.Tensor) -> float:
+            return workload.units_from_output(inputs, outputs)
+
+        for _ in range(self.warmup_runs):
+            inputs = prepare_inputs()
+            self._execute_remote(workload_cfg["name"], inputs)
+
+        runs: List[Dict[str, float]] = []
+        for run_id in range(1, self.runs + 1):
+            inputs = prepare_inputs()
+            start = time.perf_counter()
+            output = self._execute_remote(workload_cfg["name"], inputs)
+            latency_ms = (time.perf_counter() - start) * 1000.0
+            input_mb = _tensor_dict_mb(inputs)
+            output_mb = _tensor_mb(output)
+            total_mb = input_mb + output_mb
+            units = get_units(inputs, output)
+            throughput = units / (latency_ms / 1000.0) if latency_ms > 0 else 0.0
+            runs.append(
+                {
+                    "run_id": run_id,
+                    "latency_ms": latency_ms,
+                    "input_mb": input_mb,
+                    "output_mb": output_mb,
+                    "total_data_mb": total_mb,
+                    "units_processed": units,
+                    "throughput_units_per_s": throughput,
+                }
+            )
+
+        aggregates = summarize_fields(runs, ["latency_ms", "throughput_units_per_s", "total_data_mb"])
+        metadata = {
+            **workload.metadata(),
+            "baseline": self.name,
+            "runner_type": "pytorch_rpc",
+            "rpc_server": self.server_worker,
+        }
+        return BaselineResult(
+            baseline=self.name,
+            runner_type="pytorch_rpc",
+            runs=runs,
+            aggregates=aggregates,
+            metadata=metadata,
+            derived={},
+        )
+
+    def _execute_remote(self, workload_name: str, inputs: Dict[str, torch.Tensor]) -> torch.Tensor:
+        payload = {
+            key: value.cpu() if torch.is_tensor(value) else value
+            for key, value in inputs.items()
+        }
+        result = torch_rpc.rpc_sync(
+            self.server_worker,
+            pytorch_rpc_ops.rpc_forward,
+            args=(workload_name, payload),
+        )
+        if isinstance(result, torch.Tensor):
+            return result
+        raise RuntimeError(
+            f"RPC forward for workload '{workload_name}' returned unsupported type: {type(result)}"
+        )
+
+def _flatten_client_phases(phases: Dict[str, float]) -> Dict[str, float]:
+    mapping = {
+        "client_serialize_ms": "client_serialize",
+        "client_deserialize_ms": "client_deserialize",
+        "client_network_c2s_ms": "network_c2s",
+        "client_network_s2c_ms": "network_s2c",
+    }
+    result: Dict[str, float] = {}
+    for out_key, phase_name in mapping.items():
+        value = phases.get(phase_name)
+        if value is not None:
+            result[out_key] = float(value)
+    return result
+
+
+def _flatten_server_metrics(metrics: Dict[str, float]) -> Dict[str, float]:
+    result: Dict[str, float] = {}
+    scalar_mapping = {
+        "server_duration_ms": "duration_ms",
+        "server_executor_time_ms": "executor_time_ms",
+        "server_queue_latency_ms": "queue_latency_ms",
+    }
+    for out_key, metric_key in scalar_mapping.items():
+        value = metrics.get(metric_key)
+        if value is not None:
+            result[out_key] = float(value)
+
+    timing_breakdown = metrics.get("timing_breakdown_ms") or {}
+    breakdown_mapping = {
+        "server_plan_ms": "planning",
+        "server_placement_ms": "placement",
+        "server_execution_ms": "execution",
+        "server_skeletonization_ms": "skeletonization",
+        "server_cleanup_ms": "cleanup",
+    }
+    for out_key, phase in breakdown_mapping.items():
+        value = timing_breakdown.get(phase)
+        if value is not None:
+            result[out_key] = float(value)
+    return result
+
+
 RUNNER_TYPES = {
     "local_synthetic": LocalSyntheticBaselineRunner,
     "scaling": ScalingBaselineRunner,
     "remote_djinn": RemoteDjinnBaselineRunner,
+    "pytorch_rpc": PytorchRpcBaselineRunner,
 }
 
 
@@ -442,6 +681,15 @@ class ExperimentRunner:
                 return None
             return res["aggregates"]["latency_ms"]["mean"]
 
+        def mean_metric(name: str, metric: str) -> Optional[float]:
+            res = result_map.get(name)
+            if not res:
+                return None
+            block = res["aggregates"].get(metric)
+            if not block:
+                return None
+            return block.get("mean")
+
         def mean_data(name: str) -> Optional[float]:
             res = result_map.get(name)
             if not res:
@@ -482,6 +730,19 @@ class ExperimentRunner:
                     if data_savings_pct is not None:
                         target["derived"]["semantic_efficiency_ratio"] = data_savings_pct / overhead_pct
 
+            delta_metrics = [
+                ("latency_ms", "latency_delta_ms_vs_semantic_blind"),
+                ("client_deserialize_ms", "client_deserialize_delta_ms_vs_semantic_blind"),
+                ("client_serialize_ms", "client_serialize_delta_ms_vs_semantic_blind"),
+                ("server_execution_ms", "server_execution_delta_ms_vs_semantic_blind"),
+                ("server_duration_ms", "server_duration_delta_ms_vs_semantic_blind"),
+            ]
+            for metric_name, derived_key in delta_metrics:
+                blind_mean = mean_metric(blind_name, metric_name)
+                target_mean = mean_metric(target_name, metric_name)
+                if blind_mean is not None and target_mean is not None:
+                    target["derived"][derived_key] = blind_mean - target_mean
+
 
 def _baseline_result_to_dict(result: BaselineResult) -> Dict:
     return {
@@ -492,6 +753,20 @@ def _baseline_result_to_dict(result: BaselineResult) -> Dict:
         "metadata": result.metadata,
         "derived": result.derived,
     }
+
+
+def _tensor_mb(tensor: Optional[torch.Tensor]) -> float:
+    if tensor is None:
+        return 0.0
+    return tensor.element_size() * tensor.numel() / (1024**2)
+
+
+def _tensor_dict_mb(values: Dict[str, torch.Tensor]) -> float:
+    total = 0.0
+    for value in values.values():
+        if torch.is_tensor(value):
+            total += _tensor_mb(value)
+    return total
 
 
 __all__ = ["ExperimentRunner"]

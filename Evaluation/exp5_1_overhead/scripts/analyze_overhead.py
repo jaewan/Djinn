@@ -78,21 +78,42 @@ def load_rows(path: Path) -> List[Dict[str, Any]]:
     workload_block = payload["workload"]
     workload_name = workload_block["workload"]
     rows: List[Dict[str, Any]] = []
+    
+    # Find native baseline latency for overhead calculation
+    # See: OSDI Review - Critique 2 (Metric Inconsistency)
+    native_latency_ms = None
+    for baseline in workload_block["results"]:
+        if baseline["baseline"] == "native_pytorch":
+            aggregates = baseline["aggregates"]
+            native_latency_ms = _safe_get(aggregates, "latency_ms", "mean")
+            break
+    
     for baseline in workload_block["results"]:
         aggregates = baseline["aggregates"]
         derived = baseline.get("derived", {})
+        latency_ms = _safe_get(aggregates, "latency_ms", "mean")
+        
+        # CRITICAL: overhead_per_request_ms shows absolute overhead
+        # This distinguishes between constant overhead (good) vs proportional (leaky abstraction)
+        # See: OSDI Review - Critique 2
+        overhead_per_request_ms = None
+        if latency_ms is not None and native_latency_ms is not None:
+            overhead_per_request_ms = latency_ms - native_latency_ms
+        
         row = {
             "workload": workload_name,
             "category": workload_block.get("category"),
             "baseline": baseline["baseline"],
             "runner_type": baseline.get("runner_type"),
-            "latency_mean_ms": _safe_get(aggregates, "latency_ms", "mean"),
+            "latency_mean_ms": latency_ms,
             "latency_p95_ms": _safe_get(aggregates, "latency_ms", "p95"),
+            "overhead_per_request_ms": overhead_per_request_ms,
             "data_mean_mb": _safe_get(aggregates, "total_data_mb", "mean"),
             "throughput_mean_units_s": _safe_get(aggregates, "throughput_units_per_s", "mean"),
         }
         for key, value in derived.items():
             row[key] = value
+        _attach_profiling_columns(row, aggregates)
         row["source_file"] = str(path)
         row["experiment_tag"] = experiment.get("tag")
         rows.append(row)
@@ -106,6 +127,25 @@ def _safe_get(aggregates: Dict[str, Dict], section: str, field: str) -> Optional
     return block.get(field)
 
 
+def _attach_profiling_columns(row: Dict[str, Any], aggregates: Dict[str, Dict[str, Any]]) -> None:
+    mapping = {
+        "client_serialize_mean_ms": ("client_serialize_ms", "mean"),
+        "client_deserialize_mean_ms": ("client_deserialize_ms", "mean"),
+        "client_network_c2s_mean_ms": ("client_network_c2s_ms", "mean"),
+        "client_network_s2c_mean_ms": ("client_network_s2c_ms", "mean"),
+        "server_duration_mean_ms": ("server_duration_ms", "mean"),
+        "server_executor_time_mean_ms": ("server_executor_time_ms", "mean"),
+        "server_queue_latency_mean_ms": ("server_queue_latency_ms", "mean"),
+        "server_plan_mean_ms": ("server_plan_ms", "mean"),
+        "server_placement_mean_ms": ("server_placement_ms", "mean"),
+        "server_execution_mean_ms": ("server_execution_ms", "mean"),
+        "server_skeletonization_mean_ms": ("server_skeletonization_ms", "mean"),
+        "server_cleanup_mean_ms": ("server_cleanup_ms", "mean"),
+    }
+    for column, (section, field) in mapping.items():
+        row[column] = _safe_get(aggregates, section, field)
+
+
 def write_csv(rows: List[Dict[str, Any]], output: Optional[Path]) -> None:
     if not rows:
         print("No rows to write.")
@@ -116,12 +156,25 @@ def write_csv(rows: List[Dict[str, Any]], output: Optional[Path]) -> None:
         "baseline",
         "latency_mean_ms",
         "latency_p95_ms",
+        "overhead_per_request_ms",  # NEW: OSDI Review - Critique 2 (absolute overhead)
         "data_mean_mb",
         "throughput_mean_units_s",
         "latency_overhead_pct_vs_native_pytorch",
         "speedup_vs_semantic_blind",
         "data_savings_pct_vs_semantic_blind",
         "semantic_efficiency_ratio",
+        "client_serialize_mean_ms",
+        "client_deserialize_mean_ms",
+        "client_network_c2s_mean_ms",
+        "client_network_s2c_mean_ms",
+        "server_duration_mean_ms",
+        "server_executor_time_mean_ms",
+        "server_queue_latency_mean_ms",
+        "server_plan_mean_ms",
+        "server_placement_mean_ms",
+        "server_execution_mean_ms",
+        "server_skeletonization_mean_ms",
+        "server_cleanup_mean_ms",
         "source_file",
     ]
     fh = output.open("w", newline="") if output else sys.stdout
@@ -145,6 +198,7 @@ def print_markdown(rows: List[Dict[str, Any]]) -> None:
         "Baseline",
         "Latency (ms)",
         "P95 (ms)",
+        "Overhead (ms)",
         "Data (MB)",
         "Speedup vs Blind",
         "Data Savings (%)",
@@ -153,12 +207,15 @@ def print_markdown(rows: List[Dict[str, Any]]) -> None:
     print("| " + " | ".join(header) + " |")
     print("|" + "|".join([" --- "] * len(header)) + "|")
     for row in rows:
+        # Use .3f for sub-millisecond precision to avoid losing information
+        # See: OSDI Review - Code Nit #3 (Markdown Precision)
         print(
-            "| {workload} | {baseline} | {lat:.2f} | {p95:.2f} | {data:.3f} | {speedup:.2f} | {savings:.2f} | {eff:.2f} |".format(
+            "| {workload} | {baseline} | {lat:.3f} | {p95:.3f} | {ovh:.3f} | {data:.3f} | {speedup:.2f} | {savings:.2f} | {eff:.2f} |".format(
                 workload=row["workload"],
                 baseline=row["baseline"],
                 lat=row.get("latency_mean_ms", 0.0) or 0.0,
                 p95=row.get("latency_p95_ms", 0.0) or 0.0,
+                ovh=row.get("overhead_per_request_ms", 0.0) or 0.0,  # NEW: show absolute overhead
                 data=row.get("data_mean_mb", 0.0) or 0.0,
                 speedup=row.get("speedup_vs_semantic_blind") or 0.0,
                 savings=row.get("data_savings_pct_vs_semantic_blind") or 0.0,

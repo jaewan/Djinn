@@ -1,17 +1,73 @@
 experiment:
   device: "cuda:0"
   dtype: "float16"
-  runs: 2
-  warmup_runs: 1
-  tag: "hf_smoke"
+  runs: 30
+  warmup_runs: 5
+  tag: "hf_microbench"
   result_dir: "Evaluation/exp5_1_overhead/results"
   reference_baseline: "native_pytorch"
   blind_baseline: "semantic_blind"
   target_baseline: "full_djinn"
 
 workloads:
+  # Latency-bound transformer (BERT-class)
+  - name: bert_latency_bound
+    category: latency_bound
+    implementation: synthetic_transformer
+    params:
+      batch_size: 1
+      sequence_length: 128
+      hidden_size: 768
+      num_heads: 12
+      num_layers: 12
+      ff_size: 3072
+      unit_name: "tokens"
+
+  # Memory-bound decode (single token continuation)
+  - name: llama_decode_1tok
+    category: decode
+    implementation: hf_causal_lm
+    params:
+      model_id: "meta-llama/Llama-2-7b-hf"
+      prompt_text: "Djinn schedules semantic phases without moving tensors unless required."
+      prompt_length: 512
+      new_tokens: 1
+      batch_size: 1
+      unit_name: "tokens"
+      generation:
+        do_sample: false
+        temperature: 0.0
+        top_p: 1.0
+
+  # Compute-bound prefill (long prompt, minimal decode)
+  - name: llama_prefill_1k
+    category: prefill
+    implementation: hf_causal_lm
+    params:
+      model_id: "meta-llama/Llama-2-7b-hf"
+      prompt_text: "Prefill workload to measure Djinn virtualization tax on large FLOP bursts."
+      prompt_length: 1024
+      new_tokens: 0
+      batch_size: 1
+      unit_name: "tokens"
+      generation:
+        do_sample: false
+        temperature: 0.0
+        top_p: 1.0
+
+  # Throughput-oriented vision workload
+  - name: resnet50_batch8
+    category: vision
+    implementation: hf_vision
+    params:
+      model_id: "microsoft/resnet-50"
+      batch_size: 8
+      image_size: 224
+      unit_name: "images"
+
+  # Tiny GPT-2 smoke (kept for dev sanity checks)
   - name: hf_tiny_gpt2
-    category: sequential
+    category: smoke
     implementation: hf_causal_lm
     params:
       model_id: "sshleifer/tiny-gpt2"
@@ -28,16 +84,21 @@ workloads:
 baselines:
   - name: native_pytorch
     type: local_synthetic
-    notes: "HuggingFace causal LM running locally (upper bound)."
+    notes: "Model executes directly on the server GPU (upper bound)."
+
+  - name: pytorch_rpc
+    type: pytorch_rpc
+    rpc_server_name: "rpc_server"
+    rpc_client_name: "rpc_client"
+    notes: "PyTorch RPC baseline (no semantic sharing)."
 
   - name: semantic_blind
     type: remote_djinn
     semantic_aware: false
-    notes: "Djinn remote execution with semantics disabled (high latency + bandwidth)"
+    notes: "Djinn remote execution with semantics disabled (driver-level behavior)."
 
   - name: full_djinn
     type: remote_djinn
     semantic_aware: true
-    notes: "Djinn remote execution with full semantics (low data, optimized)"
-
+    notes: "Djinn remote execution with semantic planning, VMU, and skeletonization."
 

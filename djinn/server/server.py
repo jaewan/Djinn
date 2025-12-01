@@ -2171,6 +2171,9 @@ class DjinnServer:
                 'plan_summary': getattr(execution_metrics, 'plan_summary', None),
                 'qos_class': request.get('_resolved_qos_class', self._default_qos_class.value),
             }
+            timing_breakdown = getattr(execution_metrics, 'timing_breakdown', None)
+            if timing_breakdown:
+                response_metrics['timing_breakdown_ms'] = timing_breakdown
             
             return {
                 'status': 'success',
