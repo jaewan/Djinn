@@ -157,11 +157,30 @@ def main() -> None:
     args = parse_args()
     prompt = args.prompt_file.read_text().strip()
     # Initialize Ray with minimal dependencies
-    ray.init(
-        address=args.ray_address or None,
-        ignore_reinit_error=True,
-        include_dashboard=False,
-    )
+    # OSDI FIX: Handle remote Ray cluster connection properly
+    ray_address = args.ray_address
+    if ray_address:
+        print(f"[ray-keepalive] Connecting to Ray cluster at: {ray_address}")
+        print(f"[ray-keepalive] Note: If connection fails, check:")
+        print(f"  1. Server is running: ray status --address {ray_address}")
+        print(f"  2. Network connectivity: nc -zv {ray_address.split(':')[0]} {ray_address.split(':')[1]}")
+        print(f"  3. Firewall allows Ray ports")
+    
+    try:
+        ray.init(
+            address=ray_address or None,
+            ignore_reinit_error=True,
+            include_dashboard=False,
+        )
+        print(f"[ray-keepalive] Successfully connected to Ray cluster")
+    except Exception as e:
+        print(f"[ray-keepalive] ERROR: Failed to connect to Ray cluster at {ray_address}")
+        print(f"[ray-keepalive] Error: {e}")
+        print(f"[ray-keepalive] Troubleshooting:")
+        print(f"  1. Verify server is running: ray status (on server machine)")
+        print(f"  2. Check port matches: server used --port=XXX, client uses SERVER_IP:XXX")
+        print(f"  3. Test connectivity: nc -zv {ray_address.split(':')[0] if ray_address else 'SERVER_IP'} {ray_address.split(':')[1] if ray_address else 'PORT'}")
+        raise
     args.output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = _utc_timestamp()
     payload = {

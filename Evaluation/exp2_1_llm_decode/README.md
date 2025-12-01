@@ -219,13 +219,52 @@ python Evaluation/exp2_1_llm_decode/scripts/run_djinn_agents.py \
 
 For production experiments, run servers on GPU machines and clients on separate machines.
 
+**⚠️ AWS Security Group Port Requirements (IMPORTANT):**
+
+| Service | Ports Required | Notes |
+|---------|---------------|-------|
+| **Ray** | 5379 (or 6379) + **10001-10020** | GCS port + Raylet/Object Store range |
+| **Djinn** | 5555, 5556 | Control + Data planes |
+
+**Common Error**: If you only opened ports 5000-6000, Ray will fail because it needs ports **10001-10020** for worker communication!
+
+**Quick Fix for AWS:**
+1. Go to EC2 → Security Groups → Select your server's security group
+2. Edit Inbound Rules → Add:
+   - Custom TCP, Port **5379**, Source: Client security group
+   - Custom TCP, Port Range **10001-10020**, Source: Client security group
+3. Save rules and retry connection
+
 #### Prerequisites
 
 1. **Server Machine**: GPU-enabled (A100/H100) with CUDA installed
 2. **Client Machine**: CPU-only is fine, needs network access to server
 3. **Network**: Ensure firewall allows:
-   - Ray: Ports 10001-10010 (default), 6379 (GCS)
-   - Djinn: Ports 5555 (control), 5556 (data)
+   - **Ray**: 
+     - GCS port: 6379 (default) or custom port (e.g., 5379)
+     - Raylet/Object Store: 10001-10020 (required for worker communication)
+     - Dashboard (optional): 8265
+   - **Djinn**: Ports 5555 (control), 5556 (data)
+
+**AWS Security Group Configuration:**
+
+For Ray clusters, you need to open these ports in your AWS Security Group:
+
+```
+Type: Custom TCP
+Port Range: 5379 (or 6379 if using default)
+Source: Client machine IP or security group
+
+Type: Custom TCP  
+Port Range: 10001-10020
+Source: Client machine IP or security group
+
+Type: Custom TCP (optional)
+Port Range: 8265
+Source: Your IP (for dashboard access)
+```
+
+**Important**: If you only opened ports 5000-6000, Ray will fail because it needs ports 10001-10020 for worker communication!
 
 #### 1. Ray Baselines (Keep-Alive & Serverless)
 
@@ -233,6 +272,7 @@ For production experiments, run servers on GPU machines and clients on separate 
 
 ```bash
 # Start Ray head node (replace SERVER_IP with actual server IP)
+# IMPORTANT: Use default port 6379 (Ray's GCS port) unless you have a specific reason
 ray start --head \
   --node-ip-address=SERVER_IP \
   --port=6379 \
@@ -240,7 +280,15 @@ ray start --head \
   --include-dashboard=false
 
 # Note the Ray address shown (e.g., "SERVER_IP:6379")
+# The port in --port must match the port used in client --ray-address
 ```
+
+**Port Configuration:**
+- **Default Ray GCS port**: 6379 (recommended)
+- If you use a custom port (e.g., `--port=5379`), ensure:
+  1. Client uses the same port: `--ray-address SERVER_IP:5379`
+  2. Firewall allows that port: `sudo ufw allow 5379/tcp`
+  3. Port is not already in use
 
 **On Client Machine:**
 
@@ -365,10 +413,66 @@ python -m djinn.server.server_main --gpu 0 --port 5556 --host 0.0.0.0
 - Check firewall: `sudo ufw allow 5556/tcp` (Djinn) or `sudo ufw allow 6379/tcp` (Ray)
 - Ensure server binds to `0.0.0.0`, not `127.0.0.1`
 
-**Ray Connection Timeout:**
-- Verify Ray head is running: `ray status` on server
-- Check Ray logs: `tail -f /tmp/ray/session_latest/logs/raylet.out`
-- Ensure port 6379 is accessible from client
+**Ray Connection Timeout (AWS-Specific):**
+
+If you see: `Can't find a node_ip_address.json file... Did you do ray start or ray.init on this host?`
+
+**This is almost always a firewall/security group issue on AWS.** Check:
+
+1. **AWS Security Group Ports (CRITICAL):**
+   ```bash
+   # You MUST open these ports in AWS Security Group:
+   # - GCS port: 5379 (or 6379)
+   # - Raylet/Object Store: 10001-10020 (NOT just 10001-10010!)
+   ```
+   
+   **Common mistake**: Opening only ports 5000-6000 will NOT work because Ray needs 10001-10020!
+   
+   **Fix**: In AWS Console → EC2 → Security Groups → Edit Inbound Rules:
+   - Add rule: Custom TCP, Port 5379, Source: Client security group or IP
+   - Add rule: Custom TCP, Port Range 10001-10020, Source: Client security group or IP
+   
+2. **Verify Ray head is running on server:**
+
+1. **Verify Ray head is running on server:**
+   ```bash
+   # On server machine
+   ray status
+   ```
+
+2. **Check network connectivity:**
+   ```bash
+   # On client machine, test if you can reach the server
+   nc -zv SERVER_IP 5379  # or 6379, depending on what port you used
+   ```
+
+3. **Verify correct port:**
+   - If server started with `--port=5379`, client must use `SERVER_IP:5379`
+   - If server started with `--port=6379` (default), client must use `SERVER_IP:6379`
+   - **Important**: The port in `--ray-address` must match the port used in `ray start --head --port=XXX`
+
+4. **Check firewall:**
+   ```bash
+   # On server machine, ensure Ray ports are open
+   sudo ufw allow 5379/tcp  # or 6379
+   sudo ufw allow 10001:10010/tcp  # Ray worker ports
+   ```
+
+5. **Verify Ray address format:**
+   ```bash
+   # Correct format (no spaces around colon)
+   --ray-address SERVER_IP:PORT
+   
+   # Wrong format
+   --ray-address SERVER_IP : PORT  # spaces cause issues
+   ```
+
+6. **Check Ray logs on server:**
+   ```bash
+   # On server machine
+   tail -f /tmp/ray/session_latest/logs/raylet.out
+   # Look for connection attempts from client IP
+   ```
 
 **Djinn Connection Failed:**
 - Check server logs for errors
