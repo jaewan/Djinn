@@ -6,7 +6,7 @@ numpy>=1.24.0,<2.0.0
 
 # Configuration and serialization
 pyyaml>=6.0.0
-xxhash
+xxhash>=3.4.0
 
 # GPU monitoring
 pynvml>=11.0.0
@@ -28,8 +28,7 @@ scipy>=1.10.0
 
 # System monitoring
 psutil>=5.9.0
-prometheus
-prometheus_client
+prometheus-client>=0.18.0
 
 # Progress bars
 tqdm>=4.64.0
@@ -58,8 +57,7 @@ ray[default]>=2.10.0
 vllm>=0.4.0
 
 # Evaluation and monitoring utilities
-xxhash>=3.4.0
-prometheus-client>=0.18.0
+# (xxhash and prometheus-client already listed above)
 
 # Optional: For vLLM support (uncomment when needed)
 # lm-format-enforcer>=0.4.3
