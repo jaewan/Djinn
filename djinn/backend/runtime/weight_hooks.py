@@ -84,12 +84,10 @@ class RingBufferHookManager:
             name: idx for idx, name in enumerate(self.layer_names)
         }
         
-        # Store original CPU weights before they get redirected to ring buffer
-        # This is critical - after first use, module.weight points to ring buffer view,
-        # so we need to keep original host weights for prefetching
-        # NOTE: For large models (70B+), this uses significant RAM (~140GB)
-        self.original_weights: Dict[str, torch.Tensor] = {}
-        self._cache_original_weights()
+        # Store model reference for on-demand weight access during prefetching
+        # We will fetch weights from model on-demand instead of caching all in RAM
+        # This avoids the memory explosion of storing 140GB of weights twice
+        self.model_state_dict = None
         
         # Store hooks for potential removal
         self.hook_handles: Dict[str, Any] = {}
@@ -168,14 +166,19 @@ class RingBufferHookManager:
                         )
                     except ValueError:
                         # Try without .weight suffix (in case layer_name is already full key)
-                        ring_view = self.ring_buffer.get_layer_view(
-                            self.model_id,
-                            layer_name
-                        )
-                        module.weight.data = ring_view
-                        logger.debug(
-                            f"Redirected {layer_name} to ring buffer view"
-                        )
+                        try:
+                            ring_view = self.ring_buffer.get_layer_view(
+                                self.model_id,
+                                layer_name
+                            )
+                            module.weight.data = ring_view
+                            logger.debug(
+                                f"Redirected {layer_name} to ring buffer view"
+                            )
+                        except ValueError:
+                            # Layer not in ring buffer - this can happen for shared weights
+                            # (e.g., lm_head shares with embedding layer)
+                            logger.debug(f"⚠️  Layer {layer_name} not in ring buffer (may be shared weights)")
                 
                 # Also handle bias if present and in ring buffer
                 if hasattr(module, 'bias') and module.bias is not None:
@@ -200,9 +203,14 @@ class RingBufferHookManager:
                 next_layer_name = self.layer_names[layer_idx + 1]
                 next_weight_key = f"{next_layer_name}.weight" if next_layer_name else "weight"
                 try:
-                    # Use ORIGINAL cached weights, not module.weight (which points to ring buffer)
-                    if next_weight_key in self.original_weights:
-                        next_weights = self.original_weights[next_weight_key]
+                    # Get next module to prefetch its weights
+                    next_module = self._get_module_by_name(self.model, next_layer_name)
+                    if next_module and hasattr(next_module, 'weight') and next_module.weight is not None:
+                        # Get weight (CPU copy, not from ring buffer which is GPU memory)
+                        # Use detach() to break any autograd tracking
+                        next_weights = next_module.weight.detach()
+                        if next_weights.device.type != 'cpu':
+                            next_weights = next_weights.cpu()
                         
                         # Queue for prefetch (non-blocking)
                         self.streamer.queue_prefetch(
@@ -211,28 +219,11 @@ class RingBufferHookManager:
                             next_weight_key,
                             next_weights
                         )
+                        logger.debug(f"Queued prefetch for {next_weight_key}")
                 except Exception as e:
                     logger.debug(f"Could not prefetch next layer: {e}")
         
         return pre_hook
-    
-    def _cache_original_weights(self) -> None:
-        """
-        Cache original CPU weights before they get redirected to ring buffer.
-        
-        This is critical because after the first forward pass, module.weight
-        points to the ring buffer view. We need the original host weights for
-        prefetching on subsequent iterations.
-        
-        Weights are stored using state_dict-style keys (e.g., "embed.weight")
-        """
-        for layer_name in self.layer_names:
-            module = self._get_module_by_name(self.model, layer_name)
-            if module and hasattr(module, 'weight') and module.weight is not None:
-                # Store detached, CPU copy of original weight using state_dict key
-                weight_key = f"{layer_name}.weight" if layer_name else "weight"
-                self.original_weights[weight_key] = module.weight.detach().cpu()
-                logger.debug(f"Cached original weights for {weight_key}")
     
     def _extract_layer_names(self, model: nn.Module) -> List[str]:
         """

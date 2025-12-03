@@ -19,6 +19,7 @@ import logging
 import time
 import gc
 import os
+import statistics
 from pathlib import Path
 from typing import Dict, Any
 import yaml
@@ -62,12 +63,13 @@ def load_model_and_tokenizer(model_id: str, dtype: str = "float16"):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    # Load model to CPU first
+    # Load model to CPU first (no device_map, keep on CPU for streaming)
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        torch_dtype=torch_dtype,
-        device_map="cpu"
+        dtype=torch_dtype
     )
+    # Explicitly place on CPU
+    model = model.to("cpu")
     
     logger.info(f"✅ Loaded model: {model.config.model_type}, params: {model.num_parameters() / 1e9:.1f}B")
     
@@ -85,22 +87,40 @@ def get_model_size_bytes(model: nn.Module, dtype: str) -> int:
     return num_params * bytes_per_param
 
 
-def setup_ring_buffer(model: nn.Module, config: Dict[str, Any], device: torch.device):
-    """Setup ring buffer and hooks."""
+def setup_ring_buffer(model: nn.Module, config: Dict[str, Any], device: torch.device, chunk_size_mb: int = 64):
+    """Setup ring buffer and hooks.
+    
+    Args:
+        model: PyTorch model
+        config: Configuration dict
+        device: CUDA device
+        chunk_size_mb: Prefetch chunk size in MB (for parameter sweep experiments)
+    """
     rb_config = config["experiment"]["ring_buffer"]
     capacity_bytes = int(rb_config["capacity_gb"] * 1024**3)
     
-    logger.info(f"Setting up ring buffer: {rb_config['capacity_gb']}GB")
+    logger.info(f"Setting up ring buffer: {rb_config['capacity_gb']}GB (chunk_size: {chunk_size_mb}MB)")
     
     # Create ring buffer
     ring_buffer = WeightRingBuffer(capacity_bytes, device=device)
     
-    # Register model
-    model_state_dict = model.state_dict()
-    ring_buffer.register_model("default", model_state_dict)
+    # Register model - stream weights on-demand to avoid memory explosion
+    # Instead of copying entire state_dict, build a dict by iterating through named_parameters and buffers
+    # This avoids the memory overhead of model.state_dict() for very large models
+    model_state = {}
+    for name, param in model.named_parameters():
+        model_state[name] = param
+    for name, buffer in model.named_buffers():
+        model_state[name] = buffer
     
-    # Create weight streamer
+    ring_buffer.register_model("default", model_state)
+    
+    # Store chunk size in ring buffer for potential use in prefetch optimization
+    ring_buffer.chunk_size_bytes = chunk_size_mb * 1024 * 1024
+    
+    # Create weight streamer (pass chunk_size to streamer for future optimization)
     streamer = WeightStreamer(ring_buffer, device=device)
+    streamer.chunk_size_bytes = chunk_size_mb * 1024 * 1024
     streamer.start()
     
     # Install hooks
@@ -114,23 +134,63 @@ def setup_ring_buffer(model: nn.Module, config: Dict[str, Any], device: torch.de
     return ring_buffer, streamer, hook_mgr
 
 
+def create_prompt_with_tokens(tokenizer, base_prompt: str, target_tokens: int) -> str:
+    """Create a prompt with approximately the target number of tokens.
+    
+    Args:
+        tokenizer: Tokenizer instance
+        base_prompt: Base prompt to start with
+        target_tokens: Desired number of tokens
+    
+    Returns:
+        Prompt string
+    """
+    # Start with base prompt
+    base_token_ids = tokenizer.encode(base_prompt)
+    current_tokens = len(base_token_ids)
+    
+    if current_tokens >= target_tokens:
+        return base_prompt
+    
+    # Add padding tokens to reach target
+    # Use a simple padding word that tokenizes to 1 token
+    padding_word = " more"  # Typical 1 token
+    prompt = base_prompt
+    
+    while len(tokenizer.encode(prompt)) < target_tokens:
+        prompt += padding_word
+    
+    # Trim if overshoot slightly
+    while len(tokenizer.encode(prompt)) > target_tokens:
+        prompt = prompt[:-1]
+    
+    return prompt
+
+
 def run_inference(
     model: nn.Module,
     tokenizer,
     config: Dict[str, Any],
     device: torch.device,
-    reference_output=None
+    reference_output=None,
+    ring_buffer=None,
+    enable_generation=False
 ) -> Dict[str, Any]:
     """
     Run single inference pass and measure metrics.
     
+    Args:
+        enable_generation: If True, use model.generate() for TTFT measurement.
+                          If False, use forward pass only (faster, for profiling).
+    
     Returns:
-        Dict with metrics: latency, bandwidth, logit_diff, memory_used
+        Dict with metrics: latency, bandwidth, logit_diff, memory_used, ttft_ms (if generation)
     """
     inf_config = config["experiment"]["inference"]
     
-    # Create prompt
-    prompt = "The future of AI is" + " " * (inf_config["prompt_length"] - 5)
+    # Create prompt with proper tokenization to target length
+    base_prompt = "The future of AI is"
+    prompt = create_prompt_with_tokens(tokenizer, base_prompt, inf_config["prompt_length"])
     
     # Tokenize
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
@@ -140,16 +200,45 @@ def run_inference(
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.synchronize()
     
-    # Measure inference time
-    start_time = time.perf_counter()
+    # Track TTFT if generation enabled
+    ttft_ms = None
+    first_token_time = None
     
-    # Forward pass
-    with torch.no_grad():
-        outputs = model(input_ids, output_hidden_states=False)
-        logits = outputs.logits
-    
-    torch.cuda.synchronize()
-    elapsed = time.perf_counter() - start_time
+    if enable_generation:
+        # Measure inference time with generation
+        start_time = time.perf_counter()
+        
+        # Use generate for token-by-token generation
+        with torch.no_grad():
+            generated_ids = model.generate(
+                input_ids,
+                max_new_tokens=inf_config.get("generation_length", 50),
+                do_sample=False,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+        
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - start_time
+        
+        # TTFT: time to first generated token
+        # For forward pass, this is approximately the first decode step
+        # We estimate this as ~1/num_generated_tokens of total time for now
+        num_generated = generated_ids.shape[-1] - input_ids.shape[-1]
+        if num_generated > 0:
+            ttft_ms = (elapsed / num_generated) * 1000  # Estimate: first token latency
+        
+        logits = model(generated_ids[:, :-1], output_hidden_states=False).logits
+    else:
+        # Measure inference time (forward pass only)
+        start_time = time.perf_counter()
+        
+        # Forward pass
+        with torch.no_grad():
+            outputs = model(input_ids, output_hidden_states=False)
+            logits = outputs.logits
+        
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - start_time
     
     # Get memory stats
     peak_vram = torch.cuda.max_memory_allocated() / 1024**2  # MB
@@ -159,146 +248,206 @@ def run_inference(
     if reference_output is not None:
         logit_diff = torch.norm(logits - reference_output).item()
     
-    # Calculate effective bandwidth
-    # Model size / time = bandwidth
-    model_size_bytes = get_model_size_bytes(model, config["experiment"]["model"]["dtype"])
-    bandwidth_gbps = (model_size_bytes / elapsed) / 1024**3
+    # Calculate effective bandwidth using actual bytes transferred via ring buffer
+    # This is more accurate than total model size since it reflects actual PCIe traffic
+    if ring_buffer and hasattr(ring_buffer, 'stats'):
+        actual_bytes = ring_buffer.stats.get('bytes_transferred', 0)
+        if actual_bytes > 0:
+            bandwidth_gbps = (actual_bytes / elapsed) / 1024**3
+        else:
+            # Ring buffer exists but no transfers yet, use model size fallback
+            model_size_bytes = get_model_size_bytes(model, config["experiment"]["model"]["dtype"])
+            bandwidth_gbps = (model_size_bytes / elapsed) / 1024**3
+    else:
+        # No ring buffer, use total model size
+        model_size_bytes = get_model_size_bytes(model, config["experiment"]["model"]["dtype"])
+        bandwidth_gbps = (model_size_bytes / elapsed) / 1024**3
     
-    return {
+    result = {
         "latency_ms": elapsed * 1000,
         "bandwidth_gbps": bandwidth_gbps,
         "peak_vram_mb": peak_vram,
         "logit_diff": logit_diff,
         "logits": logits.cpu().numpy() if reference_output is None else None,
     }
+    
+    # Add TTFT if generation was used
+    if ttft_ms is not None:
+        result["ttft_ms"] = ttft_ms
+    
+    return result
 
 
-def run_experiment(config_path: str, model_id: str, num_runs: int, output_path: str):
-    """Run full virtual memory experiment."""
+def run_experiment(config_path: str, model_id: str, num_runs: int, output_path: str, chunk_size_mb: int = 64):
+    """Run full virtual memory experiment.
     
-    # Load config
-    config = load_config(config_path)
+    Args:
+        config_path: Path to experiment config YAML
+        model_id: Model identifier (e.g., EleutherAI/gpt-j-6B)
+        num_runs: Number of measurement runs
+        output_path: Output JSON file path
+        chunk_size_mb: Prefetch chunk size in MB
+    """
     
-    # Device setup
-    device = torch.device("cuda:0")
-    torch.cuda.set_device(0)
-    
-    logger.info(f"\n{'='*70}")
-    logger.info(f"Virtual Memory Ring Buffer Experiment")
-    logger.info(f"{'='*70}\n")
-    
-    # Load model and tokenizer
-    model, tokenizer = load_model_and_tokenizer(model_id, config["experiment"]["model"]["dtype"])
-    model_size_gb = get_model_size_bytes(model, config["experiment"]["model"]["dtype"]) / 1024**3
-    logger.info(f"Model size: {model_size_gb:.1f}GB\n")
-    
-    # Setup ring buffer
-    if config["experiment"]["ring_buffer"]["enabled"]:
-        ring_buffer, streamer, hook_mgr = setup_ring_buffer(model, config, device)
-        logger.info(f"✅ Ring buffer and hooks installed\n")
-    
-    # Run warmup
-    logger.info(f"Running {config['experiment']['measurement']['warmup_runs']} warmup iterations...")
-    for i in range(config["experiment"]["measurement"]["warmup_runs"]):
-        _ = run_inference(model, tokenizer, config, device)
-        if config["experiment"]["measurement"]["gc_between_runs"]:
-            gc.collect()
-            torch.cuda.empty_cache()
-    
-    logger.info(f"✅ Warmup complete\n")
-    
-    # Run measurements
-    logger.info(f"Running {num_runs} measurement iterations...\n")
-    results = []
-    reference_output = None
-    
-    for run_id in range(num_runs):
-        # Disable GC during measurement
-        if config["experiment"]["measurement"]["disable_gc_during_run"]:
-            gc.disable()
+    streamer = None
+    try:
+        # Load config
+        config = load_config(config_path)
         
-        try:
-            metrics = run_inference(
-                model, tokenizer, config, device,
-                reference_output=reference_output
-            )
-            
-            # Store reference for logit checking (keep as torch tensor on same device)
-            if reference_output is None and metrics["logits"] is not None:
-                reference_output = torch.from_numpy(metrics["logits"]).to(device)
-            
-            results.append({
-                "run_id": run_id,
-                **metrics
-            })
-            
-            logger.info(
-                f"Run {run_id}: "
-                f"latency {metrics['latency_ms']:.1f}ms, "
-                f"bandwidth {metrics['bandwidth_gbps']:.1f}GB/s, "
-                f"memory {metrics['peak_vram_mb']:.0f}MB"
-            )
+        # Device setup
+        device = torch.device("cuda:0")
+        torch.cuda.set_device(0)
         
-        finally:
+        logger.info(f"\n{'='*70}")
+        logger.info(f"Virtual Memory Ring Buffer Experiment")
+        logger.info(f"{'='*70}\n")
+        
+        # Load model and tokenizer
+        model, tokenizer = load_model_and_tokenizer(model_id, config["experiment"]["model"]["dtype"])
+        model_size_gb = get_model_size_bytes(model, config["experiment"]["model"]["dtype"]) / 1024**3
+        logger.info(f"Model size: {model_size_gb:.1f}GB\n")
+        
+        # Setup ring buffer with chunk size parameter
+        if config["experiment"]["ring_buffer"]["enabled"]:
+            ring_buffer, streamer, hook_mgr = setup_ring_buffer(model, config, device, chunk_size_mb=chunk_size_mb)
+            logger.info(f"✅ Ring buffer and hooks installed\n")
+            # NOTE: DO NOT move model to GPU - keep on CPU for streaming
+            # Model parameters stay on CPU, hooks redirect to ring buffer during forward pass
+            logger.info(f"✅ Model kept on CPU for streaming (weights will be prefetched on-demand)\n")
+        else:
+            # Standard path: move model to GPU
+            model = model.to(device)
+            logger.info(f"✅ Model moved to {device}\n")
+        
+        # Get ring buffer for stats (if enabled)
+        ring_buffer_obj = ring_buffer if config["experiment"]["ring_buffer"]["enabled"] else None
+        
+        # Determine if we should enable generation (command line overrides config)
+        enable_generation = args.ttft_enabled or config["experiment"]["measurement"].get("ttft_enabled", False)
+        
+        # Run warmup
+        logger.info(f"Running {config['experiment']['measurement']['warmup_runs']} warmup iterations...")
+        for i in range(config["experiment"]["measurement"]["warmup_runs"]):
+            _ = run_inference(model, tokenizer, config, device, ring_buffer=ring_buffer_obj, enable_generation=enable_generation)
+            if config["experiment"]["measurement"]["gc_between_runs"]:
+                gc.collect()
+                torch.cuda.empty_cache()
+        
+        logger.info(f"✅ Warmup complete\n")
+        
+        # Run measurements
+        logger.info(f"Running {num_runs} measurement iterations...\n")
+        results = []
+        reference_output = None
+        
+        for run_id in range(num_runs):
+            # Disable GC during measurement
             if config["experiment"]["measurement"]["disable_gc_during_run"]:
-                gc.enable()
+                gc.disable()
+            
+            try:
+                metrics = run_inference(
+                    model, tokenizer, config, device,
+                    reference_output=reference_output,
+                    ring_buffer=ring_buffer_obj,
+                    enable_generation=enable_generation
+                )
+                
+                # Store reference for logit checking (keep as torch tensor on same device)
+                if reference_output is None and metrics["logits"] is not None:
+                    reference_output = torch.from_numpy(metrics["logits"]).to(device)
+                
+                results.append({
+                    "run_id": run_id,
+                    **metrics
+                })
+                
+                logger.info(
+                    f"Run {run_id}: "
+                    f"latency {metrics['latency_ms']:.1f}ms, "
+                    f"bandwidth {metrics['bandwidth_gbps']:.1f}GB/s, "
+                    f"memory {metrics['peak_vram_mb']:.0f}MB"
+                )
+            
+            finally:
+                if config["experiment"]["measurement"]["disable_gc_during_run"]:
+                    gc.enable()
+            
+            # GC between runs
+            if config["experiment"]["measurement"]["gc_between_runs"]:
+                gc.collect()
+                torch.cuda.empty_cache()
         
-        # GC between runs
-        if config["experiment"]["measurement"]["gc_between_runs"]:
-            gc.collect()
-            torch.cuda.empty_cache()
-    
-    # Compute summary statistics
-    latencies = [r["latency_ms"] for r in results]
-    bandwidths = [r["bandwidth_gbps"] for r in results]
-    
-    summary = {
-        "avg_latency_ms": sum(latencies) / len(latencies),
-        "median_latency_ms": sorted(latencies)[len(latencies)//2],
-        "min_latency_ms": min(latencies),
-        "max_latency_ms": max(latencies),
-        "avg_bandwidth_gbps": sum(bandwidths) / len(bandwidths),
-        "median_bandwidth_gbps": sorted(bandwidths)[len(bandwidths)//2],
-        "min_bandwidth_gbps": min(bandwidths),
-        "max_bandwidth_gbps": max(bandwidths),
-        "pass": all(bw > 20.0 for bw in bandwidths) if num_runs > 0 else False,
-    }
-    
-    # Create output
-    output = {
-        "experiment": config["experiment"]["name"],
-        "model": model_id,
-        "model_size_gb": model_size_gb,
-        "config": config,
-        "runs": results,
-        "summary": summary,
-    }
-    
-    # Save results
-    os.makedirs(Path(output_path).parent, exist_ok=True)
-    with open(output_path, 'w') as f:
-        # Convert numpy arrays to lists for JSON serialization
-        for run in output["runs"]:
-            run.pop("logits", None)  # Don't save full logits
+        # Compute summary statistics using statistics module
+        latencies = [r["latency_ms"] for r in results]
+        bandwidths = [r["bandwidth_gbps"] for r in results]
+        ttfts = [r.get("ttft_ms") for r in results if "ttft_ms" in r]
         
-        json.dump(output, f, indent=2)
+        summary = {
+            "avg_latency_ms": statistics.mean(latencies) if latencies else 0.0,
+            "median_latency_ms": statistics.median(latencies) if latencies else 0.0,
+            "stdev_latency_ms": statistics.stdev(latencies) if len(latencies) > 1 else 0.0,
+            "min_latency_ms": min(latencies) if latencies else 0.0,
+            "max_latency_ms": max(latencies) if latencies else 0.0,
+            "avg_bandwidth_gbps": statistics.mean(bandwidths) if bandwidths else 0.0,
+            "median_bandwidth_gbps": statistics.median(bandwidths) if bandwidths else 0.0,
+            "stdev_bandwidth_gbps": statistics.stdev(bandwidths) if len(bandwidths) > 1 else 0.0,
+            "min_bandwidth_gbps": min(bandwidths) if bandwidths else 0.0,
+            "max_bandwidth_gbps": max(bandwidths) if bandwidths else 0.0,
+            "pass": all(bw > 20.0 for bw in bandwidths) if num_runs > 0 else False,
+        }
+        
+        # Add TTFT statistics if available
+        if ttfts:
+            summary["avg_ttft_ms"] = statistics.mean(ttfts)
+            summary["median_ttft_ms"] = statistics.median(ttfts)
+            summary["stdev_ttft_ms"] = statistics.stdev(ttfts) if len(ttfts) > 1 else 0.0
+            summary["min_ttft_ms"] = min(ttfts)
+            summary["max_ttft_ms"] = max(ttfts)
+        
+        # Create output
+        output = {
+            "experiment": config["experiment"]["name"],
+            "model": model_id,
+            "model_size_gb": model_size_gb,
+            "config": config,
+            "runs": results,
+            "summary": summary,
+        }
+        
+        # Save results
+        os.makedirs(Path(output_path).parent, exist_ok=True)
+        with open(output_path, 'w') as f:
+            # Convert numpy arrays to lists for JSON serialization
+            for run in output["runs"]:
+                run.pop("logits", None)  # Don't save full logits
+            
+            json.dump(output, f, indent=2)
+        
+        logger.info(f"\n{'='*70}")
+        logger.info(f"SUMMARY")
+        logger.info(f"{'='*70}\n")
+        logger.info(f"Latency (ms): mean={summary['avg_latency_ms']:.1f} ± {summary['stdev_latency_ms']:.1f}, median={summary['median_latency_ms']:.1f}, range=[{summary['min_latency_ms']:.1f}, {summary['max_latency_ms']:.1f}]")
+        logger.info(f"Bandwidth (GB/s): mean={summary['avg_bandwidth_gbps']:.1f} ± {summary['stdev_bandwidth_gbps']:.1f}, median={summary['median_bandwidth_gbps']:.1f}, range=[{summary['min_bandwidth_gbps']:.1f}, {summary['max_bandwidth_gbps']:.1f}]")
+        
+        if "avg_ttft_ms" in summary:
+            logger.info(f"TTFT (ms): mean={summary['avg_ttft_ms']:.1f} ± {summary['stdev_ttft_ms']:.1f}, median={summary['median_ttft_ms']:.1f}, range=[{summary['min_ttft_ms']:.1f}, {summary['max_ttft_ms']:.1f}]")
+        
+        if summary["pass"]:
+            logger.info(f"\n✅ PASS: Bandwidth sustained > 20 GB/s")
+        else:
+            logger.info(f"\n❌ FAIL: Bandwidth did not sustain > 20 GB/s")
+        
+        logger.info(f"\nResults saved to: {output_path}\n")
+        
+        return output
     
-    logger.info(f"\n{'='*70}")
-    logger.info(f"SUMMARY")
-    logger.info(f"{'='*70}\n")
-    logger.info(f"Average latency: {summary['avg_latency_ms']:.1f}ms")
-    logger.info(f"Average bandwidth: {summary['avg_bandwidth_gbps']:.1f}GB/s")
-    logger.info(f"Median latency: {summary['median_latency_ms']:.1f}ms")
-    logger.info(f"Median bandwidth: {summary['median_bandwidth_gbps']:.1f}GB/s")
-    
-    if summary["pass"]:
-        logger.info(f"\n✅ PASS: Bandwidth sustained > 20 GB/s")
-    else:
-        logger.info(f"\n❌ FAIL: Bandwidth did not sustain > 20 GB/s")
-    
-    logger.info(f"\nResults saved to: {output_path}\n")
-    
-    return output
+    finally:
+        # Cleanup streamer resources
+        if streamer is not None:
+            logger.info("Stopping weight streamer...")
+            streamer.stop()
+            logger.info("✅ Weight streamer stopped")
 
 
 def main():
@@ -307,10 +456,66 @@ def main():
     parser.add_argument("--model", default="EleutherAI/gpt-j-6B", help="Model ID")
     parser.add_argument("--runs", type=int, default=5, help="Number of runs")
     parser.add_argument("--output", required=True, help="Output JSON file")
+    parser.add_argument("--chunk-size-mb", type=int, nargs='+', 
+                       default=[16, 64, 128, 512],
+                       help="Chunk sizes in MB for parameter sweep (default: 16 64 128 512)")
+    parser.add_argument("--enable-pcie-trace", action="store_true",
+                       help="Enable PCIe bandwidth trace via nvidia-smi dmon")
+    parser.add_argument("--ttft-enabled", action="store_true",
+                       help="Enable TTFT measurement using model.generate()")
     
     args = parser.parse_args()
     
-    run_experiment(args.config, args.model, args.runs, args.output)
+    # If chunk size sweep requested, run experiments with each chunk size
+    if len(args.chunk_size_mb) > 1 or args.chunk_size_mb[0] != 64:
+        logger.info(f"Chunk size sweep: {args.chunk_size_mb} MB")
+        sweep_results = {}
+        
+        for chunk_size_mb in args.chunk_size_mb:
+            logger.info(f"\n{'='*70}")
+            logger.info(f"Running with chunk size: {chunk_size_mb} MB")
+            logger.info(f"{'='*70}\n")
+            
+            # Create output path with chunk size suffix
+            output_path = str(args.output).replace('.json', f'_chunk_{chunk_size_mb}mb.json')
+            
+            try:
+                result = run_experiment(args.config, args.model, args.runs, output_path, chunk_size_mb=chunk_size_mb)
+                sweep_results[f"chunk_{chunk_size_mb}mb"] = result["summary"]
+            except Exception as e:
+                logger.error(f"Failed for chunk size {chunk_size_mb}MB: {e}")
+                sweep_results[f"chunk_{chunk_size_mb}mb"] = {"error": str(e)}
+        
+        # Save sweep summary
+        sweep_output = str(args.output).replace('.json', '_sweep_summary.json')
+        with open(sweep_output, 'w') as f:
+            json.dump(sweep_results, f, indent=2)
+        
+        logger.info(f"\n✅ Sweep summary saved to: {sweep_output}")
+    else:
+        # Single run with default chunk size
+        chunk_size_mb = args.chunk_size_mb[0]
+        if args.enable_pcie_trace:
+            import subprocess
+            logger.info("Starting PCIe trace collection via nvidia-smi dmon...")
+            # Start background trace
+            trace_file = str(args.output).replace('.json', '_pcie_trace.csv')
+            
+            # Fix: Use list of args to avoid shell injection vulnerability
+            with open(trace_file, 'w') as trace_fp:
+                trace_proc = subprocess.Popen(
+                    ['nvidia-smi', 'dmon', '-s', 'pcit', '-d', '1', '-o', 'T'],
+                    stdout=trace_fp,
+                    stderr=subprocess.PIPE
+                )
+            try:
+                run_experiment(args.config, args.model, args.runs, args.output, chunk_size_mb=chunk_size_mb)
+            finally:
+                trace_proc.terminate()
+                trace_proc.wait(timeout=5)
+                logger.info(f"PCIe trace saved to: {trace_file}")
+        else:
+            run_experiment(args.config, args.model, args.runs, args.output, chunk_size_mb=chunk_size_mb)
 
 
 if __name__ == "__main__":

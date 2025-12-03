@@ -9,9 +9,11 @@ Key Features:
 - Transparent routing to ring buffer for large models
 - Fallback to standard memory-aware cache for small models
 - Manages WeightStreamer lifecycle for async prefetching
+- Bus contention control: DISABLE_KV_SWAP flag ensures weights own 100% of PCIe
 """
 
 import logging
+import os
 import torch
 import torch.nn as nn
 from typing import Dict, Optional, Any
@@ -23,6 +25,14 @@ from ..backend.runtime.weight_streamer import WeightStreamer
 from ..backend.runtime.weight_hooks import RingBufferHookManager
 
 logger = logging.getLogger(__name__)
+
+# Bus contention control flag
+# When True, weights own 100% of PCIe bus (no concurrent KV swapping)
+# Useful for isolating ring buffer performance during experiments
+DISABLE_KV_SWAP = os.environ.get('DJINN_DISABLE_KV_SWAP', '0') == '1'
+
+if DISABLE_KV_SWAP:
+    logger.info("🚀 DJINN_DISABLE_KV_SWAP=1: KV swapping disabled, weights own 100% of PCIe bus")
 
 
 @dataclass
@@ -79,7 +89,8 @@ class RingBufferModelCache:
         logger.info(
             f"RingBufferModelCache initialized "
             f"(device={device}, max_vram_gb={max_vram_gb}, "
-            f"ring_buffer_enabled={self.ring_buffer_config.enabled})"
+            f"ring_buffer_enabled={self.ring_buffer_config.enabled}, "
+            f"kv_swap_enabled={not DISABLE_KV_SWAP})"
         )
     
     def register_model(

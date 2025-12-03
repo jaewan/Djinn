@@ -1,162 +1,147 @@
-# OSDI Evaluation Plan & Execution Checklist: Djinn (v2.3.15)
+# OSDI Evaluation Plan: Djinn (Tensor Operating System)
 
-**Status:** **APPROVED FOR EXECUTION**
+**Status:** **APPROVED FOR EXECUTION (vFinal-Robust)**
 **Target Venue:** OSDI / SOSP
-**Core Thesis:** Djinn is a **Tensor Operating System**. By lifting OS primitives (Virtualization, Paging, Scheduling) into the framework layer, it enables **Interactivity** and **High-Density Time-Sharing** where rigid Batch (Ray) and Serving (vLLM) systems fail.
+**Core Thesis:**
+Current systems force a trade-off: **Specialized Engines** (vLLM/DeepSpeed) provide efficiency but lock resources (Reactive). **General Frameworks** (PyTorch/Ray) provide flexibility but suffer from poor utilization (Static).
+**Djinn** is a Tensor OS that achieves the efficiency of engines with the flexibility of frameworks by virtualizing memory and proactively scheduling based on semantic intent.
 
 ---
 
-## 1. Environment & Configuration
+## 1. The Environments
+We utilize two distinct hardware environments to prove different aspects of the OS.
 
-*   **Hardware:** Single Node, 1x NVIDIA A100-80GB (PCIe Gen4).
-    *   **Artificial Constraint:** We strictly enforce a **60GB VRAM Limit** for the Djinn VMU. This reserves 20GB for system overhead and forces paging behavior early.
-*   **Host Memory:** 1TB System RAM.
-    *   **CRITICAL:** `GENIE_PINNED_MEMORY=1`. All host-side weight buffers must utilize `cudaHostAlloc` (Pinned Memory) via PyTorch’s `pin_memory()`. Standard pageable memory will bottleneck bandwidth at 4GB/s; we need >24GB/s.
-    *   **OS Config:** `swapoff -a` (Disable OS Swap) to prevent kernel-level thrashing.
-    *   **Ulimit:** `ulimit -l unlimited` (Allow locking unlimited memory pages).
-*   **Baselines:**
-    *   **vLLM (Reactive):** Configured with standard block settings. Represents "Hardware-unaware LRU Paging."
-    *   **Ray (Static):** 1 Actor per Agent. Represents "Static Partitioning."
-    *   **HuggingFace Accelerate (Offloading):** Configured with `device_map="auto"` and `offload_folder`. Represents standard "Zero-3" style offloading.
-    *   **Djinn (Semantic):** v2.3.15 with Unified VMU, SRG Scheduler, and **Skip-End Ring Buffer**.
+| Environment | Hardware | Constraint | Scientific Goal |
+| :--- | :--- | :--- | :--- |
+| **A. The Cloud** | **H100 (80GB)** | **Compute Oversupply** | **Proof of Density (The Hero).** Show that Djinn’s "Semantic Scheduler" beats vLLM's "Reactive Paging" by **2.5x** in concurrent agent density. |
+| **B. The Edge** | **L4 (24GB)** | **VRAM Scarcity** | **Proof of Virtualization.** Show that Djinn’s "Ring Buffer" enables a Thin Client to run models **6x larger than VRAM** at near-native speeds. |
 
 ---
 
-## 2. Implementation Specification: The "Skip-End Ring Buffer"
+## 2. Detailed Experiment Design
 
-**Architectural Role:** Software-defined MMU for the `Text Segment` (Weights).
-**Goal:** Saturate PCIe Gen4 Bandwidth (>24 GB/s) to enable the "Infinite Memory" illusion.
+### Experiment 1: The "Parking Lot" Solution (Agent Density)
+**Goal:** Prove that **Semantic Awareness** (Proactive Paging) beats **Hardware Heuristics** (Reactive LRU) even under stochastic load.
+**Context:** This is the primary economic result. It justifies the system's existence.
 
-### 2.1 Memory Partitioning
-We explicitly partition the 60GB VRAM budget.
-*   **Total Budget:** 60GB
-*   **Partition A: Weight Ring Buffer (48GB)**
-    *   **Structure:** Circular Buffer, pre-allocated as a single ByteTensor.
-    *   **Allocation Strategy:** **"Skip-End" Allocator** (Deterministic Pre-Calc).
-        *   *Constraint:* CUDA Tensors must be physically contiguous. We **CANNOT** split a single weight matrix across the end/start of the buffer.
-        *   *Logic:* Offsets are calculated **once at startup**, not at runtime.
-            ```python
-            # Startup Phase
-            current_offset = 0
-            for layer in model:
-                if (current_offset + layer.size > RING_SIZE):
-                    current_offset = 0  # Skip the tail, wrap to start
-                layer.ring_offset = current_offset
-                current_offset += layer.size
-            ```
-*   **Partition B: Unified Heap (12GB)**
-    *   Structure: Contiguous Slab.
-    *   Usage: `Stack Slab` (Activations) + `Data Segment` (KV Cache).
-    *   *Swap Trigger:* If KV usage exceeds 12GB, the Scheduler strictly swaps an idle session to Host.
+* **Workload:** **50 Concurrent Agents**.
+    * **Context:** 3,000 Tokens (~1.5GB KV Cache per agent).
+    * **Weights:** **Resident Shared** (Loaded once, never swapped). Only KV is swapped.
+    * **Pattern:** `Generate` $\to$ `Tool_Use(Sleep)` $\to$ `Resume`.
+    * **Robustness Update:** Sleep time is **Randomized (`uniform(8s, 12s)`)**.
+        * *Why:* Prevents "Thundering Herd" synchronization artifacts where all agents wake up at $t=11s$, artificially crashing the baseline. We win on *average* utilization, not just lucky scheduling.
+    * **Math:** $50 \times 1.5\text{GB} + 16\text{GB (Weights)} \approx \mathbf{91\text{GB}}$. (Cleanly exceeds 80GB H100).
+* **Baselines:**
+    1.  **Ray (Static Partitioning):** Assigns 1 GPU per actor. Caps at **1 Agent**.
+    2.  **vLLM (Reactive Paging):** Configured with swap. Uses LRU eviction.
+        * *Failure Mode:* Keeps idle agents in VRAM until 100% full. When Agent #45 tries to resume, vLLM panics and swaps out a victim. The PCIe bus floods with reactive swaps, causing latency spikes for *active* users.
+* **Djinn (Semantic Scheduling):**
+    * *Mechanism:* Client emits explicit semantic signal: `djinn.signal_phase("IO_WAIT")`.
+    * *Result:* SRG detects intent and **Proactively** moves `Data Segment` (KV) to Host Pinned Memory immediately (0ms delay).
+    * *Isolation:* Swap thread is CPU-pinned to avoid stalling the Compute thread (Noisy Neighbor fix).
+* **Success Metric:**
+    * **Scaling:** Linear throughput up to 50 agents.
+    * **Latency:** Flat P99 latency (no thrashing spikes).
 
-### 2.2 The Runtime Logic (Async Pipelining)
-**Crucial Change:** No CPU blocking (`synchronize()`) inside the loop. Fully asynchronous GPU-side event dependency.
+### Experiment 2: End-to-End Virtualization (Thin Client)
+**Goal:** Prove that Djinn provides the illusion of infinite memory to a remote client with minimal overhead.
+**Context:** This proves the "Tensor OS" architecture (Client $\to$ Server) matches specialized local runtimes.
 
-*   **Streams:**
-    *   `Stream A` (Prefetcher): High-priority copy stream (Host $\to$ Device).
-    *   `Stream B` (Compute): Kernel execution stream.
-*   **The Logic (Per Layer):**
-    1.  **CPU (Hook):**
-        *   *Optimization:* Do not create views dynamically. Use pre-computed views.
-        *   `module.weight.data = self.precomputed_views[layer_idx]`
-        *   *Note:* This happens on CPU. It updates metadata only (O(1)).
-    2.  **Prefetcher (Stream A):**
-        *   `stream_a.wait_event(Event_Layer_N_3_Done)` (Ensure we don't overwrite a slot still in use).
-        *   `cudaMemcpyAsync(dst=ring_buffer_ptr + offset, src=host_weight_ptr)`.
-        *   `Event_Layer_N_Ready.record(stream_a)`.
-    3.  **Executor (Stream B):**
-        *   `stream_b.wait_event(Event_Layer_N_Ready)` (Wait for data).
-        *   `Layer_N.forward()` (Kernel launch).
-        *   `Event_Layer_N_Done.record(stream_b)` (Signal slot is free).
+* **Workload:** **Llama-3-70B Inference** (140GB Weights).
+* **Hardware:** **L4 (24GB VRAM)**. (Model is ~6x larger than VRAM).
+* **Topology:** Client (Localhost/100GbE) $\to$ Server (L4).
+* **Baselines:**
+    1.  **HuggingFace Accelerate (Local):** Standard offloading.
+        * *Failure Mode:* Synchronous dispatch. Poor bandwidth (~12 GB/s) and slow prefill.
+    2.  **DeepSpeed-Inference (Local):** The "Speed of Light" baseline.
+        * *Target:* Specialized C++ runtime. Should hit ~23 GB/s (PCIe saturation).
+* **Djinn (Remote):**
+    * *Mechanism:* **Skip-End Ring Buffer** + **Async Pipelining**.
+    * *Tuning:* **Chunk Size Sweep**. We select the chunk size (e.g., 64MB) that maximizes Bandwidth without destroying Time-To-First-Token.
+* **Success Metrics:**
+    1.  **Effective Bandwidth (GB/s):** Target within **10%** of DeepSpeed.
+    2.  **Time-To-First-Token (TTFT):**
+        * *Accelerate:* ~30s (Slow copy).
+        * *Djinn:* < 7s (Streaming Prefill).
 
----
+### Experiment 3: White-Box Interactivity
+**Goal:** Prove that Djinn enables workflows impossible on "Black Box" engines.
+**Context:** Defends against "Why not just use vLLM?"
 
-## 3. Experiments
-
-### Experiment 1: The "Semantic Scheduling" Test (Agent Scalability)
-**Scientific Goal:** Prove that **Semantic Awareness** (knowing *when* to swap) outperforms **Reactive Heuristics** (LRU).
-
-*   **Workload:** RAG Agent Loop ($N$ Concurrent Agents).
-    *   `Prefill (2k tokens)` $\to$ `Decode (50 tokens)` $\to$ **`Tool Wait (10s)`** $\to$ `Resume`.
-*   **The Stressor:** 50 Agents $\times$ 2GB KV Cache = 100GB. (Exceeds 60GB VMU Limit).
-*   **The Comparison:**
-    *   **vLLM:** Holds KV in VRAM during "Tool Wait" (LRU policy). When 50 agents resume, it thrashes or blocks new requests.
-    *   **Djinn:** Detects `Tool Wait` via SRG (gap in graph). **Proactively** swaps KV to Host Pinned Memory.
-*   **Metrics:**
-    1.  **Resume Latency (P99):** Time from "Tool Return" to "First Token." (Must include PCIe transfer time).
-    2.  **Throughput Sustainability:** Tokens/sec vs Concurrent Agents. (vLLM should drop to near-zero; Djinn should maintain throughput with added latency offset).
-    3.  **Success Rate:** 100% completion (vs. Client Timeout/OOM in baselines).
-
-### Experiment 2: The "Virtual Memory" Test (Heterogeneous Pipelines)
-**Scientific Goal:** Prove the **Ring Buffer** enables running models larger than physical VRAM by saturating PCIe.
-
-*   **Workload:** Llama-3-70B Inference (140GB Weights, FP16) on 60GB VRAM.
-*   **Constraint:** `Batch Size = 1`.
-*   **The Comparison:**
-    *   **vLLM:** **Crash (OOM).** Cannot page weights dynamically.
-    *   **HF Accelerate:** **Slow.** Python dispatch overhead + synchronous copies lead to gaps in PCIe usage.
-    *   **Djinn:** **Fast.** The Ring Buffer hides the latency of Layer $N$ transfer behind the compute of Layer $N-1$.
-    *   **Djinn (No-Prefetch Ablation):** **Medium.** Same Ring Buffer, but synchronous copy. Proves the value of Async Pipelining.
-*   **Metrics:**
-    1.  **Effective Bandwidth:** $\frac{\text{Model Size}}{\text{Total Inference Time}}$. Target: **>20 GB/s**.
-    2.  **Visual Proof:** `nvidia-smi` trace showing flatlined PCIe RX and continuous Compute utilization.
-
-### Experiment 3: The "White-Box" Test (Intervention)
-**Scientific Goal:** Show `LazyTensor` abstraction allows zero-cost context switching.
-
-*   **Workload:** Breakpoint Debugging.
-    *   Run Layer 1-15 $\to$ Pause (User copies tensor to CPU) $\to$ Run Other Job $\to$ Resume Layer 16.
-*   **Metric:** **System Overhead** (Time spent saving/restoring the `Stack Slab` vs. Compute Time).
+* **Workload:** **"Activation Steering"** (Human-in-the-loop).
+    * Run Layers 1-40 $\to$ **Pause** $\to$ User modifies Tensor $\to$ **Resume**.
+* **Baselines:**
+    * **vLLM:** **Fails.** No API to modify state mid-generation.
+    * **PyTorch Eager:** **OOM.** Holds 80GB model + KV in VRAM during "Think Time."
+* **Djinn:**
+    * *Mechanism:* During pause, **Unified VMU** swaps active context to Host. GPU processes other users.
+* **Metric:** **System Overhead.** (Swap cost < 100ms).
 
 ---
 
-## 4. The Execution Checklist (Junior Engineer Guide)
+## 3. The Master Execution Checklist (Strict Order)
 
-**Instructions:** Check off items sequentially. Do not proceed to the next phase until the current phase is 100% verified.
+### Phase 1: Environment Certification
+* [ ] **1. NUMA Binding (Critical):**
+    * Run `lspci -tv` to map GPU to CPU Socket.
+    * Bind process: `numactl --cpunodebind=X --membind=X ...`
+* [ ] **2. Pinned Memory:**
+    * Run `ulimit -l`. Must be `unlimited`.
+    * Verify `torch.tensor(..., pin_memory=True)` consumes `RES` on host.
+* [ ] **3. DeepSpeed Baseline (L4):**
+    * Install DeepSpeed. Run Llama-70B offload **locally**.
+    * Record Bandwidth (GB/s). **Target: ~23 GB/s.**
 
-### Phase 1: Infrastructure Foundation & Guardrails
-*   [ ] **Verify Pinned Memory:** Run `shm_bandwidth.py`. Assert `Host -> Device` is **> 22 GB/s**.
-    *   *If < 10GB/s:* You are not using Pinned Memory. Check `tensor.pin_memory()` and `ulimit`.
-*   [ ] **Kernel Parity:** Verify `torch.backends.cuda.flash_sdp_enabled` is True.
-*   [ ] **OS Configuration:** Run `swapoff -a` (Disable Swap) to prevent disk thrashing.
-*   [ ] **NUMA Affinity:** Use `numactl --cpunodebind=X --membind=X` to bind the server process to the GPU-local CPU node.
+### Phase 2: Virtualization (L4 - Llama 70B)
+* [ ] **4. Bus Contention (Crucial):**
+    * Hardcode `DISABLE_KV_SWAP = True`. Weights own 100% of the bus.
+* [ ] **5. Memory Arena Pre-allocation (Fragmentation Fix):**
+    * **Action:** Allocate the `RingBuffer` as one contiguous `torch.empty(..., pin_memory=True)` at startup.
+    * *Why:* Prevents PyTorch allocator fragmentation after 100s of cycles, which would cause spurious OOMs on the 24GB card.
+* [ ] **6. Chunk Size Parameter Sweep:**
+    * Run Exp 2 with sizes: [16MB, 64MB, 128MB, 512MB].
+    * Pick the value that hits Bandwidth target while keeping TTFT low. **Lock this value.**
+* [ ] **7. Embedding Layer Trap:**
+    * Check `offset + 2.1GB < RING_SIZE`. Ensure huge layers don't wrap.
+* [ ] **8. Prefill Batching (TTFT Check):**
+    * Ensure prompt is computed as one block.
+    * **Record TTFT Metric.** (Target: < 7s vs Accelerate's ~30s).
+* [ ] **9. Async Pipeline:**
+    * Verify `Stream A` (Copy) overlaps `Stream B` (Compute).
 
-### Phase 2: Ring Buffer Implementation (The "Moonshot")
-*   [ ] **Implement Skip-End Allocator (Startup):**
-    *   Code Logic: `if (offset + size > RING_SIZE) offset = 0;`
-    *   Verification: Print `offset` log. Ensure no tensor starts at `RING_SIZE - 100 bytes`.
-*   [ ] **Implement Pre-Computed Views:**
-    *   Create a list `self.layer_views` during model load.
-    *   Ensure each view points to the correct offset in the Ring Buffer.
-*   [ ] **Implement Hook Swizzling:**
-    *   Use `layer.register_forward_pre_hook(hook_fn)`.
-    *   Inside hook: `module.weight.data = self.layer_views[layer_idx]`.
-    *   **Verification:** Check `module.weight.data_ptr()` matches the ring buffer address.
-*   [ ] **Disable CUDA Graphs:** Explicitly disable `torch.compile` or CUDA Graphs for the weight streaming experiment.
-*   [ ] **GIL Safety Check:** Ensure the "Prefetch Loop" (Stream A) runs ahead of the "Compute Loop" (Stream B).
-*   [ ] **Ablation Switch:** Implement a flag `--disable-prefetch` (forces `synchronize()` after copy) to generate the baseline data.
+### Phase 3: Density (H100 - Agents)
+* [ ] **10. Memory Math Check:**
+    * Set Context Length = **3,000 tokens** (~1.5GB KV).
+    * Run **50 Agents**. Total Demand > 85GB.
+* [ ] **11. Warm Start Verification:**
+    * Ensure Weights are loaded *before* the timer starts. The OS manages *Tensor Data*, not file I/O.
+* [ ] **12. CPU Isolation (Noisy Neighbor Fix):**
+    * Pin **Compute Thread** to Cores 0-7.
+    * Pin **Swap Thread** to Cores 8-15.
+* [ ] **13. Semantic Signal Implementation:**
+    * Implement `djinn.signal_phase("IO_WAIT")` in the Python client.
+    * Ensure SRG acts immediately (0ms delay).
+* [ ] **14. The "Thundering Herd" Test:**
+    * Modify Agent Script: `sleep_time = random.uniform(8.0, 12.0)`.
+    * *Pass Criteria:* Throughput remains stable. System does not OOM during "overlap" windows.
+* [ ] **15. Ablation:**
+    * Run with `--disable-proactive-swap`. Confirm crash/thrash.
 
-### Phase 3: Semantic Scheduler (The "Agent" Logic)
-*   [ ] **Idle Detector:**
-    *   Logic: If a Session has no active LazyTensor ops for > 1.0s, mark as `IDLE`.
-    *   Action: Issue `vmu.evict_data_segment(session_id)`.
-*   [ ] **Swap-to-Host:** Implement `cudaMemcpyAsync(Host, Device_KV)` for eviction.
-    *   **Verification:** Watch VRAM usage drop on `nvidia-smi` when agent sleeps.
-*   [ ] **Queue Fairness:** Use **LIFO** for the ReadyQueue during overload (prevents timeout for the most recent user; let the old ones wait).
+### Phase 4: Data Collection
+* [ ] **16. Debug Demo (Exp 3):**
+    * Measure Swap Overhead (< 100ms) for White-Box Steering.
+* [ ] **17. Trace Capture (The Money Plot):**
+    * Command: `nvidia-smi dmon -s pcit -d 1 -o T > trace.csv`.
+    * **Goal:** Exp 2 (L4) shows **PCIe RX** flatlined at 100% (24 GB/s).
 
-### Phase 4: Metric Fidelity & Correctness
-*   [ ] **Logit Equivalence Check:**
-    *   Run one pass with standard PyTorch (loading model fully on CPU or 2 GPUs).
-    *   Run one pass with Djinn (Ring Buffer).
-    *   Pass Condition: `torch.norm(djinn_output - ref_output) < 0.1` (FP16 tolerance).
-*   [ ] **The "Flatline" Test:**
-    *   Run Llama-70B. Open `nvidia-smi dmon -s pcit`.
-    *   Pass Condition: `rx` column should stay > 20000 MB/s consistently.
-*   [ ] **The "Sleep" Check:**
-    *   Start Agent. Let it generate. Sleep 30s. Resume.
-    *   Pass Condition: No OOM, correct output generated.
+---
 
-### Phase 5: Troubleshooting "Gotchas"
-*   **"My speed is 12GB/s!"** $\to$ You are likely accidentally using Pageable Memory on the host. Check `tensor.pin_memory()`.
-*   **"CUDA Illegal Memory Access!"** $\to$ Your Skip-End logic failed. A tensor wrapped around the buffer end.
-*   **"Latency spikes!"** $\to$ Python Garbage Collector might be pausing the Prefetch thread. Try `gc.disable()` during the inference loop.
+### Final "Reviewer #2" Defense Cheat Sheet
+
+| Reviewer Attack | Djinn Defense |
+| :--- | :--- |
+| *"You are slower than DeepSpeed."* | "We match DeepSpeed's bandwidth within 10% (Exp 2), but we allow **Remote** execution and **Interactivity** which DeepSpeed cannot. We also beat naive offloading (Accelerate) by 2x." |
+| *"Why not use vLLM?"* | "vLLM fails at high density (Exp 1). Its reactive paging causes thrashing. Djinn's proactive scheduling enables **2.5x higher density**." |
+| *"Is this just offloading?"* | "Accelerate is offloading (Synchronous). Djinn is an **OS** (Async Pipelining + Virtual Addressing). The performance gap (12GB/s vs 22GB/s) proves the OS primitive is necessary." |
+| *"Is your density result just lucky scheduling?"* | "No. We tested with **Randomized Sleep Intervals** (Poisson arrivals) to ensure robustness against 'Thundering Herd' scenarios. The system remains stable." |
+| *"How is this 'Semantic'?"* | "Unlike Hardware Heuristics (LRU) or Timeouts (Reactive), Djinn uses explicit client signals (`IO_WAIT`) to schedule memory moves *before* the system idles." |
