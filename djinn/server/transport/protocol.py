@@ -27,6 +27,7 @@ class MessageType(IntEnum):
     QUERY_RESULT = 0x0C  # ✅ NEW: Query result of async task
     EXECUTE_BATCH = 0x0D  # ✅ NEW: Execute batch of models
     EXECUTE_STAGE = 0x0E  # Stage-level execution (encoder/decoder)
+    EXECUTE_WITH_BREAKPOINT = 0x0F  # ✅ NEW: Execute with mid-inference breakpoint (Exp3)
 
     # Error response
     ERROR = 0xFF

@@ -1,0 +1,26 @@
+# Experiment 3: White-Box Breakpoint Debugging - Smoke Test
+# Quick validation that breakpoint functionality works
+
+model:
+  name: "gpt2"
+  source: "transformers"
+  
+breakpoint:
+  enabled: true
+  layers_to_test: [5, 10, 15]  # Test at different layers
+  
+input:
+  batch_size: 1
+  seq_length: 128
+  
+metrics:
+  collect_checkpoint_time: true
+  collect_pause_duration: true
+  collect_restore_time: true
+  collect_correctness: true  # Verify breakpoint run == full run
+  
+validation:
+  tolerance: 0.1  # FP16 tolerance for output equivalence
+  
+duration: 5  # minutes
+

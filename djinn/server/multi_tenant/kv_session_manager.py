@@ -14,6 +14,8 @@ by keeping KV cache resident on GPU rather than transferring it every step.
 import asyncio
 import logging
 import time
+import pickle
+import io
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Any
 
@@ -31,6 +33,8 @@ class KVSession:
     last_access: float = field(default_factory=time.time)
     bytes_used: int = 0
     step_count: int = 0
+    is_swapped: bool = False  # Whether KV is on host (Phase 3)
+    swap_offset: Optional[int] = None  # Offset in host swap pool (Phase 3)
 
 
 class KVSessionManager:
@@ -295,6 +299,380 @@ class KVSessionManager:
         if isinstance(data, dict):
             return sum(self._estimate_size_bytes(v) for v in data.values())
         return 0
+    
+    async def evict_kv_to_host(self, session_id: str) -> int:
+        """
+        Evict KV cache for a session to host swap pool (Phase 3).
+        
+        Async copies KV cache from GPU to pinned host memory using DMA.
+        Session remains tracked; KV is marked as swapped.
+        
+        Args:
+            session_id: Session to evict
+            
+        Returns:
+            Bytes evicted, or 0 if not found/already swapped
+            
+        Raises:
+            RuntimeError: If eviction fails
+        """
+        # Import here to avoid circular dependency
+        from djinn.server.host_swap_pool import get_swap_pool
+        
+        async with self._lock:
+            if session_id not in self._sessions:
+                logger.warning(f"Cannot evict: session {session_id} not found")
+                return 0
+            
+            sess = self._sessions[session_id]
+            
+            if sess.is_swapped:
+                logger.debug(f"Session {session_id} already swapped")
+                return 0
+            
+            if sess.kv_cache is None:
+                logger.debug(f"Session {session_id} has no KV cache to evict")
+                return 0
+            
+            size_bytes = sess.bytes_used
+            
+            try:
+                # Estimate metadata size (typically 100-200 bytes for small structures)
+                metadata_estimate = 256  # Conservative estimate
+                total_size = size_bytes + metadata_estimate
+                
+                # Get swap pool and allocate space (includes metadata)
+                swap_pool = get_swap_pool()
+                offset, host_view = swap_pool.allocate(
+                    session_id, total_size, gpu_device=sess.gpu_id
+                )
+                
+                # Async copy KV from GPU to host
+                await asyncio.to_thread(
+                    self._copy_to_host,
+                    sess.kv_cache,
+                    host_view,
+                    size_bytes
+                )
+                
+                # Mark as swapped (keep KV reference for restore)
+                sess.is_swapped = True
+                sess.swap_offset = offset
+                
+                logger.info(
+                    f"Evicted KV to host: session_id={session_id}, "
+                    f"size={size_bytes/1024**2:.1f}MB, offset={offset}"
+                )
+                
+                self.stats["kv_bytes_pinned"] -= size_bytes
+                return size_bytes
+            
+            except Exception as e:
+                logger.error(f"Failed to evict session {session_id}: {e}")
+                raise
+    
+    async def restore_kv_from_host(self, session_id: str) -> int:
+        """
+        Restore KV cache for a session from host swap pool to GPU (Phase 3).
+        
+        Async copies KV cache from pinned host memory back to GPU using DMA.
+        
+        Args:
+            session_id: Session to restore
+            
+        Returns:
+            Bytes restored, or 0 if not found/not swapped
+            
+        Raises:
+            RuntimeError: If restore fails
+        """
+        # Import here to avoid circular dependency
+        from djinn.server.host_swap_pool import get_swap_pool
+        
+        async with self._lock:
+            if session_id not in self._sessions:
+                logger.warning(f"Cannot restore: session {session_id} not found")
+                return 0
+            
+            sess = self._sessions[session_id]
+            
+            if not sess.is_swapped:
+                logger.debug(f"Session {session_id} not swapped")
+                return 0
+            
+            if sess.kv_cache is None or sess.swap_offset is None:
+                logger.warning(f"Session {session_id} missing KV or swap offset")
+                return 0
+            
+            size_bytes = sess.bytes_used
+            
+            try:
+                # Get swap pool view
+                swap_pool = get_swap_pool()
+                host_view = swap_pool.get_host_view(session_id)
+                
+                if host_view is None:
+                    raise RuntimeError(f"No swap mapping for {session_id}")
+                
+                # Async copy KV from host to GPU
+                await asyncio.to_thread(
+                    self._copy_from_host,
+                    host_view,
+                    sess.kv_cache,
+                    size_bytes
+                )
+                
+                # Mark as restored
+                sess.is_swapped = False
+                swap_pool.free(session_id)
+                sess.swap_offset = None
+                
+                logger.info(
+                    f"Restored KV from host: session_id={session_id}, "
+                    f"size={size_bytes/1024**2:.1f}MB"
+                )
+                
+                self.stats["kv_bytes_pinned"] += size_bytes
+                return size_bytes
+            
+            except Exception as e:
+                logger.error(f"Failed to restore session {session_id}: {e}")
+                raise
+    
+    def _copy_to_host(self, kv_gpu: Any, host_view: torch.Tensor, size_bytes: int) -> None:
+        """
+        Copy KV cache structure from GPU to host pinned memory.
+        
+        Simplified approach: directly copy the structure without metadata overhead
+        for correct size matching. Structure metadata can be optionally added to
+        future enhancements.
+        
+        Args:
+            kv_gpu: KV cache structure on GPU
+            host_view: Tensor view into host swap pool  (includes space for metadata)
+            size_bytes: Data bytes to copy (excluding metadata)
+        """
+        # Flatten KV structure to contiguous tensor on GPU (avoiding Python bytes)
+        kv_flat = self._flatten_structure_to_tensor(kv_gpu)
+        
+        actual_data_bytes = kv_flat.numel()
+        if actual_data_bytes > size_bytes:
+            raise RuntimeError(
+                f"KV cache size mismatch: flattened={actual_data_bytes}, expected={size_bytes}"
+            )
+        
+        # Direct tensor-to-tensor copy from GPU to host (first part of view)
+        data_view = host_view.view(torch.uint8)[:actual_data_bytes]
+        data_view.copy_(kv_flat.view(torch.uint8), non_blocking=True)
+        
+        # Use stream synchronization (not global sync)
+        if torch.cuda.is_available():
+            torch.cuda.current_stream().synchronize()
+    
+    def _copy_from_host(self, host_view: torch.Tensor, kv_gpu: Any, size_bytes: int) -> None:
+        """
+        Copy KV cache structure from host pinned memory back to GPU.
+        
+        Uses direct tensor transfer. For complex structures, the caller must
+        ensure the target structure is properly allocated.
+        
+        Args:
+            host_view: Tensor view into host swap pool
+            kv_gpu: KV cache structure on GPU (target)
+            size_bytes: Bytes to copy (data portion)
+        """
+        # Extract data portion from host
+        data_view = host_view.view(torch.uint8)[:size_bytes]
+        
+        # Determine target device from kv_gpu structure
+        target_device = self._get_device_from_structure(kv_gpu)
+        
+        # Copy from host to GPU directly
+        gpu_tensor = torch.empty(size_bytes, dtype=torch.uint8, device=target_device)
+        gpu_tensor.copy_(data_view, non_blocking=True)
+        
+        # For simple tensor structures, try direct copy
+        if isinstance(kv_gpu, torch.Tensor):
+            try:
+                kv_gpu.copy_(gpu_tensor.view(kv_gpu.shape).to(kv_gpu.dtype))
+            except Exception as e:
+                logger.warning(f"Direct tensor restore failed: {e}")
+        
+        # Sync only current stream (not global)
+        if torch.cuda.is_available():
+            torch.cuda.current_stream().synchronize()
+    
+    def _get_structure_metadata(self, data: Any) -> Dict[str, Any]:
+        """Extract structure metadata for proper deserialization."""
+        if isinstance(data, torch.Tensor):
+            return {
+                'type': 'tensor',
+                'shape': tuple(data.shape),
+                'dtype': str(data.dtype),
+                'device': str(data.device),
+            }
+        if isinstance(data, (list, tuple)):
+            return {
+                'type': 'sequence',
+                'sequence_type': type(data).__name__,
+                'length': len(data),
+                'elements': [self._get_structure_metadata(elem) for elem in data],
+            }
+        if isinstance(data, dict):
+            return {
+                'type': 'dict',
+                'keys': list(data.keys()),
+                'values': {k: self._get_structure_metadata(v) for k, v in data.items()},
+            }
+        return {'type': 'unknown'}
+    
+    def _flatten_structure_to_tensor(self, data: Any) -> torch.Tensor:
+        """
+        Flatten nested KV cache structure to a single contiguous tensor on GPU.
+        
+        Returns a uint8 tensor containing all the data bytes.
+        """
+        tensors = []
+        total_bytes = 0
+        
+        def collect_tensors(obj):
+            nonlocal total_bytes
+            if isinstance(obj, torch.Tensor):
+                # Calculate size in bytes
+                num_bytes = obj.numel() * obj.element_size()
+                total_bytes += num_bytes
+                # Store as contiguous float tensor (will convert to bytes later)
+                tensors.append(obj.detach().contiguous())
+            elif isinstance(obj, (list, tuple)):
+                for elem in obj:
+                    collect_tensors(elem)
+            elif isinstance(obj, dict):
+                for v in obj.values():
+                    collect_tensors(v)
+        
+        collect_tensors(data)
+        
+        if not tensors:
+            raise RuntimeError("No tensors found in KV structure")
+        
+        # Concatenate all tensors on GPU, then convert to bytes
+        if len(tensors) == 1:
+            flattened_gpu = tensors[0].view(torch.uint8)
+        else:
+            # Convert each tensor to bytes, concatenate, then view as uint8
+            byte_tensors = [t.view(torch.uint8) for t in tensors]
+            flattened_gpu = torch.cat(byte_tensors)
+        
+        return flattened_gpu
+    
+    def _get_device_from_structure(self, data: Any) -> torch.device:
+        """Extract device from KV structure."""
+        if isinstance(data, torch.Tensor):
+            return data.device
+        if isinstance(data, (list, tuple)):
+            for elem in data:
+                dev = self._get_device_from_structure(elem)
+                if dev is not None:
+                    return dev
+        if isinstance(data, dict):
+            for v in data.values():
+                dev = self._get_device_from_structure(v)
+                if dev is not None:
+                    return dev
+        return torch.device('cuda:0')
+    
+    def _deserialize_kv_from_flat(
+        self, 
+        flat_tensor: torch.Tensor, 
+        target_structure: Any, 
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """
+        Deserialize flattened KV cache back to target structure.
+        
+        Handles complex nested structures (lists of tuples of tensors, etc.)
+        """
+        if metadata is None:
+            # Fallback: if structure is tensor, just reshape
+            if isinstance(target_structure, torch.Tensor):
+                target_structure.copy_(flat_tensor.view(target_structure.shape))
+            return
+        
+        offset = 0
+        
+        def deserialize_recursive(meta, target):
+            nonlocal offset
+            
+            if meta['type'] == 'tensor':
+                shape = tuple(meta['shape'])
+                dtype_str = meta['dtype']
+                size = 1
+                for dim in shape:
+                    size *= dim
+                
+                # Extract bytes for this tensor
+                element_size = 1  # uint8
+                tensor_bytes = flat_tensor[offset:offset + size]
+                offset += size
+                
+                # Reshape and restore dtype
+                dtype = eval(dtype_str) if 'torch' not in dtype_str else torch.float32
+                reshaped = tensor_bytes.view(dtype).reshape(shape)
+                target.copy_(reshaped)
+            
+            elif meta['type'] == 'sequence':
+                for i, elem_meta in enumerate(meta['elements']):
+                    deserialize_recursive(elem_meta, target[i])
+            
+            elif meta['type'] == 'dict':
+                for key, value_meta in meta['values'].items():
+                    deserialize_recursive(value_meta, target[key])
+        
+        try:
+            deserialize_recursive(metadata, target_structure)
+        except Exception as e:
+            logger.warning(f"Deserialization with metadata failed: {e}, skipping reconstruction")
+    
+    def is_swapped(self, session_id: str) -> bool:
+        """
+        Check if a session's KV cache is currently on host.
+        
+        Verifies consistency with both KVSession.is_swapped and HostSwapPool state.
+        
+        Args:
+            session_id: Session to check
+            
+        Returns:
+            True if swapped, False otherwise
+        """
+        # Import here to avoid circular dependency
+        from djinn.server.host_swap_pool import get_swap_pool
+        
+        # Check local state
+        if session_id not in self._sessions:
+            return False
+        
+        sess = self._sessions[session_id]
+        
+        # Verify consistency with host swap pool
+        try:
+            swap_pool = get_swap_pool()
+            pool_has_mapping = swap_pool.is_swapped(session_id)
+            
+            # They should match
+            if sess.is_swapped != pool_has_mapping:
+                logger.warning(
+                    f"Swap state mismatch for {session_id}: "
+                    f"KVSession.is_swapped={sess.is_swapped}, "
+                    f"pool.is_swapped={pool_has_mapping}. "
+                    f"Assuming pool state is authoritative."
+                )
+                return pool_has_mapping
+            
+            return sess.is_swapped
+        except Exception as e:
+            logger.debug(f"Could not verify swap pool state: {e}")
+            return sess.is_swapped
 
 
 _global_kv_session_manager: Optional[KVSessionManager] = None

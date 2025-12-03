@@ -47,6 +47,11 @@ class BasicQosScheduler:
 
     Provides strict priority ordering (Realtime > Interactive > Batch) with
     per-class concurrency limits and bounded total concurrency.
+    
+    Phase 3 Enhancement: LIFO scheduling during overload
+    - When total queue depth > 2x concurrency, switches to LIFO (pop from end)
+    - Ensures newest requests get served even during congestion
+    - Prevents timeout for requests with full deadline budget
     """
 
     def __init__(
@@ -54,6 +59,8 @@ class BasicQosScheduler:
         max_concurrency: int,
         class_shares: Optional[Dict[str, float]] = None,
         escalation_delay_ms: float = 800.0,
+        overload_threshold_multiplier: float = 2.0,
+        use_lifo_on_overload: bool = True,
     ):
         if max_concurrency <= 0:
             raise ValueError("max_concurrency must be positive")
@@ -65,13 +72,26 @@ class BasicQosScheduler:
         self._inflight_total = 0
         self._inflight_per_class: Dict[QoSClass, int] = {qos: 0 for qos in QoSClass}
         self._lock = asyncio.Lock()
+        
+        # Phase 3: LIFO parameters
+        self.overload_threshold_multiplier = overload_threshold_multiplier
+        self.use_lifo_on_overload = use_lifo_on_overload
+        self._was_overloaded = False  # Track overload state transitions
+        self.stats = {
+            "lifo_switches": 0,
+            "fifo_scheduled": 0,
+            "lifo_scheduled": 0,
+        }
 
         self._class_limits = self._compute_class_limits(max_concurrency, class_shares)
         self._escalation_delay_ms = max(0.0, float(escalation_delay_ms))
         logger.info(
-            "BasicQoSScheduler initialized: total_slots=%d, limits=%s",
+            "BasicQoSScheduler initialized: total_slots=%d, limits=%s, "
+            "overload_threshold=%d, lifo_enabled=%s",
             self._max_concurrency,
             {cls.value: limit for cls, limit in self._class_limits.items()},
+            int(max_concurrency * overload_threshold_multiplier),
+            use_lifo_on_overload,
         )
 
     @staticmethod
@@ -144,11 +164,46 @@ class BasicQosScheduler:
             if not next_class:
                 break
 
-            work = self._queues[next_class].popleft()
+            # Phase 3: Check for overload and use LIFO if needed
+            is_overload = self._check_overload()
+            if is_overload and self.use_lifo_on_overload:
+                work = self._queues[next_class].pop()  # LIFO: pop from end
+                self.stats["lifo_scheduled"] += 1
+            else:
+                work = self._queues[next_class].popleft()  # FIFO: pop from start
+                self.stats["fifo_scheduled"] += 1
+            
             self._inflight_total += 1
             self._inflight_per_class[next_class] += 1
             asyncio.create_task(self._execute_work(next_class, work))
 
+    def _check_overload(self) -> bool:
+        """
+        Check if system is in overload state (Phase 3).
+        
+        Overload = total queued requests > overload_threshold_multiplier * max_concurrency
+        
+        Returns:
+            True if overload detected, False otherwise
+        """
+        total_queued = sum(len(q) for q in self._queues.values())
+        threshold = int(self._max_concurrency * self.overload_threshold_multiplier)
+        
+        is_overload = total_queued > threshold
+        
+        # Only increment counter on state transitions (not every check)
+        if is_overload and not self._was_overloaded:
+            self.stats["lifo_switches"] += 1
+            logger.info(
+                f"Scheduler entered overload state (queued={total_queued} > threshold={threshold}). "
+                f"Switching to LIFO."
+            )
+        elif not is_overload and self._was_overloaded:
+            logger.info(f"Scheduler exited overload state. Switching back to FIFO.")
+        
+        self._was_overloaded = is_overload
+        return is_overload
+    
     def _pick_next_class_locked(self) -> Optional[QoSClass]:
         now = time.time()
         for qos in QoSClass:
@@ -221,4 +276,14 @@ class BasicQosScheduler:
                     0, self._inflight_per_class[qos_class] - 1
                 )
                 await self._maybe_dispatch_locked()
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get scheduler statistics (Phase 3)."""
+        return {
+            **self.stats,
+            "inflight_total": self._inflight_total,
+            "inflight_per_class": dict(self._inflight_per_class),
+            "queued_per_class": {qos.value: len(q) for qos, q in self._queues.items()},
+            "max_concurrency": self._max_concurrency,
+        }
 

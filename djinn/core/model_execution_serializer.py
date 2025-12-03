@@ -571,3 +571,324 @@ class ModelExecutionSerializer:
             results.append(result)
 
         return results
+
+    @staticmethod
+    def serialize_execute_with_breakpoint_request(
+        fingerprint: str,
+        inputs: Dict[str, torch.Tensor],
+        breakpoint_layer_index: int,
+        wait_for_resume: bool = True,
+        session_id: Optional[str] = None,
+        profile_id: Optional[str] = None,
+        qos_class: Optional[str] = None,
+        deadline_ms: Optional[int] = None,
+    ) -> bytes:
+        """
+        Serialize EXECUTE_WITH_BREAKPOINT request to binary protocol.
+
+        Args:
+            fingerprint: Model fingerprint
+            inputs: Input tensors
+            breakpoint_layer_index: Layer to pause at
+            wait_for_resume: Whether to wait for resume signal
+            session_id: Optional session ID
+            profile_id: Optional profile ID
+            qos_class: Optional QoS class
+            deadline_ms: Optional deadline
+
+        Returns:
+            Serialized binary data
+        """
+        # Prepare metadata
+        tensor_keys = list(inputs.keys())
+        metadata = {
+            'fingerprint': fingerprint,
+            'breakpoint_layer_index': breakpoint_layer_index,
+            'wait_for_resume': wait_for_resume,
+            'profile_id': profile_id,
+            'tensor_keys': tensor_keys,
+            'tensor_shapes': [list(inputs[k].shape) for k in tensor_keys],
+            'tensor_dtypes': [str(inputs[k].dtype) for k in tensor_keys],
+        }
+        if session_id:
+            metadata['session_id'] = session_id
+        if qos_class:
+            metadata['qos_class'] = qos_class
+        if deadline_ms is not None:
+            metadata['deadline_ms'] = deadline_ms
+        
+        metadata_json = json.dumps(metadata).encode('utf-8')
+
+        # Serialize tensors to numpy format
+        tensor_data = []
+        for key in tensor_keys:
+            tensor = inputs[key]
+            if tensor.device.type == 'cuda':
+                tensor = tensor.cpu()
+            if not tensor.is_contiguous():
+                tensor = tensor.contiguous()
+            numpy_bytes = tensor.numpy().tobytes()
+            tensor_data.append(numpy_bytes)
+
+        # Build message
+        message = SerializedMessage(
+            header=ModelExecutionSerializer._build_header(len(metadata_json), len(tensor_keys)),
+            metadata=metadata_json,
+            tensor_data=tensor_data
+        )
+
+        return ModelExecutionSerializer._assemble_message(message)
+
+    @staticmethod
+    def deserialize_execute_with_breakpoint_request(data: bytes) -> Tuple[str, Dict[str, torch.Tensor], int, bool, Optional[str], Optional[str], Dict[str, Any]]:
+        """
+        Deserialize EXECUTE_WITH_BREAKPOINT request from binary protocol.
+
+        Returns:
+            (fingerprint, inputs, breakpoint_layer_index, wait_for_resume, session_id, profile_id, extras)
+        """
+        # Parse header
+        if len(data) < 9:
+            raise ValueError(f"Message too short: {len(data)} bytes")
+
+        version = data[0]
+        if version != PROTOCOL_VERSION:
+            raise ValueError(f"Unsupported protocol version: {version}")
+
+        metadata_len = struct.unpack('>I', data[1:5])[0]
+        tensor_count = struct.unpack('>I', data[5:9])[0]
+
+        offset = 9
+
+        # Parse metadata
+        metadata_end = offset + metadata_len
+        if metadata_end > len(data):
+            raise ValueError(f"Metadata length exceeds message: {metadata_len} > {len(data) - offset}")
+
+        metadata_json = data[offset:metadata_end].decode('utf-8')
+        metadata = json.loads(metadata_json)
+        offset = metadata_end
+
+        # Extract metadata
+        fingerprint = metadata.get('fingerprint')
+        breakpoint_layer_index = metadata.get('breakpoint_layer_index', 0)
+        wait_for_resume = metadata.get('wait_for_resume', True)
+        session_id = metadata.get('session_id')
+        profile_id = metadata.get('profile_id')
+        tensor_keys = metadata.get('tensor_keys', [])
+        tensor_shapes = metadata.get('tensor_shapes', [])
+        tensor_dtypes = metadata.get('tensor_dtypes', [])
+
+        # Parse tensors (with key framing for validation)
+        inputs = {}
+        for i, key in enumerate(tensor_keys):
+            # Read key (for validation) - matches _assemble_message format
+            if offset + 4 > len(data):
+                raise ValueError(f"Key length data too short at index {i}")
+            
+            key_len = struct.unpack('>I', data[offset:offset+4])[0]
+            offset += 4
+
+            if offset + key_len > len(data):
+                raise ValueError(f"Key data incomplete at index {i}")
+            
+            actual_key = data[offset:offset+key_len].decode('utf-8')
+            if actual_key != key:
+                raise ValueError(f"Key mismatch: expected {key}, got {actual_key}")
+            offset += key_len
+
+            # Read tensor length
+            if offset + 8 > len(data):
+                raise ValueError(f"Tensor data length too short at index {i}")
+            
+            tensor_len = struct.unpack('>Q', data[offset:offset+8])[0]
+            offset += 8
+
+            # Read tensor data
+            if offset + tensor_len > len(data):
+                raise ValueError(f"Tensor data incomplete at index {i}")
+            
+            tensor_bytes = data[offset:offset+tensor_len]
+            offset += tensor_len
+
+            # Reconstruct tensor
+            shape = tuple(tensor_shapes[i])
+            dtype_str = tensor_dtypes[i]
+            tensor = ModelExecutionSerializer._deserialize_tensor(tensor_bytes, shape, dtype_str)
+            inputs[key] = tensor
+
+        extras = {
+            'qos_class': metadata.get('qos_class'),
+            'deadline_ms': metadata.get('deadline_ms'),
+        }
+
+        return fingerprint, inputs, breakpoint_layer_index, wait_for_resume, session_id, profile_id, extras
+
+    @staticmethod
+    def serialize_execute_with_breakpoint_response(
+        result: Any,
+        checkpoint_time_ms: float = 0.0,
+        restore_time_ms: float = 0.0,
+        checkpoint_size_mb: float = 0.0,
+        overhead_percent: float = 0.0,
+        metrics: Optional[Dict[str, float]] = None,
+        status: str = 'success',
+        message: Optional[str] = None,
+    ) -> bytes:
+        """
+        Serialize EXECUTE_WITH_BREAKPOINT response to binary protocol.
+
+        Args:
+            result: Model output
+            checkpoint_time_ms: Checkpoint duration
+            restore_time_ms: Restore duration
+            checkpoint_size_mb: Checkpoint size
+            overhead_percent: Overhead percentage
+            metrics: Additional metrics
+            status: Response status
+            message: Optional message
+
+        Returns:
+            Serialized binary data
+        """
+        # Determine result type
+        if isinstance(result, torch.Tensor):
+            result_type = RESULT_TYPE_TENSOR
+            result_structure = None
+        elif isinstance(result, dict):
+            result_type = RESULT_TYPE_DICT
+            result_structure = {
+                'keys': list(result.keys()),
+                'types': [type(v).__name__ for v in result.values()]
+            }
+        elif isinstance(result, (tuple, list)):
+            result_type = RESULT_TYPE_TUPLE
+            result_structure = {
+                'length': len(result),
+                'types': [type(v).__name__ for v in result]
+            }
+        else:
+            result_type = RESULT_TYPE_CUSTOM
+            result_structure = {'type': type(result).__name__}
+
+        # Prepare metadata with breakpoint-specific metrics
+        # Note: metrics dict already contains checkpoint_time_ms, restore_time_ms, etc.
+        # from BreakpointExecutor, so we don't duplicate them
+        all_metrics = {
+            'checkpoint_time_ms': checkpoint_time_ms,
+            'restore_time_ms': restore_time_ms,
+            'checkpoint_size_mb': checkpoint_size_mb,
+            'overhead_percent': overhead_percent,
+        }
+        if metrics:
+            # Merge additional metrics without overwriting the primary ones
+            for key, value in metrics.items():
+                if key not in all_metrics:
+                    all_metrics[key] = value
+
+        metadata = {
+            'status': status,
+            'metrics': all_metrics,
+            'result_structure': result_structure
+        }
+        if message:
+            metadata['message'] = message
+        metadata_json = json.dumps(metadata).encode('utf-8')
+
+        # Serialize result data
+        result_data = bytearray()
+
+        if result_type == RESULT_TYPE_TENSOR and result is not None:
+            shape_json = json.dumps(list(result.shape)).encode('utf-8')
+            dtype_str = str(result.dtype).encode('utf-8')
+            tensor_bytes = ModelExecutionSerializer._serialize_tensor(result)
+
+            result_data.extend(struct.pack('>I', len(shape_json)))
+            result_data.extend(shape_json)
+            result_data.extend(struct.pack('>I', len(dtype_str)))
+            result_data.extend(dtype_str)
+            result_data.extend(struct.pack('>Q', len(tensor_bytes)))
+            result_data.extend(tensor_bytes)
+
+        elif result_type == RESULT_TYPE_DICT and result is not None:
+            result_data.extend(struct.pack('>I', len(result)))
+            for key, value in result.items():
+                if isinstance(value, torch.Tensor):
+                    key_bytes = key.encode('utf-8')
+                    shape_json = json.dumps(list(value.shape)).encode('utf-8')
+                    dtype_str = str(value.dtype).encode('utf-8')
+                    tensor_bytes = ModelExecutionSerializer._serialize_tensor(value)
+
+                    result_data.extend(struct.pack('>I', len(key_bytes)))
+                    result_data.extend(key_bytes)
+                    result_data.extend(struct.pack('>I', len(shape_json)))
+                    result_data.extend(shape_json)
+                    result_data.extend(struct.pack('>I', len(dtype_str)))
+                    result_data.extend(dtype_str)
+                    result_data.extend(struct.pack('>Q', len(tensor_bytes)))
+                    result_data.extend(tensor_bytes)
+
+        # Build message
+        header = ModelExecutionSerializer._build_response_header(len(metadata_json), result_type)
+        return header + metadata_json + bytes(result_data)
+
+    @staticmethod
+    def deserialize_execute_with_breakpoint_response(data: bytes) -> Tuple[Any, float, float, float, float, Dict[str, Any], str, Optional[str]]:
+        """
+        Deserialize EXECUTE_WITH_BREAKPOINT response from binary protocol.
+
+        Returns:
+            (result, checkpoint_time_ms, restore_time_ms, checkpoint_size_mb, overhead_percent, metrics, status, message)
+        """
+        # Parse header
+        if len(data) < 6:
+            raise ValueError(f"Response too short: {len(data)} bytes")
+
+        version = data[0]
+        if version != PROTOCOL_VERSION:
+            raise ValueError(f"Unsupported protocol version: {version}")
+
+        metadata_len = struct.unpack('>I', data[1:5])[0]
+        result_type = data[5]
+
+        offset = 6
+
+        # Parse metadata
+        metadata_end = offset + metadata_len
+        if metadata_end > len(data):
+            raise ValueError(f"Metadata length exceeds message: {metadata_len} > {len(data) - offset}")
+
+        metadata_json = data[offset:metadata_end].decode('utf-8')
+        metadata = json.loads(metadata_json)
+        offset = metadata_end
+
+        status = metadata.get('status', 'success')
+        message = metadata.get('message')
+        metrics = metadata.get('metrics', {})
+
+        checkpoint_time_ms = metrics.get('checkpoint_time_ms', 0.0)
+        restore_time_ms = metrics.get('restore_time_ms', 0.0)
+        checkpoint_size_mb = metrics.get('checkpoint_size_mb', 0.0)
+        overhead_percent = metrics.get('overhead_percent', 0.0)
+
+        # Parse result
+        result = None
+        if result_type == RESULT_TYPE_TENSOR and offset < len(data):
+            shape_len = struct.unpack('>I', data[offset:offset+4])[0]
+            offset += 4
+            shape_json = data[offset:offset+shape_len].decode('utf-8')
+            shape = tuple(json.loads(shape_json))
+            offset += shape_len
+
+            dtype_len = struct.unpack('>I', data[offset:offset+4])[0]
+            offset += 4
+            dtype_str = data[offset:offset+dtype_len].decode('utf-8')
+            offset += dtype_len
+
+            data_len = struct.unpack('>Q', data[offset:offset+8])[0]
+            offset += 8
+            tensor_bytes = data[offset:offset+data_len]
+
+            result = ModelExecutionSerializer._deserialize_tensor(tensor_bytes, shape, dtype_str)
+
+        return result, checkpoint_time_ms, restore_time_ms, checkpoint_size_mb, overhead_percent, metrics, status, message

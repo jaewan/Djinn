@@ -146,14 +146,19 @@ class DjinnServer:
             return
 
         try:
+            # Phase 3: Add LIFO parameters from config
+            use_lifo = getattr(qos_cfg, 'use_lifo_on_overload', True)
+            
             self.qos_scheduler = BasicQosScheduler(
                 max_concurrency=max(1, qos_cfg.qos_max_concurrency),
                 class_shares=qos_cfg.qos_class_shares,
                 escalation_delay_ms=qos_cfg.qos_escalation_delay_ms,
+                use_lifo_on_overload=use_lifo,
             )
             logger.info(
-                "QoS scheduler enabled (max_concurrency=%d)",
+                "QoS scheduler enabled (max_concurrency=%d, lifo_on_overload=%s)",
                 qos_cfg.qos_max_concurrency,
+                use_lifo,
             )
         except Exception as qos_error:
             logger.error(f"Failed to initialize QoS scheduler: {qos_error}")
@@ -889,27 +894,60 @@ class DjinnServer:
                 
                 logger.info(f"Deserializing request (msg_type=0x{msg_type:02x})...")
                 try:
-                    # ✅ FIRST: Try binary protocol detection (v2.3 execute_model)
+                    # ✅ FIRST: Try binary protocol detection (v2.3 execute_model / breakpoint)
                     # Check if this looks like binary protocol (starts with version byte)
                     if len(request_bytes) >= 1 and request_bytes[0] == 0x02:  # Protocol version
                         logger.info("🔍 Detected binary protocol message (v2.3)")
                         try:
                             from djinn.core.model_execution_serializer import ModelExecutionSerializer
-                            fingerprint, inputs, profile_id, exec_options = ModelExecutionSerializer.deserialize_execute_request(request_bytes)
-                            request = {
-                                'fingerprint': fingerprint,
-                                'inputs': inputs,
-                                'profile_id': profile_id
-                            }
-                            request['_binary_protocol'] = True
-                            self._normalize_qos_metadata(request, exec_options)
-                            self._ensure_request_id(request)
-                            self._attach_stage_metadata(request, exec_options)
-                            logger.info("✅ Binary protocol request deserialized successfully")
+                            
+                            # Try to detect if it's a breakpoint request by checking structure
+                            # Breakpoint requests have specific metadata with breakpoint_layer_index field
+                            is_breakpoint_request = False
+                            try:
+                                # Peek at metadata to detect breakpoint vs regular execute
+                                if len(request_bytes) >= 9:
+                                    metadata_len = int.from_bytes(request_bytes[1:5], 'big')
+                                    if 9 + metadata_len <= len(request_bytes):
+                                        metadata_json = request_bytes[9:9+metadata_len].decode('utf-8', errors='ignore')
+                                        is_breakpoint_request = 'breakpoint_layer_index' in metadata_json
+                            except:
+                                pass  # If peek fails, try normal deserialization
+                            
+                            if is_breakpoint_request:
+                                logger.info("🔍 Detected breakpoint request (binary protocol)")
+                                fingerprint, inputs, breakpoint_layer_index, wait_for_resume, session_id, profile_id, exec_options = ModelExecutionSerializer.deserialize_execute_with_breakpoint_request(request_bytes)
+                                request = {
+                                    'fingerprint': fingerprint,
+                                    'inputs': inputs,
+                                    'breakpoint_layer_index': breakpoint_layer_index,
+                                    'wait_for_resume': wait_for_resume,
+                                    'session_id': session_id,
+                                    'profile_id': profile_id,
+                                    '_message_type': MessageType.EXECUTE_WITH_BREAKPOINT,
+                                }
+                                request['_binary_protocol'] = True
+                                self._normalize_qos_metadata(request, exec_options)
+                                self._ensure_request_id(request)
+                                logger.info("✅ Breakpoint binary protocol request deserialized successfully")
+                            else:
+                                logger.info("🔍 Detected regular execute request (binary protocol)")
+                                fingerprint, inputs, profile_id, exec_options = ModelExecutionSerializer.deserialize_execute_request(request_bytes)
+                                request = {
+                                    'fingerprint': fingerprint,
+                                    'inputs': inputs,
+                                    'profile_id': profile_id
+                                }
+                                request['_binary_protocol'] = True
+                                self._normalize_qos_metadata(request, exec_options)
+                                self._ensure_request_id(request)
+                                self._attach_stage_metadata(request, exec_options)
+                                logger.info("✅ Binary protocol request deserialized successfully")
+                            
                             # Store request for keep-alive decision
                             self._last_request = request
                         except Exception as binary_error:
-                            logger.error(f"Binary protocol deserialization failed: {binary_error}")
+                            logger.error(f"Binary protocol deserialization failed: {binary_error}", exc_info=True)
                             raise binary_error
                     else:
                         # ✅ SECOND: Try secure JSON protocol (v2.0+)
@@ -1085,6 +1123,8 @@ class DjinnServer:
                         response = await self._handle_register_model(request)
                 elif msg_type == MessageType.EXECUTE_MODEL:
                     response = await self._handle_execute_model(request)
+                elif msg_type == MessageType.EXECUTE_WITH_BREAKPOINT:
+                    response = await self._handle_execute_with_breakpoint(request)
                 elif msg_type == MessageType.EXECUTE_STAGE:
                     response = await self._handle_execute_stage(request)
                 elif msg_type == MessageType.INIT_MODEL:
@@ -1141,7 +1181,7 @@ class DjinnServer:
             
             # Send response (message type + length + serialized data)
             try:
-                # Use binary protocol for EXECUTE_MODEL responses (2-3x faster)
+                # Use binary protocol for EXECUTE_MODEL and EXECUTE_WITH_BREAKPOINT responses (2-3x faster)
                 if msg_type == MessageType.EXECUTE_MODEL:
                     from djinn.core.model_execution_serializer import ModelExecutionSerializer
                     # Extract result, metrics, status from response dict
@@ -1154,7 +1194,17 @@ class DjinnServer:
                         status=status,
                         message=response.get('message')
                     )
-                    logger.info("✅ Response serialized using binary protocol")
+                    logger.info("✅ Response serialized using binary protocol (EXECUTE_MODEL)")
+                elif msg_type == MessageType.EXECUTE_WITH_BREAKPOINT:
+                    # Use pre-serialized binary response from handler
+                    if '_serialized_response' in response:
+                        response_bytes = response['_serialized_response']
+                        logger.info("✅ Response using pre-serialized binary protocol (EXECUTE_WITH_BREAKPOINT)")
+                    else:
+                        # Fallback: error response using JSON
+                        from djinn.core.secure_serializer import SecureSerializer
+                        response_bytes = SecureSerializer.serialize_response(response)
+                        logger.warning("⚠️  Using JSON fallback for EXECUTE_WITH_BREAKPOINT error response")
                 else:
                     # Use secure JSON protocol for other message types
                     from djinn.core.secure_serializer import SecureSerializer
@@ -2069,6 +2119,16 @@ class DjinnServer:
             priority = request.get('_priority')
             session_id_from_client = request.get('_session_id')  # Client-provided session ID for decode persistence
             
+            # Phase 3: Track activity for semantic idle detection
+            try:
+                from .semantic_idle_detector import get_activity_tracker
+                activity_tracker = get_activity_tracker()
+                if session_id_from_client:
+                    activity_tracker.register_session(session_id_from_client)
+                    activity_tracker.record_operation(session_id_from_client)
+            except Exception as e:
+                logger.debug(f"Activity tracking error: {e}")
+            
             if execution_phase or priority is not None:
                 logger.info(
                     f"🚀 Executing model {fingerprint[:8]} via HybridExecutor (v2.3) "
@@ -2318,6 +2378,94 @@ class DjinnServer:
             logger.info(f"✅ Result stored for task {task_id}")
             # Schedule cleanup after 60s
             asyncio.create_task(self._cleanup_task(task_id))
+
+    async def _handle_execute_with_breakpoint(self, request: Dict) -> Dict:
+        """Handle breakpoint execution request - uses BreakpointExecutor."""
+        try:
+            from .breakpoint_executor import get_breakpoint_executor
+            from .model_cache_v23 import get_model_cache_v23
+            from .session_manager import get_session_manager
+            from djinn.core.model_execution_serializer import ModelExecutionSerializer
+            
+            # Extract breakpoint-specific fields from request
+            fingerprint = request.get('fingerprint')
+            if not fingerprint:
+                return {'status': 'error', 'message': 'fingerprint required'}
+            
+            breakpoint_layer_index = request.get('breakpoint_layer_index', 0)
+            wait_for_resume = request.get('wait_for_resume', True)
+            inputs = request.get('inputs', {})
+            session_id_provided = request.get('session_id')
+            
+            # Create/reuse session
+            session_mgr = get_session_manager()
+            if session_id_provided:
+                session_id = session_id_provided
+                if session_id not in session_mgr.sessions:
+                    session_id = session_mgr.create_session(session_id=session_id)
+            else:
+                session_id = session_mgr.create_session()
+            
+            # Get model from cache
+            model_cache = get_model_cache_v23()
+            model = model_cache.get_model(fingerprint)
+            if model is None:
+                return {
+                    'status': 'error',
+                    'message': f'Model {fingerprint} not found in cache. Register it first.'
+                }
+            
+            # Get breakpoint executor
+            executor = get_breakpoint_executor()
+            
+            logger.info(
+                f"[{session_id}] Executing model with breakpoint at layer {breakpoint_layer_index}..."
+            )
+            
+            # Execute with breakpoint
+            model_output, metrics = executor.execute_with_breakpoint(
+                session_id=session_id,
+                model=model,
+                inputs=inputs,
+                breakpoint_layer_index=breakpoint_layer_index,
+                wait_for_resume=wait_for_resume,
+            )
+            
+            # Serialize response using breakpoint-specific serializer
+            checkpoint_time_ms = metrics.get('checkpoint_time_ms', 0.0)
+            restore_time_ms = metrics.get('restore_time_ms', 0.0)
+            checkpoint_size_mb = metrics.get('checkpoint_size_mb', 0.0)
+            overhead_percent = metrics.get('overhead_percent', 0.0)
+            
+            response_data = ModelExecutionSerializer.serialize_execute_with_breakpoint_response(
+                result=model_output,
+                checkpoint_time_ms=checkpoint_time_ms,
+                restore_time_ms=restore_time_ms,
+                checkpoint_size_mb=checkpoint_size_mb,
+                overhead_percent=overhead_percent,
+                metrics=metrics,
+                status='success',
+            )
+            
+            logger.info(
+                f"✅ Breakpoint execution complete for {session_id}:\n"
+                f"   Checkpoint: {checkpoint_time_ms:.1f}ms\n"
+                f"   Restore: {restore_time_ms:.1f}ms\n"
+                f"   Overhead: {overhead_percent:.1f}%"
+            )
+            
+            # Return serialized response (will be sent as binary by dispatcher)
+            return {
+                'status': 'success',
+                '_serialized_response': response_data,
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ Breakpoint execution failed: {e}", exc_info=True)
+            return {
+                'status': 'error',
+                'message': str(e)
+            }
 
     async def _handle_execute_stage(self, request: Dict) -> Dict:
         """Execute a semantic stage (encoder/decoder) request."""

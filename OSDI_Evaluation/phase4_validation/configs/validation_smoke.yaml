@@ -1,0 +1,47 @@
+experiment:
+  name: "phase4_validation_smoke"
+  description: "Quick validation of Phase 4 metrics (7B model, 5 samples each)"
+  version: "1.0"
+
+# Test 1: Logit Equivalence
+logit_equivalence:
+  enabled: true
+  model_id: "meta-llama/Llama-2-7b-hf"
+  dtype: "float16"
+  num_samples: 5
+  tolerance_norm: 0.1
+  tolerance_max_diff: 0.1
+  pass_if_predictions_match: true  # If predictions match, pass even if logits differ slightly
+
+# Test 2: PCIe Flatline (commented out - requires 70B)
+pcie_flatline:
+  enabled: false  # Set to true only if 70B model available
+  model_id: "meta-llama/Llama-2-70b-hf"
+  dtype: "float16"
+  ring_buffer_gb: 48
+  sample_duration_seconds: 10
+  min_sustained_bandwidth_mb_per_s: 20000
+  sustained_ratio: 0.8  # 80% of samples should be > threshold
+
+# Test 3: Agent Sleep/Resume
+agent_sleep_resume:
+  enabled: true
+  model_id: "meta-llama/Llama-2-7b-hf"
+  dtype: "float16"
+  idle_threshold_seconds: 1.0
+  sleep_duration_seconds: 30.0
+  host_swap_pool_gb: 16.0
+  max_retries: 3
+
+# Server configuration
+server:
+  host: "localhost"
+  port: 5556
+  timeout_seconds: 120  # Increased timeout for sleep test
+
+# Logging
+logging:
+  level: "INFO"
+  save_results: true
+  results_dir: "OSDI_Evaluation/phase4_validation/results"
+

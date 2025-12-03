@@ -14,7 +14,7 @@ import time
 import json
 import os
 from dataclasses import dataclass
-from typing import Optional, Dict, Callable, Any, List
+from typing import Optional, Dict, Callable, Any, List, Tuple
 import asyncio
 import uuid
 import torch
@@ -1870,6 +1870,106 @@ class DjinnCoordinator:
                 
         except Exception as e:
             logger.error(f"RPC execution failed: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            raise
+
+    async def execute_remote_model_with_breakpoint(
+        self,
+        fingerprint: str,
+        inputs: Dict[str, torch.Tensor],
+        breakpoint_layer_index: int,
+        wait_for_resume: bool = True,
+        session_id: Optional[str] = None,
+        profile_id: Optional[str] = None,
+        qos_class: Optional[str] = None,
+        deadline_ms: Optional[int] = None,
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
+        """
+        Execute registered model on remote server with breakpoint pause/resume.
+        
+        Args:
+            fingerprint: Model fingerprint
+            inputs: Input tensors
+            breakpoint_layer_index: Layer to pause at
+            wait_for_resume: Whether to wait for resume signal
+            session_id: Optional session ID for persistence
+            profile_id: Optional profile ID for tracing
+            qos_class: Optional QoS hint
+            deadline_ms: Optional latency target
+            
+        Returns:
+            (model_output, metrics_dict) where output is None if wait_for_resume=False
+        """
+        logger.info(
+            f"Executing model {fingerprint[:8]} on remote server with breakpoint at layer {breakpoint_layer_index}..."
+        )
+        
+        from ..server.transport.protocol import MessageType
+        from .model_execution_serializer import ModelExecutionSerializer
+        
+        # Get server address
+        server_address = self.config.server_address or 'localhost:5556'
+        
+        try:
+            # Serialize request
+            serialized = ModelExecutionSerializer.serialize_execute_with_breakpoint_request(
+                fingerprint=fingerprint,
+                inputs=inputs,
+                breakpoint_layer_index=breakpoint_layer_index,
+                wait_for_resume=wait_for_resume,
+                session_id=session_id,
+                profile_id=profile_id,
+                qos_class=qos_class,
+                deadline_ms=deadline_ms,
+            )
+
+            # Send with EXECUTE_WITH_BREAKPOINT message type
+            logger.debug(f"Sending EXECUTE_WITH_BREAKPOINT request to {server_address}")
+            response_msg_type, response_data = await self._send_tcp_request(
+                server_address,
+                MessageType.EXECUTE_WITH_BREAKPOINT,
+                serialized
+            )
+            
+            if response_msg_type == MessageType.ERROR:
+                from ..core.secure_serializer import SecureSerializer
+                error_response = SecureSerializer.deserialize_response(response_data)
+                raise RuntimeError(error_response.get('message', 'Unknown error'))
+            
+            # Deserialize response using binary protocol
+            try:
+                result, checkpoint_time_ms, restore_time_ms, checkpoint_size_mb, overhead_percent, metrics, status, error_message = ModelExecutionSerializer.deserialize_execute_with_breakpoint_response(response_data)
+            except Exception:
+                logger.error(f"⚠️  Failed to parse EXECUTE_WITH_BREAKPOINT response ({len(response_data)} bytes)")
+                logger.error(f"Response head: {response_data[:32].hex()}")
+                raise
+
+            if status == 'success':
+                # Build comprehensive metrics dict
+                metrics_dict = {
+                    'checkpoint_time_ms': checkpoint_time_ms,
+                    'restore_time_ms': restore_time_ms,
+                    'checkpoint_size_mb': checkpoint_size_mb,
+                    'overhead_percent': overhead_percent,
+                    'breakpoint_layer': breakpoint_layer_index,
+                    'wait_for_resume': wait_for_resume,
+                }
+                metrics_dict.update(metrics)
+                
+                logger.info(
+                    f"✅ Breakpoint execution successful:\n"
+                    f"   Checkpoint: {checkpoint_time_ms:.1f}ms\n"
+                    f"   Restore: {restore_time_ms:.1f}ms\n"
+                    f"   Overhead: {overhead_percent:.1f}%"
+                )
+                return result, metrics_dict
+            else:
+                message = error_message or 'Unknown error'
+                raise RuntimeError(f"Remote breakpoint execution failed with status: {status} ({message})")
+                
+        except Exception as e:
+            logger.error(f"RPC breakpoint execution failed: {e}")
             import traceback
             logger.debug(traceback.format_exc())
             raise

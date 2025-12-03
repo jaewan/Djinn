@@ -1,0 +1,40 @@
+experiment:
+  name: "semantic_scheduler_agent_scaling_no_swap"
+  description: "Ablation: Disable semantic scheduler to show swap is necessary"
+  version: "1.0"
+
+workload:
+  model_id: "meta-llama/Llama-2-7b-hf"
+  dtype: "float16"
+  agent_counts: [1, 2, 4, 8]
+  new_tokens: 50
+  sleep_seconds: 10.0
+  iterations: 1
+
+semantic_scheduler:
+  enabled: false  # DISABLED for ablation
+  idle_threshold_seconds: 1.0
+  host_swap_pool_gb: 0.0
+  lifo_on_overload: false
+
+server_config:
+  enable_semantic_scheduler: false
+  idle_threshold_seconds: 1.0
+  host_swap_pool_gb: 0.0
+  max_concurrent: 32
+
+expected_results:
+  agents_1:
+    p99_latency_ms: 120
+    success: true
+  agents_2:
+    p99_latency_ms: 130
+    success: true
+  agents_4:
+    p99_latency_ms: 140
+    success: true
+  agents_8:
+    p99_latency_ms: 0
+    success: false
+    note: "Expected OOM without semantic scheduler"
+
