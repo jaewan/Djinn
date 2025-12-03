@@ -1,8 +1,8 @@
 
 # Djinn: The Semantic Tensor Operating System
 
-**Status**: Production Ready (v2.3.15)  
-**Last Updated**: November 21, 2025
+**Status**: Production Ready (v2.3.16)  
+**Last Updated**: December 3, 2025
 **Target Audience**: Systems Researchers, ML Infrastructure Engineers, Platform Architects
 
 ---
@@ -119,7 +119,7 @@ Standard allocators (like `cudaMalloc`) fragment memory when handling concurrent
 
 | Memory Segment | OS Analogy | Lifecycle | Implementation |
 | :--- | :--- | :--- | :--- |
-| **Text Segment** | Shared Libs | **Read-Only** | **Model Weights.** Loaded once. Mapped into the virtual address space of every user running that model. Zero duplication. |
+| **Text Segment** | Shared Libs | **Read-Only** | **Model Weights.** Loaded once. Mapped into the virtual address space of every user running that model. Zero duplication. For models exceeding VRAM, uses **Ring Buffer** mode (see §5.4). |
 | **Data Segment** | Heap | **Private** | **KV-Cache & Outputs.** Owned by a specific Session ID. Persists between requests to support stateful inference (e.g., Notebooks). Security is logically enforced by Session ID checks. |
 | **Stack Slab** | Stack | **Volatile** | **Activations.** A massive, **256-byte aligned** scratchpad for intermediate compute. |
 
@@ -140,6 +140,36 @@ Djinn employs a hybrid concurrency model:
 *   **Time-Sharing (Compute):** The **Stack Slab** is a shared resource. Multiple users time-share the Slab for execution.
     *   **Text Segment:** Read-only, accessed concurrently by multiple CUDA streams.
     *   **Stack Slab:** Protected by stream synchronization. One user executes at a time per GPU stream, preventing data corruption.
+
+### 5.4 Skip-End Ring Buffer (Oversized Model Support)
+
+For models exceeding available VRAM (e.g., 140GB LLaMA-3 on a 48GB GPU), the Text Segment can be configured as a **circular ring buffer** that streams weights layer-by-layer during inference.
+
+**Implementation:** `djinn/backend/runtime/ring_buffer.py`
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Ring Buffer (48GB)                                          │
+├─────────────────────────────────────────────────────────────┤
+│ [Layer 0] [Layer 1] ... [Layer N-3] [SKIP] [Layer 0] ...   │
+│                                        ↑                    │
+│              If next layer won't fit, skip to start         │
+│              (never splits tensors across buffer wrap)      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Key Features:**
+*   **Skip-End Allocation:** Pre-computes layer offsets at model registration. If a layer won't fit before the buffer end, skips to the start—tensors are never split across the wrap boundary.
+*   **Async Dual-Stream Pipelining:** High-priority prefetch stream transfers weights while compute stream executes the previous layer. Zero CPU blocking via GPU events.
+*   **PyTorch Hook Integration:** `register_forward_pre_hook` transparently redirects `module.weight.data` to the ring buffer view before each layer's forward pass.
+
+**Configuration:**
+```bash
+export GENIE_VMU_USE_RING_BUFFER=1
+export GENIE_VMU_RING_BUFFER_CAPACITY_GB=48
+```
+
+*Result:* Running a 140GB model on 48GB VRAM with ~11 GB/s sustained H2D bandwidth, achieving inference latency within 2× of a fully-resident model.
 
 ---
 

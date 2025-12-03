@@ -45,10 +45,44 @@ class ResilientModelHandler:
     """
     
     def __init__(self, gpu_id: int = 0):
-        from .memory_aware_model_cache import MemoryAwareModelCache
+        from .ring_buffer_model_cache import RingBufferModelCache, RingBufferConfig
         from .model_security import ModelSecurityValidator
+        from ..config import get_config
         
-        self.model_cache = MemoryAwareModelCache(device=f'cuda:{gpu_id}')
+        # Check if ring buffer is enabled in config
+        try:
+            config = get_config()
+            vmu_config = config.vmu if hasattr(config, 'vmu') else None
+            
+            use_ring_buffer = (
+                vmu_config and 
+                hasattr(vmu_config, 'use_ring_buffer_text_segment') and 
+                vmu_config.use_ring_buffer_text_segment
+            )
+            
+            if use_ring_buffer:
+                # Use ring buffer model cache
+                ring_buffer_config = RingBufferConfig(
+                    enabled=True,
+                    capacity_gb=getattr(vmu_config, 'ring_buffer_capacity_gb', 48.0),
+                    prefetch_workers=getattr(vmu_config, 'ring_buffer_prefetch_workers', 1)
+                )
+                self.model_cache = RingBufferModelCache(
+                    device=f'cuda:{gpu_id}',
+                    max_vram_gb=80.0,  # Adjust based on GPU type
+                    ring_buffer_config=ring_buffer_config
+                )
+                logger.info("✅ Using RingBufferModelCache (oversized models will stream)")
+            else:
+                # Use standard cache
+                from .memory_aware_model_cache import MemoryAwareModelCache
+                self.model_cache = MemoryAwareModelCache(device=f'cuda:{gpu_id}')
+                logger.info("Using standard MemoryAwareModelCache")
+        except Exception as e:
+            logger.warning(f"Failed to initialize ring buffer config, using standard cache: {e}")
+            from .memory_aware_model_cache import MemoryAwareModelCache
+            self.model_cache = MemoryAwareModelCache(device=f'cuda:{gpu_id}')
+        
         self.security_validator = ModelSecurityValidator()
         
         # Fallback to graph execution

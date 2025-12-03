@@ -56,6 +56,7 @@ import threading
 import socket
 from typing import Tuple, Dict, List, Optional
 from dataclasses import dataclass
+
 @dataclass
 class VMUMetrics:
     """Aggregated memory statistics for VMU segments."""
@@ -598,9 +599,14 @@ class UnifiedVMU:
         logger.info(f"  Text Segment:  {text_capacity / 1024**3:.1f} GB ({text_ratio:.0%})")
         logger.info(f"  Data Segment:  {data_capacity / 1024**3:.1f} GB ({data_ratio:.0%})")
         logger.info(f"  Stack Segment: {stack_capacity / 1024**3:.1f} GB ({stack_ratio:.0%})")
+        
+        # Store config for later use
+        self.config = config
 
         # Initialize segments
         try:
+            # Note: Ring buffer is handled via RingBufferModelCache in server-side caching
+            # VMU always uses standard TextSegment; ring buffer wraps it at model cache level
             self.text_segment = TextSegment(text_capacity, self.device)
             self.data_segment = DataSegment(data_capacity, self.device)
             self.stack_segment = StackSegment(stack_capacity, self.device)

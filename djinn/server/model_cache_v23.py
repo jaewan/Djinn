@@ -56,7 +56,38 @@ class ModelCacheV23:
             # Extract state dict for Text Segment loading
             state_dict = model.state_dict()
 
-            # Load weights into Text Segment (shared, read-only)
+            # Check if we should use ring buffer (oversized models)
+            # Estimate model size
+            total_weight_bytes = sum(
+                w.numel() * w.element_size() 
+                for w in state_dict.values()
+                if isinstance(w, torch.Tensor)
+            )
+            total_weight_gb = total_weight_bytes / (1024 ** 3)
+            
+            # Get available GPU memory
+            if torch.cuda.is_available():
+                free_memory_bytes, total_memory_bytes = torch.cuda.mem_get_info(self.vmu.device)
+                available_vram_gb = free_memory_bytes / (1024 ** 3)
+            else:
+                available_vram_gb = 80.0  # Assume 80GB if can't query
+            
+            # Determine if ring buffer should be used (model > 80% of available VRAM)
+            should_use_ring_buffer = total_weight_gb > (available_vram_gb * 0.8)
+            
+            if should_use_ring_buffer:
+                logger.info(
+                    f"Model {model_id} is {total_weight_gb:.1f}GB (>{available_vram_gb * 0.8:.1f}GB threshold). "
+                    f"Using ring buffer for streaming."
+                )
+                # Ring buffer will be handled by RingBufferModelCache wrapper in ResilientModelHandler
+                # Just store the model as-is (hooks will be installed by the wrapper)
+                model.eval()
+                self.models[fingerprint] = model
+                logger.info(f"✅ Model {fingerprint[:8]} registered for ring buffer streaming")
+                return
+
+            # Standard path: Load weights into Text Segment (shared, read-only)
             success = self.vmu.load_model_to_text(model_id, state_dict)
             if success:
                 logger.info(f"✅ Model {model_id} weights loaded into Text Segment")

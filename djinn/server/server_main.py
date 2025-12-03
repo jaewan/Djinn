@@ -31,6 +31,15 @@ async def main():
                         help='Max concurrent requests (default: 64 for high-concurrency experiments)')
     parser.add_argument('--max-vram-gb', type=float, default=80.0,
                         help='Max VRAM per tenant in GB (default: 80 for A100-80GB)')
+    
+    # Ring buffer flags
+    parser.add_argument('--ring-buffer', action='store_true', 
+                        help='Enable ring buffer mode for oversized models')
+    parser.add_argument('--ring-buffer-gb', type=float, default=48.0,
+                        help='Ring buffer capacity in GB (default: 48)')
+    parser.add_argument('--ring-buffer-workers', type=int, default=1,
+                        help='Number of prefetch workers (default: 1)')
+    
     args = parser.parse_args()
     configure_logging(args.log_level)
     
@@ -41,12 +50,26 @@ async def main():
     logger.info(f"   Max concurrent requests: {args.max_concurrent}")
     logger.info(f"   Max VRAM per tenant: {args.max_vram_gb} GB")
     
+    # Ring buffer configuration
+    if args.ring_buffer:
+        logger.info(f"   Ring Buffer: ENABLED")
+        logger.info(f"   Ring Buffer capacity: {args.ring_buffer_gb} GB")
+        logger.info(f"   Ring Buffer workers: {args.ring_buffer_workers}")
+    else:
+        logger.info(f"   Ring Buffer: DISABLED")
+    
     # Initialize server components
     from .server import DjinnServer, ServerConfig
     import os
     
     # Set environment variables to control server configuration
     os.environ['GENIE_QOS_MAX_CONCURRENCY'] = str(args.max_concurrent)
+    
+    # Set ring buffer environment variables
+    if args.ring_buffer:
+        os.environ['GENIE_VMU_RING_BUFFER'] = '1'
+        os.environ['GENIE_VMU_RING_BUFFER_GB'] = str(args.ring_buffer_gb)
+        os.environ['GENIE_VMU_RING_BUFFER_WORKERS'] = str(args.ring_buffer_workers)
     
     config = ServerConfig(
         node_id='djinn-server',

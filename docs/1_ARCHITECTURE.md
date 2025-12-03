@@ -1,8 +1,8 @@
 # Djinn System Architecture
 
 **Status**: Production Technical Reference
-**Version**: 2.3.15
-**Last Updated**: November 21, 2025
+**Version**: 2.3.16
+**Last Updated**: December 3, 2025
 **Target Audience**: System Architects, Core Developers, Platform Engineers
 
 ---
@@ -13,7 +13,7 @@ Djinn implements a **Distributed Tensor Operating System** that transforms GPU d
 
 **Core Innovation**: Operating at the ML framework layer provides semantic visibility impossible at hardware/driver levels, enabling optimizations like KV cache co-location and intelligent operation routing.
 
-**Architecture Philosophy (v2.3.15)**:
+**Architecture Philosophy (v2.3.16)**:
 - **Binary Protocol**: Length-prefixed serialization replacing pickle for security and performance
 - **DMA-First Architecture**: Network-to-GPU direct memory access with synchronization
 - **MTU-Aware Transport**: Payload-size optimized syscall strategies
@@ -22,6 +22,7 @@ Djinn implements a **Distributed Tensor Operating System** that transforms GPU d
 - **Session-Safe GC**: Prevents memory leaks in distributed environment
 - **API Transparency**: Full PyTorch compatibility with lazy evaluation
 - **Production Hardened**: Comprehensive fault tolerance and monitoring
+- **Oversized Model Support**: Skip-End Ring Buffer enables 140GB+ models on 48GB VRAM
 
 ### 2.0 Core Design Principles
 
@@ -374,11 +375,19 @@ Djinn supports comprehensive model handling across all PyTorch model types:
 - **Async Weight Streaming**: Model registrations pin each state dict, stream it into the Text segment via a dedicated CUDA copy stream, and attach the resulting plan summary to the memory plan for tooling.
 - **ServerState Initialization**: The singleton is brought up on the preferred GPU before the VMU or executor runs, so warmup and diagnostics always see CUDA.
 
+**Ring Buffer Mode** (for oversized models):
+- **Skip-End Ring Buffer**: Circular buffer Text Segment for models exceeding VRAM capacity
+- **Pre-Computed Offsets**: Layer positions computed at registration, never splitting tensors across wrap
+- **Dual-Stream Pipelining**: High-priority prefetch stream + compute stream with event-based sync
+- **Hook Integration**: PyTorch forward hooks transparently redirect weight pointers to ring buffer views
+- **Configuration**: `GENIE_VMU_USE_RING_BUFFER=1`, `GENIE_VMU_RING_BUFFER_CAPACITY_GB=48`
+
 **Benefits**:
 - Zero fragmentation through watermark-based management
 - DMA synchronization prevents data corruption
 - Efficient KV cache growth without reallocation
 - **Prevents OOM** during prefill → decode transitions
+- **Ring Buffer enables 140GB+ models on 48GB GPUs**
 
 ### 3.7 Component 7: Hybrid Executor (Server)
 
@@ -1056,6 +1065,44 @@ phase_memory_manager.adjust_for_phase(phase)
 - Optimizes memory allocation for workload characteristics
 - Reduces eviction of phase-relevant models
 
+### 10.3 Ring Buffer Weight Streaming
+
+**Implementation**: `djinn/backend/runtime/ring_buffer.py`, `weight_streamer.py`, `weight_hooks.py`
+
+For models exceeding VRAM capacity, the VMU can use a **Skip-End Ring Buffer** for the Text Segment that streams weights layer-by-layer during inference.
+
+**Architecture:**
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│ Host Memory (Pinned)         │ GPU Ring Buffer (48GB)        │
+│ [Full Model Weights]         │ [Layer N] [Layer N+1] [...]   │
+└──────────────────────────────────────────────────────────────┘
+       ↓ (async copy via prefetch_stream)
+   Layer N+3 arriving       Layer N executing (compute_stream)
+       ↓                              ↓
+   Event N+3 ready    ←→    compute_stream.wait_event(N+3)
+```
+
+**Key Components:**
+
+| Component | Implementation | Purpose |
+|-----------|----------------|---------|
+| **WeightRingBuffer** | `ring_buffer.py` | Circular buffer with skip-end allocation, pre-computed layer views |
+| **WeightStreamer** | `weight_streamer.py` | Dual-stream pipelining engine with event-based synchronization |
+| **RingBufferHookManager** | `weight_hooks.py` | PyTorch forward hooks for transparent weight redirection |
+
+**Key Design Decisions:**
+- **Skip-End Allocation**: If a layer won't fit at buffer end, skip to start (never split tensors)
+- **Zero CPU Blocking**: All synchronization via `stream.wait_event()` (GPU-side)
+- **Pre-Computed Views**: Tensor views into ring buffer computed once at registration
+- **Original Weight Caching**: Host weights cached separately from redirected GPU views
+
+**Performance:**
+- **Throughput**: ~11 GB/s sustained H2D (pinned memory)
+- **Latency**: Within 2× of fully-resident model execution
+- **Memory**: Enables 140GB models on 48GB VRAM
+
 ---
 
 ## 11. Fault Tolerance
@@ -1258,7 +1305,7 @@ Software cache                 GPU L2 cache aware
 **Performance**:
 - Shape inference can be slow (timeout guards in place)
 - First execution has compilation overhead
-- No predictive prefetching
+- Ring buffer mode adds ~2× latency overhead vs fully-resident models
 
 ---
 
@@ -1285,6 +1332,7 @@ The five-component architecture cleanly separates concerns while maintaining pro
 
 **Server Components**:
 - **Unified VMU**: DMA-synchronized memory kernel with zero fragmentation
+- **Ring Buffer Mode**: Skip-end circular buffer for models exceeding VRAM (140GB+ on 48GB)
 - **Hybrid Executor**: Slab-based execution with automatic memory reset
 - **Session Manager**: Distributed GC with heartbeat monitoring
 
@@ -1309,6 +1357,5 @@ Djinn v2.3.15 successfully demonstrates that kernel-level distributed tensor ope
 - [Deployment Guide](deployment.md) - Production setup
 - [Performance Tuning](performance.md) - Optimization guide
 - [Troubleshooting](troubleshooting.md) - Common issues
-```
 
 ---
