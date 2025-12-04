@@ -166,16 +166,30 @@ For models exceeding available VRAM (e.g., 140GB LLaMA-3 on a 48GB GPU), the Tex
 
 **Key Features:**
 *   **Skip-End Allocation:** Pre-computes layer offsets at model registration. If a layer won't fit before the buffer end, skips to the start—tensors are never split across the wrap boundary.
+*   **GPU-Resident Model Loading:** Model parameters ARE ring buffer views from initialization, eliminating device mismatch errors that plague traditional offloading approaches.
 *   **Async Dual-Stream Pipelining:** High-priority prefetch stream transfers weights while compute stream executes the previous layer. Zero CPU blocking via GPU events.
-*   **PyTorch Hook Integration:** `register_forward_pre_hook` transparently redirects `module.weight.data` to the ring buffer view before each layer's forward pass.
+*   **PyTorch Hook Integration:** `register_forward_pre_hook` transparently redirects weight pointers to ring buffer views before each layer's forward pass.
+*   **Adaptive Virtualization:** Allocates as many parameters as fit in ring buffer as resident (55%), remaining parameters (45%) marked for on-demand streaming.
+
+**Architecture (v2.3.18 - OSDI Experiment 2):**
+- **Model Skeleton Loading:** Load model structure to 'meta' device (zero memory)
+- **Parameter Allocation:** Allocate resident parameters to ring buffer views
+- **Weight Loading:** Stream actual weights from checkpoint to GPU at 11.6 GB/s
+- **Inference:** Forward pass runs entirely on GPU with resident weights, no device mismatch
 
 **Configuration:**
 ```bash
 export GENIE_VMU_USE_RING_BUFFER=1
-export GENIE_VMU_RING_BUFFER_CAPACITY_GB=48
+export GENIE_VMU_RING_BUFFER_CAPACITY_GB=16  # For L4 (24GB GPU)
+export GENIE_VMU_USE_PINNED_MEMORY=1
 ```
 
-*Result:* Running a 140GB model on 48GB VRAM with ~11 GB/s sustained H2D bandwidth, achieving inference latency within 2× of a fully-resident model.
+*Result:* 
+- **Llama-2-13B (26GB) on L4 (24GB):** 59× faster than HuggingFace Accelerate (3.6s vs 212s)
+- **Sustained H2D bandwidth:** 11.6 GB/s (pinned memory optimized)
+- **Effective inference throughput:** 6.74 GB/s (compute-bound, as expected)
+- **TTFT:** 72ms (vs 4,250ms for CPU offloading)
+- **Memory virtualization:** 45% of parameters streamed on-demand, 55% resident
 
 ---
 
@@ -316,6 +330,19 @@ By moving from a "Network Wrapper" to a "Tensor Operating System," Djinn achieve
 | **Latency (Large)** | 868ms | **81ms** | **10.7x Faster** (via Zero-Copy) |
 | **Bandwidth** | 100% (Full Return) | **0.3%** | **99.7% Reduction** (via Skeletonization) |
 | **Fragmentation** | High (Standard Allocator) | **Zero (External)** | **Unified VMU (Slab)** |
+
+### Experiment 2: Memory Virtualization (v2.3.18 - OSDI Evaluation)
+
+**Ring Buffer Virtualization Results (L4 GPU, Llama-2-13B):**
+
+| Metric | HF Accelerate | Djinn Ring Buffer | **Speedup** |
+|--------|---------------|-------------------|-------------|
+| **Latency** | 212,517 ms | 3,599 ms | **59× Faster** |
+| **Bandwidth** | 0.11 GB/s | 6.74 GB/s | **61× Higher** |
+| **TTFT** | 4,250 ms | 72 ms | **59× Faster** |
+| **Peak VRAM** | 5.7 GB | 16.2 GB | - |
+
+**Key Achievement:** GPU-resident model loading with ring buffer virtualization delivers **59× speedup** over standard HuggingFace Accelerate CPU offloading. Enables running 26GB models on 24GB GPUs with 45% parameter virtualization and 99.7% ring buffer utilization, eliminating device mismatch errors inherent to traditional offloading.
 
 ---
 

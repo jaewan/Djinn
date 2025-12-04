@@ -18,6 +18,7 @@ import json
 import logging
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 import statistics
@@ -154,6 +155,8 @@ def main():
                        help="Enable TTFT measurement using generate()")
     parser.add_argument("--generation-length", type=int, default=50,
                        help="Tokens to generate for TTFT measurement")
+    parser.add_argument("--timeout", type=int, default=7200,
+                       help="Timeout per baseline in seconds (default: 7200 = 2 hours)")
     
     args = parser.parse_args()
     
@@ -189,7 +192,7 @@ def main():
             cmd.append("--ttft-enabled")
             cmd.extend(["--generation-length", str(args.generation_length)])
         
-        success = run_command(cmd, "HuggingFace Accelerate Baseline")
+        success = run_command(cmd, "HuggingFace Accelerate Baseline", timeout=args.timeout)
         results["hf_accelerate"] = success
     
     # Run DeepSpeed
@@ -206,7 +209,7 @@ def main():
             cmd.append("--ttft-enabled")
             cmd.extend(["--generation-length", str(args.generation_length)])
         
-        success = run_command(cmd, "DeepSpeed Baseline")
+        success = run_command(cmd, "DeepSpeed Baseline", timeout=args.timeout)
         results["deepspeed"] = success
     
     # Run Djinn Ring Buffer
@@ -224,11 +227,12 @@ def main():
                 "--config", str(config_file),
                 "--output", str(output_dir / "djinn_ring_buffer.json"),
                 "--runs", str(args.runs),
+                "--model", args.model,
             ]
             if args.ttft_enabled:
                 cmd.append("--ttft-enabled")
             
-            success = run_command(cmd, "Djinn Ring Buffer Baseline")
+            success = run_command(cmd, "Djinn Ring Buffer Baseline", timeout=args.timeout)
             results["djinn_ring_buffer"] = success
     
     # Generate comparison report
@@ -245,7 +249,7 @@ def main():
         json.dump({
             "model": args.model,
             "comparison": comparison,
-            "timestamp": Path(script_dir).resolve(),
+            "timestamp": time.time(),
         }, f, indent=2)
     
     logger.info(f"\n✅ Comparison report saved to: {report_file}")

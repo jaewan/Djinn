@@ -15,6 +15,7 @@ Usage:
 import argparse
 import asyncio
 import json
+import random
 import sys
 import time
 import uuid
@@ -104,7 +105,14 @@ async def agent_lifecycle(
             })
             
             # PHASE 2: ACT (Simulated Tool Use / Idle Period)
-            await asyncio.sleep(config.get("sleep_seconds", 10.0))
+            # Randomized sleep to prevent "Thundering Herd" synchronization artifacts
+            # Per Evaluation Plan: uniform(8s, 12s)
+            if "sleep_seconds" in config:
+                sleep_time = config["sleep_seconds"]
+            else:
+                # Default: randomized uniform(8s, 12s) as per Evaluation Plan
+                sleep_time = random.uniform(8.0, 12.0)
+            await asyncio.sleep(sleep_time)
             
             # PHASE 3: REFLECT (Decode with KV Reuse)
             start_reflect = time.perf_counter()
