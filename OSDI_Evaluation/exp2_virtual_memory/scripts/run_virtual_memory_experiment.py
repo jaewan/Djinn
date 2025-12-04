@@ -102,9 +102,18 @@ def setup_ring_buffer(model_id: str, config: Dict[str, Any], device: torch.devic
         device=device,
         dtype=dtype
     )
-    
+
     # Store chunk size in ring buffer for potential use in prefetch optimization
     ring_buffer.chunk_size_bytes = chunk_size_mb * 1024 * 1024
+
+    # Embedding Layer Trap Check: Ensure embedding layer doesn't wrap (Llama-70B ~2.1GB)
+    embedding_size_gb = 2.1  # Llama-70B embedding size estimate
+    ring_buffer_gb = rb_config["capacity_gb"]
+    if embedding_size_gb >= ring_buffer_gb:
+        logger.warning(f"⚠️  Embedding layer ({embedding_size_gb}GB) >= ring buffer ({ring_buffer_gb}GB)")
+        logger.warning("   This may cause wrapping issues. Consider increasing ring buffer capacity.")
+    else:
+        logger.info(f"✅ Embedding layer check passed: {embedding_size_gb}GB < {ring_buffer_gb}GB")
     
     # Create weight streamer (pass chunk_size to streamer for future optimization)
     streamer = WeightStreamer(ring_buffer, device=device)
@@ -266,7 +275,7 @@ def run_inference(
     return result
 
 
-def run_experiment(config_path: str, model_id: str, num_runs: int, output_path: str, chunk_size_mb: int = 64, ttft_enabled: bool = False):
+def run_experiment(config_path: str, model_id: str, num_runs: int, output_path: str, chunk_size_mb: int = 64, ttft_enabled: bool = False, disable_kv_swap: bool = True):
     """Run full virtual memory experiment.
     
     Args:
@@ -456,6 +465,8 @@ def main():
                        help="Enable PCIe bandwidth trace via nvidia-smi dmon")
     parser.add_argument("--ttft-enabled", action="store_true",
                        help="Enable TTFT measurement using model.generate()")
+    parser.add_argument("--disable-kv-swap", action="store_true", default=True,
+                       help="Disable KV cache swapping (weights own 100% of PCIe bus)")
     
     args = parser.parse_args()
     
@@ -473,7 +484,7 @@ def main():
             output_path = str(args.output).replace('.json', f'_chunk_{chunk_size_mb}mb.json')
             
             try:
-                result = run_experiment(args.config, args.model, args.runs, output_path, chunk_size_mb=chunk_size_mb, ttft_enabled=args.ttft_enabled)
+                result = run_experiment(args.config, args.model, args.runs, output_path, chunk_size_mb=chunk_size_mb, ttft_enabled=args.ttft_enabled, disable_kv_swap=args.disable_kv_swap)
                 sweep_results[f"chunk_{chunk_size_mb}mb"] = result["summary"]
             except Exception as e:
                 logger.error(f"Failed for chunk size {chunk_size_mb}MB: {e}")
@@ -502,13 +513,13 @@ def main():
                     stderr=subprocess.PIPE
                 )
             try:
-                run_experiment(args.config, args.model, args.runs, args.output, chunk_size_mb=chunk_size_mb, ttft_enabled=args.ttft_enabled)
+                run_experiment(args.config, args.model, args.runs, args.output, chunk_size_mb=chunk_size_mb, ttft_enabled=args.ttft_enabled, disable_kv_swap=args.disable_kv_swap)
             finally:
                 trace_proc.terminate()
                 trace_proc.wait(timeout=5)
                 logger.info(f"PCIe trace saved to: {trace_file}")
         else:
-            run_experiment(args.config, args.model, args.runs, args.output, chunk_size_mb=chunk_size_mb, ttft_enabled=args.ttft_enabled)
+            run_experiment(args.config, args.model, args.runs, args.output, chunk_size_mb=chunk_size_mb, ttft_enabled=args.ttft_enabled, disable_kv_swap=args.disable_kv_swap)
 
 
 if __name__ == "__main__":

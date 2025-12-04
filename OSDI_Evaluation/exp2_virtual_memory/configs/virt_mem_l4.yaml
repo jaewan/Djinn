@@ -2,15 +2,15 @@
 # For Experiment 2: Virtual Memory via Skip-End Ring Buffer
 
 experiment:
-  name: "virtual_memory_ring_buffer_l4"
-  description: "Experiment 2: Ring Buffer virtualization on L4 GPU (24GB)"
+  name: "virtual_memory_ring_buffer_l4_70b"
+  description: "Experiment 2: Ring Buffer virtualization on L4 GPU (24GB) with Llama-70B (140GB)"
   
   # Ring buffer configuration
   ring_buffer:
     enabled: true
-    capacity_gb: 16  # Use 16GB for weights on 24GB L4 (test virtualization with 13B model)
+    capacity_gb: 20  # Use 20GB for weights on 24GB L4 (6x oversubscription for 140GB model)
     prefetch_workers: 1  # Single worker sufficient on L4
-  
+
   # Model configuration
   model:
     # For L4 (24GB VRAM):
@@ -18,7 +18,7 @@ experiment:
     # - 7B models need ring buffer (~14GB FP16)
     # - 13B models need ring buffer (~26GB FP16, larger than VRAM)
     # - 70B models need ring buffer (~140GB FP16, 6x VRAM)
-    model_id: "meta-llama/Llama-2-13b-hf"  # Slightly larger than VRAM to test streaming
+    model_id: "meta-llama/Llama-2-70b-hf"  # 140GB model for 6x oversubscription test
     dtype: "float16"  # FP16 for bandwidth savings
     device: "cuda:0"
   
@@ -52,7 +52,7 @@ baselines:
     offload_folder: "/tmp/hf_offload"
   
   deepspeed:
-    enabled: false  # Optional: DeepSpeed baseline if installed
+    enabled: true  # DeepSpeed baseline for "speed of light" reference
     config: "ds_config.json"
   
   ring_buffer_no_prefetch:
