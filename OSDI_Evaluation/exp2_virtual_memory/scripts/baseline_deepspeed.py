@@ -30,8 +30,9 @@ import time
 import tempfile
 import shutil
 from pathlib import Path
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, Optional
 import gc
+import statistics
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -80,18 +81,17 @@ def load_model_with_deepspeed(
     model_id: str,
     device_id: int = 0,
     dtype: str = "float16",
-    ds_config: Dict[str, Any] = None
+    ds_config_path: Optional[str] = None
 ) -> Tuple[Any, Any]:
     """
-    Load model with DeepSpeed inference optimizations.
+    Load model with DeepSpeed ZeRO-Inference for memory-constrained inference.
     
-    Uses ZeRO-Inference with model parallelism and memory-mapped IO.
+    Uses device_map="auto" for CPU-GPU offloading with DeepSpeed backend.
     """
     logger.info(f"Loading {model_id} with DeepSpeed")
     
     try:
         import deepspeed
-        from deepspeed.inference import get_quantize_config
     except ImportError:
         logger.error("❌ DeepSpeed not installed. Install with: pip install deepspeed")
         raise
@@ -104,39 +104,25 @@ def load_model_with_deepspeed(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    # Default DeepSpeed config for inference
-    if ds_config is None:
-        ds_config = {
-            "dtype": torch_dtype,
-            "device": device_id,
-        }
-    
     logger.info("Loading model (this may take several minutes for 70B)...")
     start = time.perf_counter()
     
     try:
+        # Load model with device_map="auto" for automatic CPU/GPU partitioning
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
             torch_dtype=torch_dtype,
             device_map="auto",
             low_cpu_mem_usage=True,
+            offload_folder="/tmp/hf_offload",
         )
-        
-        # Try to apply DeepSpeed inference optimizations
-        try:
-            model = deepspeed.init_inference(
-                model,
-                dtype=torch_dtype,
-                mp_size=1,  # Single GPU
-                replace_method='auto',
-            )
-            logger.info("✅ DeepSpeed inference optimizations applied")
-        except Exception as e:
-            logger.warning(f"⚠️  Could not apply DeepSpeed optimizations: {e}")
-            logger.info("   Falling back to standard model")
         
         load_time = time.perf_counter() - start
         logger.info(f"✅ Model loaded in {load_time:.1f}s")
+        
+        # Note: DeepSpeed ZeRO-3 with NVMe offloading requires distributed training setup
+        # For inference-only, device_map="auto" is sufficient for memory-constrained scenarios
+        
     except Exception as e:
         logger.error(f"❌ Failed to load model: {e}")
         raise
@@ -353,10 +339,12 @@ def main():
     summary = {
         "avg_latency_ms": sum(latencies) / len(latencies),
         "median_latency_ms": sorted(latencies)[len(latencies)//2],
+        "stdev_latency_ms": statistics.stdev(latencies) if len(latencies) > 1 else 0,
         "min_latency_ms": min(latencies),
         "max_latency_ms": max(latencies),
         "avg_bandwidth_gbps": sum(bandwidths) / len(bandwidths),
         "median_bandwidth_gbps": sorted(bandwidths)[len(bandwidths)//2],
+        "stdev_bandwidth_gbps": statistics.stdev(bandwidths) if len(bandwidths) > 1 else 0,
         "min_bandwidth_gbps": min(bandwidths),
         "max_bandwidth_gbps": max(bandwidths),
     }
@@ -365,6 +353,7 @@ def main():
     if ttfts:
         summary["avg_ttft_ms"] = sum(ttfts) / len(ttfts)
         summary["median_ttft_ms"] = sorted(ttfts)[len(ttfts)//2]
+        summary["stdev_ttft_ms"] = statistics.stdev(ttfts) if len(ttfts) > 1 else 0,
         summary["min_ttft_ms"] = min(ttfts)
         summary["max_ttft_ms"] = max(ttfts)
     

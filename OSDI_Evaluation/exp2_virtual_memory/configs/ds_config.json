@@ -1,0 +1,24 @@
+{
+  "fp16": {
+    "enabled": true
+  },
+  "zero_optimization": {
+    "stage": 3,
+    "offload_param": {
+      "device": "nvme",
+      "nvme_path": "/tmp/ds_offload"
+    },
+    "offload_optimizer": {
+      "device": "nvme",
+      "nvme_path": "/tmp/ds_offload"
+    }
+  },
+  "aio": {
+    "block_size": 1048576,
+    "queue_depth": 8,
+    "single_submit": false
+  },
+  "train_micro_batch_size_per_gpu": 1,
+  "gradient_accumulation_steps": 1
+}
+
