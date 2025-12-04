@@ -8,7 +8,7 @@ experiment:
   # Ring buffer configuration
   ring_buffer:
     enabled: true
-    capacity_gb: 20  # Leave 4GB for activations/overhead on 24GB L4
+    capacity_gb: 4  # Leave 4GB for activations/overhead on 24GB L4
     prefetch_workers: 1  # Single worker sufficient on L4
   
   # Model configuration
