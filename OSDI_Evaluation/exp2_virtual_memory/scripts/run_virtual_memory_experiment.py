@@ -47,33 +47,17 @@ def load_config(config_path: str) -> Dict[str, Any]:
 
 
 def load_model_and_tokenizer(model_id: str, dtype: str = "float16"):
-    """Load model from HuggingFace."""
-    logger.info(f"Loading model: {model_id}")
+    """Load model tokenizer only. Model will be loaded with ring buffer."""
+    logger.info(f"Loading tokenizer: {model_id}")
     
-    # Determine torch dtype
-    if dtype == "float16":
-        torch_dtype = torch.float16
-    elif dtype == "float32":
-        torch_dtype = torch.float32
-    else:
-        torch_dtype = torch.float32
-    
-    # Load tokenizer
+    # Load tokenizer only (model will be loaded via gpu_model_loader)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    # Load model to CPU first (no device_map, keep on CPU for streaming)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        dtype=torch_dtype
-    )
-    # Explicitly place on CPU
-    model = model.to("cpu")
+    logger.info(f"✅ Loaded tokenizer for {model_id}")
     
-    logger.info(f"✅ Loaded model: {model.config.model_type}, params: {model.num_parameters() / 1e9:.1f}B")
-    
-    return model, tokenizer
+    return None, tokenizer
 
 
 def get_model_size_bytes(model: nn.Module, dtype: str) -> int:
@@ -87,15 +71,21 @@ def get_model_size_bytes(model: nn.Module, dtype: str) -> int:
     return num_params * bytes_per_param
 
 
-def setup_ring_buffer(model: nn.Module, config: Dict[str, Any], device: torch.device, chunk_size_mb: int = 64):
-    """Setup ring buffer and hooks.
+def setup_ring_buffer(model_id: str, config: Dict[str, Any], device: torch.device, chunk_size_mb: int = 64, dtype: str = "float16"):
+    """Setup ring buffer with GPU-resident model loading.
     
     Args:
-        model: PyTorch model
+        model_id: Model identifier for loading with ring buffer
         config: Configuration dict
         device: CUDA device
         chunk_size_mb: Prefetch chunk size in MB (for parameter sweep experiments)
+        dtype: Data type ("float16" or "float32")
+    
+    Returns:
+        (model, ring_buffer, streamer, hook_mgr)
     """
+    from OSDI_Evaluation.exp2_virtual_memory.scripts.gpu_model_loader import load_model_with_ring_buffer
+    
     rb_config = config["experiment"]["ring_buffer"]
     capacity_bytes = int(rb_config["capacity_gb"] * 1024**3)
     
@@ -104,16 +94,14 @@ def setup_ring_buffer(model: nn.Module, config: Dict[str, Any], device: torch.de
     # Create ring buffer
     ring_buffer = WeightRingBuffer(capacity_bytes, device=device)
     
-    # Register model - stream weights on-demand to avoid memory explosion
-    # Instead of copying entire state_dict, build a dict by iterating through named_parameters and buffers
-    # This avoids the memory overhead of model.state_dict() for very large models
-    model_state = {}
-    for name, param in model.named_parameters():
-        model_state[name] = param
-    for name, buffer in model.named_buffers():
-        model_state[name] = buffer
-    
-    ring_buffer.register_model("default", model_state)
+    # Load model with GPU-resident ring buffer views (NEW ARCHITECTURE)
+    logger.info("Loading model with GPU ring buffer virtualization...")
+    model, param_views, remaining_params = load_model_with_ring_buffer(
+        model_id=model_id,
+        ring_buffer=ring_buffer,
+        device=device,
+        dtype=dtype
+    )
     
     # Store chunk size in ring buffer for potential use in prefetch optimization
     ring_buffer.chunk_size_bytes = chunk_size_mb * 1024 * 1024
@@ -123,7 +111,7 @@ def setup_ring_buffer(model: nn.Module, config: Dict[str, Any], device: torch.de
     streamer.chunk_size_bytes = chunk_size_mb * 1024 * 1024
     streamer.start()
     
-    # Install hooks
+    # Install hooks for prefetch triggering
     hook_mgr = install_ring_buffer_hooks(
         model,
         ring_buffer=ring_buffer,
@@ -131,7 +119,7 @@ def setup_ring_buffer(model: nn.Module, config: Dict[str, Any], device: torch.de
         streamer=streamer
     )
     
-    return ring_buffer, streamer, hook_mgr
+    return model, ring_buffer, streamer, hook_mgr
 
 
 def create_prompt_with_tokens(tokenizer, base_prompt: str, target_tokens: int) -> str:
@@ -268,7 +256,7 @@ def run_inference(
         "bandwidth_gbps": bandwidth_gbps,
         "peak_vram_mb": peak_vram,
         "logit_diff": logit_diff,
-        "logits": logits.cpu().numpy() if reference_output is None else None,
+        "logits": logits.detach().cpu().numpy() if reference_output is None else None,
     }
     
     # Add TTFT if generation was used
@@ -278,7 +266,7 @@ def run_inference(
     return result
 
 
-def run_experiment(config_path: str, model_id: str, num_runs: int, output_path: str, chunk_size_mb: int = 64):
+def run_experiment(config_path: str, model_id: str, num_runs: int, output_path: str, chunk_size_mb: int = 64, ttft_enabled: bool = False):
     """Run full virtual memory experiment.
     
     Args:
@@ -287,6 +275,7 @@ def run_experiment(config_path: str, model_id: str, num_runs: int, output_path: 
         num_runs: Number of measurement runs
         output_path: Output JSON file path
         chunk_size_mb: Prefetch chunk size in MB
+        ttft_enabled: Enable TTFT measurement using model.generate()
     """
     
     streamer = None
@@ -302,28 +291,32 @@ def run_experiment(config_path: str, model_id: str, num_runs: int, output_path: 
         logger.info(f"Virtual Memory Ring Buffer Experiment")
         logger.info(f"{'='*70}\n")
         
-        # Load model and tokenizer
-        model, tokenizer = load_model_and_tokenizer(model_id, config["experiment"]["model"]["dtype"])
+        # Load tokenizer only (model will be loaded with ring buffer)
+        _, tokenizer = load_model_and_tokenizer(model_id, config["experiment"]["model"]["dtype"])
+        
+        # Setup ring buffer with GPU-resident model (NEW ARCHITECTURE)
+        if config["experiment"]["ring_buffer"]["enabled"]:
+            model, ring_buffer, streamer, hook_mgr = setup_ring_buffer(
+                model_id=model_id,
+                config=config,
+                device=device,
+                chunk_size_mb=chunk_size_mb,
+                dtype=config["experiment"]["model"]["dtype"]
+            )
+            logger.info(f"✅ GPU-resident model with ring buffer virtualization\n")
+        else:
+            # This path is not supported with new architecture
+            raise RuntimeError("Ring buffer must be enabled for this experiment")
+        
+        # Calculate model size
         model_size_gb = get_model_size_bytes(model, config["experiment"]["model"]["dtype"]) / 1024**3
         logger.info(f"Model size: {model_size_gb:.1f}GB\n")
         
-        # Setup ring buffer with chunk size parameter
-        if config["experiment"]["ring_buffer"]["enabled"]:
-            ring_buffer, streamer, hook_mgr = setup_ring_buffer(model, config, device, chunk_size_mb=chunk_size_mb)
-            logger.info(f"✅ Ring buffer and hooks installed\n")
-            # NOTE: DO NOT move model to GPU - keep on CPU for streaming
-            # Model parameters stay on CPU, hooks redirect to ring buffer during forward pass
-            logger.info(f"✅ Model kept on CPU for streaming (weights will be prefetched on-demand)\n")
-        else:
-            # Standard path: move model to GPU
-            model = model.to(device)
-            logger.info(f"✅ Model moved to {device}\n")
+        # Ring buffer is always available in new architecture
+        ring_buffer_obj = ring_buffer
         
-        # Get ring buffer for stats (if enabled)
-        ring_buffer_obj = ring_buffer if config["experiment"]["ring_buffer"]["enabled"] else None
-        
-        # Determine if we should enable generation (command line overrides config)
-        enable_generation = args.ttft_enabled or config["experiment"]["measurement"].get("ttft_enabled", False)
+        # Determine if we should enable generation (parameter overrides config)
+        enable_generation = ttft_enabled or config["experiment"]["measurement"].get("ttft_enabled", False)
         
         # Run warmup
         logger.info(f"Running {config['experiment']['measurement']['warmup_runs']} warmup iterations...")
@@ -453,7 +446,7 @@ def run_experiment(config_path: str, model_id: str, num_runs: int, output_path: 
 def main():
     parser = argparse.ArgumentParser(description="Run virtual memory experiment")
     parser.add_argument("--config", required=True, help="Config YAML file")
-    parser.add_argument("--model", default="EleutherAI/gpt-j-6B", help="Model ID")
+    parser.add_argument("--model", default="gpt2", help="Model ID")
     parser.add_argument("--runs", type=int, default=5, help="Number of runs")
     parser.add_argument("--output", required=True, help="Output JSON file")
     parser.add_argument("--chunk-size-mb", type=int, nargs='+', 
@@ -480,7 +473,7 @@ def main():
             output_path = str(args.output).replace('.json', f'_chunk_{chunk_size_mb}mb.json')
             
             try:
-                result = run_experiment(args.config, args.model, args.runs, output_path, chunk_size_mb=chunk_size_mb)
+                result = run_experiment(args.config, args.model, args.runs, output_path, chunk_size_mb=chunk_size_mb, ttft_enabled=args.ttft_enabled)
                 sweep_results[f"chunk_{chunk_size_mb}mb"] = result["summary"]
             except Exception as e:
                 logger.error(f"Failed for chunk size {chunk_size_mb}MB: {e}")
@@ -509,13 +502,13 @@ def main():
                     stderr=subprocess.PIPE
                 )
             try:
-                run_experiment(args.config, args.model, args.runs, args.output, chunk_size_mb=chunk_size_mb)
+                run_experiment(args.config, args.model, args.runs, args.output, chunk_size_mb=chunk_size_mb, ttft_enabled=args.ttft_enabled)
             finally:
                 trace_proc.terminate()
                 trace_proc.wait(timeout=5)
                 logger.info(f"PCIe trace saved to: {trace_file}")
         else:
-            run_experiment(args.config, args.model, args.runs, args.output, chunk_size_mb=chunk_size_mb)
+            run_experiment(args.config, args.model, args.runs, args.output, chunk_size_mb=chunk_size_mb, ttft_enabled=args.ttft_enabled)
 
 
 if __name__ == "__main__":

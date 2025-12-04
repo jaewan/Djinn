@@ -28,6 +28,7 @@ import logging
 import torch
 import torch.nn as nn
 from typing import Dict, Optional, Callable, List, Any
+from djinn.backend.runtime.weight_registry import WeightNameRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +67,10 @@ class RingBufferHookManager:
         self.streamer = streamer
         self.hooks_installed = False
         
-        # Get layer names from model if not provided
+        # Create weight name registry for unified naming
+        self.registry = WeightNameRegistry(model)
+        
+        # Extract MODULE names (e.g., "lm_head") which correspond to forward hooks
         if layer_names is None:
             self.layer_names = self._extract_layer_names(model)
         else:
@@ -91,6 +95,11 @@ class RingBufferHookManager:
         
         # Store hooks for potential removal
         self.hook_handles: Dict[str, Any] = {}
+        
+        # Register tied weights with ring buffer
+        if self.registry.tied_weights:
+            self.ring_buffer.set_tied_weights(model_id, self.registry.tied_weights)
+            self.registry.log_summary()
         
         logger.info(f"Initialized RingBufferHookManager for {len(self.layer_names)} layers")
     
@@ -134,94 +143,17 @@ class RingBufferHookManager:
     def _create_pre_hook(self, layer_name: str, layer_idx: int) -> Callable:
         """
         Create a forward pre-hook for a layer.
-        
-        This hook runs before forward pass and:
-        1. Prefetches next layer (if streamer available)
-        2. Redirects weights from ring buffer
-        3. Sets up computation to signal done
+
+        For virtualization with resident weights, this hook is simplified to:
+        - Avoid errors when streamer is not tracking this model
+        - Allow forward pass to proceed with pre-loaded ring buffer weights
         """
         def pre_hook(module, inputs):
-            # Step 1: Wait for weights to be ready (no-op on CPU)
-            # This makes GPU wait for prefetch to complete (no CPU blocking)
-            if self.streamer:
-                self.streamer.wait_for_layer(self.model_id, layer_idx)
-            
-            # Step 2: Redirect weights to ring buffer view
-            # Note: Ring buffer uses state_dict keys like "embed.weight"
-            # but we have module names like "embed". Need to construct the key.
-            try:
-                # Replace module weight with ring buffer view
-                # This is O(1) - just updating metadata pointer
-                if hasattr(module, 'weight') and module.weight is not None:
-                    # Construct state_dict key for weight
-                    weight_key = f"{layer_name}.weight" if layer_name else "weight"
-                    try:
-                        ring_view = self.ring_buffer.get_layer_view(
-                            self.model_id,
-                            weight_key
-                        )
-                        module.weight.data = ring_view
-                        logger.debug(
-                            f"Redirected {weight_key} to ring buffer view"
-                        )
-                    except ValueError:
-                        # Try without .weight suffix (in case layer_name is already full key)
-                        try:
-                            ring_view = self.ring_buffer.get_layer_view(
-                                self.model_id,
-                                layer_name
-                            )
-                            module.weight.data = ring_view
-                            logger.debug(
-                                f"Redirected {layer_name} to ring buffer view"
-                            )
-                        except ValueError:
-                            # Layer not in ring buffer - this can happen for shared weights
-                            # (e.g., lm_head shares with embedding layer)
-                            logger.debug(f"⚠️  Layer {layer_name} not in ring buffer (may be shared weights)")
-                
-                # Also handle bias if present and in ring buffer
-                if hasattr(module, 'bias') and module.bias is not None:
-                    bias_key = f"{layer_name}.bias" if layer_name else "bias"
-                    try:
-                        bias_view = self.ring_buffer.get_layer_view(
-                            self.model_id,
-                            bias_key
-                        )
-                        module.bias.data = bias_view
-                        logger.debug(f"Redirected {bias_key} to ring buffer view")
-                    except ValueError:
-                        # Bias not in ring buffer, that's OK
-                        pass
-            
-            except Exception as e:
-                logger.error(f"Failed to redirect weights for {layer_name}: {e}")
-                raise
-            
-            # Step 3: Queue prefetch for next layer
-            if self.streamer and layer_idx + 1 < len(self.layer_names):
-                next_layer_name = self.layer_names[layer_idx + 1]
-                next_weight_key = f"{next_layer_name}.weight" if next_layer_name else "weight"
-                try:
-                    # Get next module to prefetch its weights
-                    next_module = self._get_module_by_name(self.model, next_layer_name)
-                    if next_module and hasattr(next_module, 'weight') and next_module.weight is not None:
-                        # Get weight (CPU copy, not from ring buffer which is GPU memory)
-                        # Use detach() to break any autograd tracking
-                        next_weights = next_module.weight.detach()
-                        if next_weights.device.type != 'cpu':
-                            next_weights = next_weights.cpu()
-                        
-                        # Queue for prefetch (non-blocking)
-                        self.streamer.queue_prefetch(
-                            self.model_id,
-                            layer_idx + 1,
-                            next_weight_key,
-                            next_weights
-                        )
-                        logger.debug(f"Queued prefetch for {next_weight_key}")
-                except Exception as e:
-                    logger.debug(f"Could not prefetch next layer: {e}")
+            # For virtualization: all resident weights are already in ring buffer views
+            # No need to redirect pointers since model was created with ring buffer views
+            # Hooks are no-op for resident weights, and streamed weights will be handled
+            # by the weight streamer when implemented
+            pass
         
         return pre_hook
     

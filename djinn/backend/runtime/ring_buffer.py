@@ -68,6 +68,7 @@ class ModelRegistration:
     total_bytes: int = 0
     layer_ready_events: Dict[int, torch.cuda.Event] = field(default_factory=dict)
     layer_done_events: Dict[int, torch.cuda.Event] = field(default_factory=dict)
+    tied_weights: Dict[str, str] = field(default_factory=dict)  # alias -> canonical name
 
 
 class WeightRingBuffer:
@@ -219,6 +220,87 @@ class WeightRingBuffer:
             
             return registration
     
+    def allocate_view(
+        self,
+        param_name: str,
+        shape: Tuple,
+        dtype: torch.dtype,
+        device: Optional[torch.device] = None
+    ) -> torch.Tensor:
+        """
+        Allocate a contiguous view in the ring buffer for a parameter.
+        
+        Used for GPU-resident model loading where parameters are ring buffer views
+        from initialization, not redirected afterwards.
+        
+        Args:
+            param_name: Parameter name (for tracking)
+            shape: Parameter shape
+            dtype: Parameter dtype
+            device: Target device (defaults to ring buffer's device)
+            
+        Returns:
+            Tensor view that can be used as a model parameter
+        """
+        if device is None:
+            device = self.device
+        
+        # Calculate required bytes
+        import math
+        num_elements = math.prod(shape)
+        element_size = torch.empty(0, dtype=dtype).element_size()
+        bytes_needed = num_elements * element_size
+        
+        # Allocate in ring buffer (simple linear allocation for now)
+        with self.lock:
+            if not hasattr(self, '_allocation_offset'):
+                self._allocation_offset = 0
+            
+            offset = self._allocation_offset
+            
+            # Check if fits
+            if offset + bytes_needed > self.capacity_bytes:
+                raise RuntimeError(
+                    f"Ring buffer full: Cannot allocate {param_name} ({bytes_needed / 1024**3:.2f}GB). "
+                    f"Capacity: {self.capacity_bytes / 1024**3:.1f}GB, "
+                    f"Available: {(self.capacity_bytes - offset) / 1024**3:.2f}GB"
+                )
+            
+            # Create view
+            byte_view = self.buffer[offset:offset + bytes_needed]
+            typed_view = byte_view.view(dtype)
+            param_view = typed_view[:num_elements].view(shape)
+            
+            # Track allocation
+            self._allocation_offset = offset + bytes_needed
+            
+            logger.debug(
+                f"Allocated {param_name}: {shape} {dtype} at offset {offset / 1024**2:.1f}MB "
+                f"(total: {self._allocation_offset / 1024**3:.2f}GB / {self.capacity_bytes / 1024**3:.1f}GB)"
+            )
+            
+            return param_view
+    
+    def set_tied_weights(self, model_id: str, tied_weights: Dict[str, str]) -> None:
+        """
+        Register tied weight mappings for a model.
+        
+        Tied weights occur when multiple parameters share the same underlying tensor
+        (e.g., lm_head.weight = transformer.wte.weight in GPT-2).
+        
+        Args:
+            model_id: Model identifier
+            tied_weights: Dict mapping alias parameter names to canonical names
+        """
+        with self.lock:
+            if model_id not in self.registrations:
+                raise ValueError(f"Model {model_id} not registered")
+            
+            registration = self.registrations[model_id]
+            registration.tied_weights = tied_weights
+            
+            logger.debug(f"Registered {len(tied_weights)} tied weight(s) for model {model_id}")
+    
     def get_layer_view(
         self,
         model_id: str,
@@ -230,9 +312,11 @@ class WeightRingBuffer:
         This view points into the ring buffer at the pre-computed offset.
         Does NOT copy data - you must load weights using load_layer_weights().
         
+        Handles tied weights by resolving aliases to canonical parameter names.
+        
         Args:
             model_id: Model identifier
-            layer_name: Layer name from state dict
+            layer_name: Layer name from state dict (may be an alias for tied weights)
         
         Returns:
             Tensor view into ring buffer with correct shape/dtype
@@ -243,10 +327,14 @@ class WeightRingBuffer:
                 raise ValueError(f"Model {model_id} not registered")
             
             registration = self.registrations[model_id]
-            if layer_name not in registration.layer_allocations:
-                raise ValueError(f"Layer {layer_name} not found in model {model_id}")
             
-            alloc = registration.layer_allocations[layer_name]
+            # Resolve aliases for tied weights
+            canonical_layer_name = registration.tied_weights.get(layer_name, layer_name)
+            
+            if canonical_layer_name not in registration.layer_allocations:
+                raise ValueError(f"Layer {layer_name} (canonical: {canonical_layer_name}) not found in model {model_id}")
+            
+            alloc = registration.layer_allocations[canonical_layer_name]
             # Copy allocation data before releasing lock
             offset = alloc.offset
             size_bytes = alloc.size_bytes

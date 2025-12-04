@@ -1,0 +1,169 @@
+\section{Introduction}
+
+The economics of AI infrastructure are driving a fundamental architectural reversion: the return of the mainframe. With individual NVIDIA GB200 NVL72 racks commanding \$52–65 million—comparable to the inflation-adjusted cost of an IBM System/370—the era of the personal high-performance workstation has ended. This capital concentration necessitates a return to time-sharing, where thousands of users via "thin clients" (laptops) borrow compute from a centralized pool.
+
+However, the software abstractions governing these clusters have failed to adapt to the dominant mode of AI development: \textit{interactive exploration}. Data scientists and researchers work in tight, human-speed loops—debugging model internals, testing hypotheses, and visualizing activations. 
+Similarly, emerging Reasoning Agents exhibit identical patterns: they interleave bursty GPU generation with long-latency I/O (tool execution), leaving accelerators idle during these "machine think-times".
+Unlike static production workloads, these tasks require the flexibility to execute arbitrary code combined with the elasticity to acquire resources in milliseconds.
+
+Current infrastructure forces a bifurcation that leaves interactive workloads behind.
+Production serving systems like vLLM~\cite{vllm} achieve high throughput via closed-loop execution: 
+the system owns the execution loop, treating the model as a static appliance.
+While they employ sophisticated paging, they rely on static execution graphs, lacking the semantic visibility to handle the arbitrary control flow, external tool usage, or state intervention required for research.
+Conversely, cluster schedulers like Ray~\cite{ray} or Kubernetes~\cite{kubernetes} support arbitrary code but enforce coarse-grained batch semantics: users must reserve exclusive GPUs. 
+This leads to the "parking lot" problem, where expensive accelerators sit idle while users think and type, resulting in average cluster utilization of 55--60\%~\cite{Gupta2023GPUUtilization}.
+
+Enabling interactive exploration on shared accelerators requires more than simply disaggregating resources.
+Existing disaggregation approaches~\cite{rcuda,dxpu,bitfusion} fail due to a fundamental architectural mismatch we term the semantic translation gap. 
+As computation descends the software stack—from the deep learning framework, through the runtime, down to the driver and hardware—crucial semantic intent is stripped away~\cite{hong2025lost}.
+A PyTorch program understands that model weights are immutable and shared, while a KV-cache is session-private state. It knows when an operation is part of a long-lived prefill versus a short decode step. By the time these operations reach the driver, however, they have been flattened into opaque buffers and kernel launches. This semantic blindness forces lower layers into pathological behaviors, such as holding persistent state for idle sessions or repeatedly re-transferring static weights.
+
+
+We argue that enabling efficient interactivity on shared accelerators requires a new abstraction: the \textbf{Tensor Process}.
+Just as a Unix process virtualizes the CPU and RAM via Code, Heap, and Stack segments, a Tensor Process must virtualize the distinct semantic components of Deep Learning—Model Weights (Text), KV Caches (Data), and Activations (Stack).
+This abstraction allows the system to manage memory lifecycles independently, enabling multiple sessions to time-share a single accelerator without thrashing.
+
+
+We present \sys, a framework-level Tensor Operating System designed for this abstraction.
+\sys bridges the semantic gap by interposing at the PyTorch dispatch layer, treating tensor operations as system calls.
+It exposes a virtual tensor device to PyTorch: user code issues ordinary tensor operations against what appears to be a local accelerator, while \sys maps those operations and tensors onto remote GPU resources and physically multiplexes computations across a disaggregated cluster.
+It introduces three OS primitives to the deep learning stack.
+
+First, Lazy Evaluation via \textit{Semantically Rich Graph (SRG)}.
+\sys acts as a semantic hypervisor, intercepting tensor operations and immediately returning a \textit{LazyTensor}—a virtual handle—without executing code or moving data.
+This decouples the logical definition of computation from its physical execution. \sys records these operations into a \textit{Semantically Rich Graph (SRG)}, which captures tensor lifecycles and execution phases (e.g., prefill vs. decode). 
+This allows the scheduler to optimize allocation globally, prefetching data for active phases and proactively swapping out idle sessions based on code structure.
+The heavy lifting of graph capture, serialization, and remote execution is handled transparently, enabling features like \textit{Lazy I/O}, where \sys returns lightweight skeleton references and transfers concrete data only when the user explicitly inspects it.
+%This graph drives a semantic scheduler that interleaves requests from multiple tenants, prioritizing interactive latency while maximizing throughput. SRG informs placement decisions: which tensors remain in the GPU and which are materialized or spilled, allowing \sys to co-locate long-lived state with compute. Additionally, the LazyTensor abstraction enables Lazy I/O: \sys returns lightweight "skeleton" references for complex results, transferring concrete data only when the user explicitly accesses it (e.g., printing a value).
+
+
+Second, memory segmentation via \textit{Unified Virtual Memory Unit (VMU)}.
+To realize Tensor Process, \sys partitions GPU memory into semantic segments.
+Guided by the SRG, it maps immutable weights to a shared \textit{Text Segment}, session-private KV caches to a swappable \textit{Data Segment}, and ephemeral activations to a volatile \textit{Stack Segment}. 
+Crucially, the Stack Segment employs a watermark-based reset, guaranteeing zero external fragmentation for intermediate computations.
+This allows \sys to context-switch at the granularity of individual operations, solving the "parking lot" problem: users retain logical session state without locking physical compute.
+
+Third, Latency-hiding Virtualization via \textit{Ghost Loading}. 
+To virtualize access to massive models, \sys implements Ghost Loading. Clients instantiate zero-memory "ghost" modules; the server maps physical weights into the shared Text Segment. Unlike naive demand paging which stalls execution, \sys leverages the SRG to pipeline memory transfers with computation. By treating the Text Segment as a streaming ring buffer, \sys prefetches future layers over PCIe while the GPU computes the current layer, effectively hiding virtualization latency and saturating host-to-device bandwidth.
+
+
+Our evaluation shows that \sys enables new regimes of interactivity and efficiency. For reasoning agents, \sys eliminates the "parking lot" effect, scaling concurrent sessions by ×× over batch schedulers by transparently swapping state during tool execution. 
+For heterogeneous pipelines, \sys runs multi-model workflows (e.g., Audio-LLM-Vision) on a single GPU that would otherwise OOM, by dynamically paging "Text Segments." \sys demonstrates that by lifting OS primitives into the framework layer, we can transform the GPU cluster from a rigid batch processor into a flexible interactive utility.
+
+\section{The Case for Framework-Level Disaggregation}
+\label{sec:motivation}
+
+Efficient disaggregation requires answering three fundamental resource management questions for every operation:
+\begin{enumerate}
+    \item \textbf{Life Cycle \& Residency:} Is this tensor ephemeral (activations), session-scoped (KV-cache), or globally shared (weights)?
+    \item \textbf{Locality:} Should the computation move to the data (e.g., near a KV-cache), or should the data move to the computation?
+    \item \textbf{Scheduling:} Does the dataflow allow for latency masking via pipelining or prefetching?
+\end{enumerate}
+
+These are not merely optimization flags; they are semantic properties inherent to the workload. In this section, we demonstrate that the \textit{semantic translation gap} prevents lower layers from answering these questions, identifying the framework layer as the unique "narrow waist" capable of driving a Tensor Operating System.
+
+\subsection{The Challenges of Temporal Sparsity}
+\label{sec:interactive_crisis}
+
+AI workloads are bifurcating. While training and bulk serving maximize compute density, interactive workloads exhibit extreme \emph{temporal sparsity}: distinct periods of high-intensity compute interspersed with long periods of idleness ("think time").
+Existing infrastructure handles this pathology poorly where a user must reserve a physical accelerator for the entire duration of a session, regardless of actual utilization resulting in a duty cycle of $<1\%$.  
+This sparsity originates from two structural shifts in the workloads that break the assumptions of traditional batch schedulers.
+
+\paragraph{Human-in-the-Loop: The Notebook Granularity Mismatch.}
+The Jupyter notebook, the de facto interface for AI research, interacts inefficiently with monolithic schedulers. A researcher debugging Llama-3-70B requires exclusive allocation of two NVIDIA H100-80GB GPUs to satisfy the model's memory footprint.
+However, the execution model is fragmented: computation occurs in cells—small, sporadic graph fragments—while the Python kernel maintains persistent state for hours.
+Because the scheduler cannot distinguish between "holding state" and "computing," the researcher is forced to lock 140GB of HBM and 4,000 TFLOPS of compute during minutes of code modification.
+This "parking lot" behavior prevents the cluster from reclaiming the accelerator's compute units for other pending jobs, artificially inflating the scarcity of high-end hardware.
+
+\paragraph{Machine-in-the-Loop: Agentic Workflows.}
+Emerging \textit{Reasoning Agents} accelerate this pattern: they interleave bursty GPU generation with I/O-bound tool execution in rapid loops.
+Agents execute stateful loops: \textit{Reason(GPU) → Act(Tool/IO) → Observe(GPU)}.
+During the I/O-bound "Act" phase (e.g., querying a database), the GPU execution units are idle.
+However, standard serverless abstractions (e.g., K-Serve) fail here because they conflate idleness with termination. Releasing the GPU during the "Act" phase forces a full flush of the session's KV-cache (State).
+When the agent returns to "Observe," the system must pay a prohibitive Cold Start Tax: reloading weights and re-computing the entire history.
+This forces architects into a false choice: reserve the GPU (wasting compute) or recompute state (wasting latency).
+
+%Emerging \textit{AI Agents} exhibit identical structural sparsity but at higher frequency. Unlike stateless HTTP inference requests, Agents execute stateful loops: \textit{Reason → Act → Observe}.
+%An agent might generate a plan on the GPU (Reason), execute a remote tool or database query (Act), and wait for the result (Observe).
+%During the I/O-bound Act/Observe phase, the GPU execution units are idle, yet the VRAM must preserve the semantic context (the agent's KV history) for the next step.
+%Current serverless abstractions fail here because they conflate idleness with termination. Releasing the GPU during I/O forces a full context flush, necessitating a prohibitively expensive Cold Start(reloading weights and re-processing history) at every step of the reasoning chain.
+
+\paragraph{The Coupling Pathology.}
+Both scenarios reveal a fundamental architectural inefficiency: the rigid coupling of Memory Capacity to Compute Bandwidth.
+Under the current monolithic acquisition model, a process must reserve a static VRAM footprint to establish an execution context. Consequently, maintaining session state (residency) necessitates holding the accelerator's compute entitlement, even during idle periods.
+This results in stranded compute capacity: the execution units are technically idle but practically inaccessible because available memory is exhausted by dormant state.
+This forces a trade-off between utilization (batching) and interactivity (caching).
+A Tensor Operating System resolves this by decoupling these resources, implementing distinct virtualization strategies: space-sharing VRAM to preserve hot session state via demand paging, while time-sharing execution units to multiplex sporadic compute bursts via sub-millisecond scheduling.
+
+\subsection{The Semantic Translation Gap}
+
+As operations descend the software stack, semantic intent is compiled into opaque resource transactions.
+
+At the \textbf{Framework Layer} (e.g., PyTorch), a \textit{scaled\_dot\_product\_attention} call carries rich context: it identifies the operation type, distinguishes immutable weights from stateful KV-caches, and defines the DAG structure.
+
+By the \textbf{Driver Layer} (e.g., CUDA), this context collapses. The driver sees a sequence of generic kernel launches and flat \textit{malloc} calls. It cannot distinguish a 12GB allocation representing shared, read-only model weights from a 12GB allocation representing ephemeral activations. Both are simply pointers.
+
+At the \textbf{Hardware Layer} (PCIe/NVLink), context is erased. The system observes only DMA transactions defined by physical addresses.
+
+This blindness forces lower-layer systems into conservative behaviors. Unable to identify which data is shareable (Weights) versus private (KV), a driver-level system must enforce strict process isolation. It cannot deduplicate weights across tenants, nor can it migrate an interactive session without copying the entire VRAM context---even if the active state is only a fraction of the allocated memory.
+
+\subsection{The Cost of Agnosticism}
+
+We quantify the impact of this semantic blindness across three representative workloads.
+
+\paragraph{LLM Serving (Residency & Locality).}
+LLMs are defined by state management. Weights are immutable/shared; KV-caches are private/growing; activations are ephemeral. A driver-level system (e.g., rCUDA~\cite{rcuda}) sees only memory writes. To serve 50 users, it must allocate 50 copies of the weights, exhausting cluster memory. In contrast, a framework-aware system identifies the \textbf{Residency} of weights as "Global/Read-Only" and KV-caches as "Session/Private." In our benchmarks (GPT-J), this semantic caching reduces the memory footprint for 50 concurrent sessions by \jw{todo}
+
+\paragraph{Computer Vision (Scheduling).}
+Convolutional networks exhibit strict sequential dataflow ($L_1 \rightarrow L_2 \rightarrow L_3$). A driver-level system sees independent kernels and forces sequential execution to ensure safety. Framework visibility exposes the dependency chain, allowing the system to automate \textbf{Scheduling} decisions like pipeline parallelism. \jw{Update to newer models}On ResNet-50, overlapping communication with computation reduces latency by \jw{todo}.
+
+\paragraph{Recommendation Systems (Access Patterns).}
+Embedding lookups follow a Zipfian distribution. A hardware-level system sees random access and defaults to LRU eviction. The framework layer observes embedding IDs, enabling value-based caching that pins "hot" rows. This semantic caching reduces average lookup latency by \jw{todo, maybe cut this}.
+
+\subsection{The Design Space}
+
+We evaluate four intervention points for implementing disaggregation (Table~\ref{tab:design_space}).
+
+\paragraph{Hardware (PCIe-over-Fabric).}
+Systems like DxPU \cite{dxpu} extend PCIe over the network. While transparent, they suffer from protocol impedance mismatch (PCIe assumes nanosecond latency) and total semantic blindness, precluding intelligent caching.
+
+\paragraph{Driver (CUDA Interception).}
+Systems like BitFusion \cite{bitfusion,rcuda} intercept GPU calls. This provides binary compatibility but suffers from "API Churn"---the maintenance burden of wrapping hundreds of evolving CUDA APIs. More critically, driver interception enforces process-level isolation, making fine-grained tensor sharing impossible.
+
+\paragraph{Application (Manual Management).}
+Specialized serving engines like vLLM \cite{vllm} or DistServe \cite{distserve} achieve high performance by manually partitioning specific models.
+While efficient, this approach is Black-Box: it restricts users to a fixed API, prohibiting the arbitrary code execution required for interactive research. It violates the systems principle of generality.
+
+\begin{table}[t]
+\centering
+\small
+\caption{The Framework layer balances semantic visibility with application generality.}
+\label{tab:design_space}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{Layer} & \textbf{Semantic} & \textbf{Multi-} & \textbf{Stable} & \textbf{Zero} \\
+& \textbf{Visibility} & \textbf{Tenancy} & \textbf{API} & \textbf{Code} \\ \midrule
+Hardware & None & Low & Yes & Yes \\
+Driver & Low & Low & No & Yes \\
+Application & High & High & N/A & No \\
+\textbf{Framework} & \textbf{High} & \textbf{High} & \textbf{Yes} & \textbf{Yes} \\ \bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Framework (The Semantic Narrow Waist).}
+The ML framework acts as the "narrow waist" of the stack. It observes graph structures and tensor lifecycles (High Visibility) yet intercepts operations via standard dispatch mechanisms (High Generality). It abstracts hardware, allowing one codebase to support NVIDIA, AMD, or TPU backends. This is the optimal layer for a Tensor OS.
+
+
+\subsection{Design Requirements}
+
+To realize a Tensor Operating System at the framework layer, \sys targets five specific requirements:
+
+\begin{itemize}
+    \item \textbf{Transparent Capture:} Infer semantic intent (phases, lifecycles) from standard PyTorch code without manual user annotation.
+    \item \textbf{Virtualization:} Decouple logical tensors from physical memory. Data should never move to the client unless explicitly accessed ("Zero Data Movement").
+    \item \textbf{Zero-Fragmentation:} Manage remote memory to eliminate external fragmentation while enforcing session isolation (addressing the Residency decision).
+    \item \textbf{Failure Resilience:} Detect and recover from remote failures at the tensor operation boundary.
+    \item \textbf{Interactive Latency:} Mask network latency via lookahead scheduling to approach local execution speeds for interactive use.
+\end{itemize}
+
+Existing systems fail at least two of these. \sys satisfies all five.
