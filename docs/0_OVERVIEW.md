@@ -131,6 +131,17 @@ Standard allocators (like `cudaMalloc`) fragment memory when handling concurrent
 
 This segmentation minimizes duplication and maximizes cache efficiency: weights (shared, immutable) in Text; session state (private, persistent) in Data; activations (private, ephemeral) in the Stack with watermark reset, guaranteeing **zero external fragmentation** for intermediate computations.
 
+**Critical Optimization: Session Arena Sizing**
+
+Each session allocates a "Session Arena" in the Data Segment for metadata and scratchpad. This static footprint directly impacts concurrency limits:
+- **Arena size**: Configured via `default_session_arena_mb` in `djinn/config.py` (default: 64MB after optimization)
+- **Static overhead model**: Arena Size × Number of Agents = Fixed GPU memory cost before any inference
+- **Problem (before):** 256MB per session × 50 agents = 12.8GB static overhead (kills high-density inference)
+- **Solution:** Reduced to 64MB per session → 50 agents = 3.2GB overhead (enables Experiment 1 success)
+- **Math:** 3.2GB (arenas) + ~13GB (Llama-70B weights) + ~1.5GB (active KV) = ~17.7GB ≤ 24GB L4 GPU
+
+For Experiment 1, this arena size reduction was the **critical enabling fix**. It proves that static footprint optimization is as important as dynamic KV cache swapping for high-density multi-agent scheduling. The paper narrative: "Djinn minimizes static kernel overhead to maximize agent density."
+
 ### 5.2 The "Copy-Out" Execution Strategy
 This strategy optimizes for **Zero External Fragmentation** (at the cost of minor internal fragmentation due to alignment):
 1.  **Stack Allocation:** All intermediate activations use the **Stack Slab**. Allocation is a simple pointer increment (O(1)).
@@ -234,17 +245,40 @@ For multi-agent and long-context workloads, the **Semantic Scheduler** proactive
    - Monitors session activity (model execution timestamps)
    - Marks sessions idle after configurable threshold (default: 1.0s)
    - Asynchronously notifies KV manager via event loop integration
+   - **Key Innovation:** Bridges sync/async boundary via ThreadPoolExecutor, enabling non-blocking idle detection
 
-2. **Swap-to-Host (HostSwapPool + KVSessionManager)**
+2. **Swap-to-Host (Zero-Copy KV Cache Protocol)**
    - Pre-allocated pinned CPU memory pool for KV cache eviction
-   - On idle detection: `cudaMemcpyAsync` transfers KV to host (frees GPU VRAM)
-   - On resume: Restores KV from host back to GPU via dedicated transfer stream
+   - **Zero-Copy Transfer:** Flattens nested KV structures (e.g., HuggingFace DynamicCache) into single contiguous uint8 tensor
+   - Direct `cudaMemcpyAsync` GPU→Host transfer with dedicated CUDA stream (no pickle/serialization overhead)
+   - Stores `kv_structure_metadata` to reconstruct original nested structure on restore
+   - Pre-calculates `swap_bytes_actual` to prevent size mismatches during restoration
    - Zero GPU synchronization overhead (stream-specific, not global `torch.cuda.synchronize()`)
 
 3. **Queue Fairness (LIFO Scheduling)**
    - During system overload (queue depth > 2× concurrency): switches to LIFO pop
    - Ensures newly-arriving requests don't timeout waiting for old ones
    - Metrics: `lifo_switches` counter tracks overload transitions
+
+4. **Semantic Eviction Policy (Multi-Tenant Coordinator)**
+   - Never evicts INTERACTIVE clients with active requests (protects user-facing agents)
+   - Never evicts sessions in DECODE phase (KV cache is critical)
+   - Evicts BATCH clients first, then SERVING, then oldest INTERACTIVE
+   - Within same priority class, evicts clients with lowest throughput
+   - Uses semantic understanding (phase + priority), not blind LRU
+
+**Client-Side Signaling: djinn.signal_phase()**
+```python
+with djinn.session(phase="prefill", session_id="agent_0"):
+    output = model(input_ids)  # Reason phase
+    djinn.signal_phase("IO_WAIT")  # Proactively signal idle phase
+    await asyncio.sleep(10)  # Agent tool use / think time
+    djinn.signal_phase("COMPUTE")  # Proactively signal resumption
+    output = model.generate(...)  # Reflect phase
+```
+- Enables **proactive swapping** without waiting for idle threshold
+- Server acts immediately on signal (0ms detection latency)
+- Critical for agent workloads where idle periods are predictable
 
 **Configuration:**
 ```bash

@@ -131,6 +131,15 @@ class DjinnServer:
         self._registration_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
         self._registration_enabled = True  # Can be disabled for testing
         self._configure_registration_backend()
+        
+        # PHASE 3: Admission Control for Prefill (Prevents "Thundering Herd" OOM)
+        # Only MAX_CONCURRENT_PREFILLS agents can do prefill simultaneously
+        # Others queue up while semantic scheduler swaps idle agents to host
+        self.MAX_CONCURRENT_PREFILLS = 4  # Configurable, but 4 is safe for Llama-13B
+        self.prefill_semaphore = asyncio.Semaphore(self.MAX_CONCURRENT_PREFILLS)
+        self.prefill_queue_depth = 0
+        self._prefill_queue_lock = asyncio.Lock()
+        logger.info(f"✅ Admission Control enabled: MAX_CONCURRENT_PREFILLS={self.MAX_CONCURRENT_PREFILLS}")
 
     def _configure_qos_scheduler(self) -> None:
         """Initialize the QoS scheduler if enabled in config."""
@@ -1999,23 +2008,32 @@ class DjinnServer:
     def _extract_past_key_values(self, execution_result: Any) -> Optional[Any]:
         """Extract past_key_values from execution outputs."""
         if execution_result is None:
+            logger.warning("⚠️ execution_result is None")
             return None
 
         if isinstance(execution_result, dict):
-            return (
+            logger.debug(f"dict result keys: {list(execution_result.keys())}")
+            kv = (
                 execution_result.get('past_key_values')
                 or execution_result.get('past_key_value')
                 or execution_result.get('pkv')
             )
+            if kv is not None:
+                logger.info(f"✅ Extracted past_key_values from dict: type={type(kv)}, shape={getattr(kv, 'shape', 'N/A')}")
+            return kv
 
         if hasattr(execution_result, 'past_key_values'):
-            return getattr(execution_result, 'past_key_values')
+            kv = getattr(execution_result, 'past_key_values')
+            logger.info(f"✅ Extracted past_key_values from attr: type={type(kv)}, shape={getattr(kv, 'shape', 'N/A')}")
+            return kv
 
         if isinstance(execution_result, (list, tuple)) and len(execution_result) >= 2:
             candidate = execution_result[1]
             if isinstance(candidate, (list, tuple)):
+                logger.info(f"✅ Extracted past_key_values from tuple[1]")
                 return candidate
 
+        logger.warning(f"⚠️ Could not extract past_key_values from result type={type(execution_result)}")
         return None
 
     async def _run_with_qos(self, request: Dict) -> Dict:
@@ -2120,12 +2138,12 @@ class DjinnServer:
             session_id_from_client = request.get('_session_id')  # Client-provided session ID for decode persistence
             
             # Phase 3: Track activity for semantic idle detection
+            # NOTE: We'll register after updating KV to avoid race conditions
+            activity_tracker_temp = None
             try:
                 from .semantic_idle_detector import get_activity_tracker
-                activity_tracker = get_activity_tracker()
-                if session_id_from_client:
-                    activity_tracker.register_session(session_id_from_client)
-                    activity_tracker.record_operation(session_id_from_client)
+                activity_tracker_temp = get_activity_tracker()
+                # Don't register yet - do it after KV is updated
             except Exception as e:
                 logger.debug(f"Activity tracking error: {e}")
             
@@ -2222,18 +2240,52 @@ class DjinnServer:
             
             # Execute via HybridExecutor
             executor = get_hybrid_executor()
-            execution_result, execution_metrics = await executor.execute_with_lazy_outputs(
-                model=model,
-                inputs=inputs,
-                session_id=session_id,
-                return_lazy=False,  # Return concrete tensors over network
-                execution_phase=execution_phase
-            )
+            
+            # ✅ ADMISSION CONTROL: Serialize prefill to prevent "Thundering Herd"
+            # Only MAX_CONCURRENT_PREFILLS agents can prefill simultaneously
+            # Others queue up while semantic scheduler swaps idle agents to host
+            is_prefill = (execution_phase or "").lower() in {'prefill', 'llm_prefill'}
+            if is_prefill:
+                async with self.prefill_semaphore:
+                    async with self._prefill_queue_lock:
+                        self.prefill_queue_depth = self.prefill_semaphore._value
+                    logger.info(f"🔒 PREFILL ACQUIRED (queue_depth={self.prefill_queue_depth})")
+                    execution_result, execution_metrics = await executor.execute_with_lazy_outputs(
+                        model=model,
+                        inputs=inputs,
+                        session_id=session_id,
+                        return_lazy=False,  # Return concrete tensors over network
+                        execution_phase=execution_phase
+                    )
+            else:
+                # Decode can run concurrently without admission control
+                execution_result, execution_metrics = await executor.execute_with_lazy_outputs(
+                    model=model,
+                    inputs=inputs,
+                    session_id=session_id,
+                    return_lazy=False,  # Return concrete tensors over network
+                    execution_phase=execution_phase
+                )
 
-            if kv_manager and execution_phase in ('prefill', 'decode'):
+            if kv_manager and execution_phase in ('prefill', 'llm_prefill', 'decode', 'llm_decode'):
                 kv_cache = self._extract_past_key_values(execution_result)
                 if kv_cache is not None:
-                    await kv_manager.update_kv(session_id, kv_cache)
+                    try:
+                        await kv_manager.update_kv(session_id, kv_cache)
+                        logger.debug(f"✅ KV cache stored for session {session_id[:12]}")
+                        
+                        # ✅ NOW register with activity tracker (after KV is actually updated)
+                        if activity_tracker_temp and session_id_from_client:
+                            try:
+                                activity_tracker_temp.register_session(session_id_from_client)
+                                activity_tracker_temp.record_operation(session_id_from_client)
+                                logger.debug(f"✅ Session {session_id_from_client[:12]} registered for idle tracking")
+                            except Exception as e:
+                                logger.debug(f"Activity tracker registration error: {e}")
+                    except Exception as e:
+                        logger.warning(f"⚠️ Failed to store KV cache: {e}")
+                else:
+                    logger.debug(f"⚠️ No KV cache found in execution result for session {session_id[:12]}")
             
             executor_time = (time.time() - executor_start) * 1000.0
             # PHASE 1.5 FIX: Log slow executions for investigation
@@ -2298,9 +2350,11 @@ class DjinnServer:
         """
         Convert execution result into a serialization-friendly structure.
         
+        ⚠️ IMPORTANT: Never send KV cache to client - it stays on server for semantic scheduler
+        
         Preference order:
             1. Direct tensor
-            2. Dict containing tensors (e.g., {'logits': ...})
+            2. Dict containing tensors (e.g., {'logits': ...}) - EXCLUDING past_key_values
             3. Attributes on common output objects (e.g., HuggingFace)
             4. First tensor found in list/tuple structures
         """
@@ -2308,11 +2362,18 @@ class DjinnServer:
             return result
         
         if isinstance(result, dict):
-            tensor_items = {k: v for k, v in result.items() if torch.is_tensor(v)}
+            # ✅ CRITICAL: Exclude past_key_values from client response
+            # KV stays server-side for semantic scheduler to manage
+            tensor_items = {
+                k: v for k, v in result.items() 
+                if torch.is_tensor(v) and k not in ('past_key_values', 'past_key_value', 'pkv')
+            }
             if tensor_items:
                 return tensor_items
             if 'logits' in result and torch.is_tensor(result['logits']):
                 return result['logits']
+            if 'generated_ids' in result and torch.is_tensor(result['generated_ids']):
+                return result['generated_ids']
         
         logits = getattr(result, 'logits', None)
         if torch.is_tensor(logits):
@@ -2323,7 +2384,10 @@ class DjinnServer:
                 if torch.is_tensor(item):
                     return item
                 if isinstance(item, dict):
-                    tensor_items = {k: v for k, v in item.items() if torch.is_tensor(v)}
+                    tensor_items = {
+                        k: v for k, v in item.items() 
+                        if torch.is_tensor(v) and k not in ('past_key_values', 'past_key_value', 'pkv')
+                    }
                     if tensor_items:
                         return tensor_items
         

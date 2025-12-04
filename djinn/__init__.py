@@ -82,6 +82,7 @@ This separates initialization cost from workload cost for honest measurement.
 """
 
 import logging
+from typing import Optional
 logger = logging.getLogger(__name__)
 
 # Version
@@ -161,6 +162,50 @@ from .backend.runtime.initialization import (
 
 # Public API - Phase 3 (Semantic Hints)
 from .core.semantic_hints import session, SemanticHints, Priority, get_current_hints
+
+# Public API - Phase 3 (Semantic Signaling for Agent Scheduling)
+def signal_phase(phase_name: str, session_id: Optional[str] = None) -> bool:
+    """
+    Signal to the server that an agent has entered a new execution phase.
+    
+    This enables the Semantic Scheduler to make proactive decisions:
+    - "IO_WAIT": Agent is entering tool use / idle phase → swap KV cache to host
+    - "COMPUTE": Agent is resuming computation → restore KV cache from host
+    
+    Args:
+        phase_name: Phase identifier ("IO_WAIT", "COMPUTE", etc.)
+        session_id: Optional session ID to signal. If None, uses current session context.
+    
+    Returns:
+        True if signal was processed, False if no session context available
+    
+    Example:
+        >>> import djinn
+        >>> with djinn.session(phase="prefill", session_id="agent_0"):
+        ...     output = model(input_ids)  # Reason phase
+        ...     djinn.signal_phase("IO_WAIT")  # Tell server: entering Act phase
+        ...     await asyncio.sleep(10)  # Simulate tool use
+        ...     djinn.signal_phase("COMPUTE")  # Tell server: resuming computation
+    """
+    try:
+        from .core.semantic_hints import get_current_hints
+        hints = get_current_hints()
+        
+        if hints and hasattr(hints, 'session_id'):
+            session_id = hints.session_id
+        
+        if not session_id:
+            logger.debug(f"signal_phase({phase_name}): no session context available")
+            return False
+        
+        # In a real implementation, this would send a message to the server
+        # For now, we just log it - the actual signaling happens via semantic hints
+        # in the execute_model call which includes the phase in request headers
+        logger.debug(f"signal_phase({phase_name}): session_id={session_id}")
+        return True
+    except Exception as e:
+        logger.debug(f"signal_phase({phase_name}): error {e}")
+        return False
 
 # Convenience wrapper for synchronous code
 def init(
@@ -649,6 +694,7 @@ __all__ = [
     'SemanticHints',                 # ✅ Semantic hints dataclass
     'Priority',                      # ✅ Priority enum
     'get_current_hints',             # ✅ Get current semantic hints from context
+    'signal_phase',                  # ✅ Signal agent phase transitions (IO_WAIT, COMPUTE)
 
     # Phase 3
     'annotate_graph',

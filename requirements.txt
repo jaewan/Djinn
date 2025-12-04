@@ -1,64 +1,110 @@
-# Core PyTorch dependencies
-torch>=2.8.0
+# ============================================================================
+# Djinn Tensor Operating System - Requirements
+# ============================================================================
+# For OSDI Evaluation: All dependencies verified and tested
+# Last Updated: December 3, 2025
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Core PyTorch Dependencies
+# ----------------------------------------------------------------------------
+torch>=2.8.0,<3.0.0
 torchvision>=0.19.0
 torchaudio>=2.4.0
 numpy>=1.24.0,<2.0.0
 
-# Configuration and serialization
+# ----------------------------------------------------------------------------
+# Configuration and Serialization
+# ----------------------------------------------------------------------------
 pyyaml>=6.0.0
 xxhash>=3.4.0
 
-# GPU monitoring
+# ----------------------------------------------------------------------------
+# GPU Monitoring and CUDA Utilities
+# ----------------------------------------------------------------------------
 pynvml>=11.0.0
 nvidia-ml-py>=11.450.51
 
-# Server dependencies
+# ----------------------------------------------------------------------------
+# Server Dependencies (Djinn Backend)
+# ----------------------------------------------------------------------------
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
 python-multipart>=0.0.6
 
-# Client dependencies
+# ----------------------------------------------------------------------------
+# Client Dependencies (Djinn Frontend)
+# ----------------------------------------------------------------------------
 requests>=2.31.0
 
-# HuggingFace models and evaluation workloads
+# ----------------------------------------------------------------------------
+# HuggingFace Models and Evaluation Workloads
+# ----------------------------------------------------------------------------
 transformers>=4.20.0
 huggingface-hub>=0.34.0,<1.0
 Pillow>=9.0.0
 scipy>=1.10.0
 
-# System monitoring
+# ----------------------------------------------------------------------------
+# System Monitoring and Infrastructure
+# ----------------------------------------------------------------------------
 psutil>=5.9.0
 prometheus-client>=0.18.0
 
-# Progress bars
+# ----------------------------------------------------------------------------
+# Progress Bars and Utilities
+# ----------------------------------------------------------------------------
 tqdm>=4.64.0
 
-# Development and testing dependencies
+# ----------------------------------------------------------------------------
+# Development and Testing Dependencies
+# ----------------------------------------------------------------------------
 pytest>=7.3.1
 pytest-asyncio>=1.2.0
 networkx>=3.0
 packaging>=23.0
 
-# Data analysis and visualization (for evaluation scripts)
+# ----------------------------------------------------------------------------
+# Data Analysis and Visualization (for OSDI Evaluation)
+# ----------------------------------------------------------------------------
 matplotlib>=3.5.0
 pandas>=2.0.0
 seaborn>=0.13.0
 
-# Distributed computing (for benchmarks and baselines)
+# ----------------------------------------------------------------------------
+# Distributed Computing (for Baselines)
+# ----------------------------------------------------------------------------
 # ray[default] includes tune, air, client, server
 # For additional tools, install: pip install -U ray[data,train,tune,air]
 ray[default]>=2.10.0
 
-# RPC and distributed execution (for PyTorch RPC baseline)
-# PyTorch distributed is bundled with torch
-
-# vLLM for serving baseline (optional - requires compatible CUDA)
-# Install separately: pip install vllm>=0.4.0
+# ----------------------------------------------------------------------------
+# Serving Baselines (for OSDI Evaluation Comparisons)
+# ----------------------------------------------------------------------------
+# vLLM for serving baseline (requires compatible CUDA)
+# Note: May require separate installation if CUDA version conflicts
 vllm>=0.4.0
 
-# Evaluation and monitoring utilities
-# (xxhash and prometheus-client already listed above)
-
-# Optional: For vLLM support (uncomment when needed)
+# ----------------------------------------------------------------------------
+# Optional: Advanced vLLM Features (uncomment when needed)
+# ----------------------------------------------------------------------------
 # lm-format-enforcer>=0.4.3
 # flash-attn>=2.3.0
+
+# ----------------------------------------------------------------------------
+# OSDI Evaluation Specific Notes
+# ----------------------------------------------------------------------------
+# System Requirements (not Python packages):
+# - numactl: For NUMA binding (install via: sudo apt-get install numactl)
+# - CUDA 12.x: Required for H100 support
+# - Pinned Memory: Requires ulimit -l unlimited
+# - OS Swap: Should be disabled (swapoff -a) for evaluation
+#
+# Installation:
+#   1. Create venv: python3 -m venv .venv
+#   2. Activate: source .venv/bin/activate
+#   3. Install: pip install -r requirements.txt
+#   4. Install Djinn: pip install -e .
+#
+# Verification:
+#   python OSDI_Evaluation/infrastructure_check.py

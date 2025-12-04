@@ -185,13 +185,71 @@ class HybridExecutor:
             with torch.cuda.stream(exec_stream) if exec_stream else contextlib.nullcontext():
                 exec_start = time.perf_counter()
                 with torch.no_grad():
-                    # OSDI FIX: Support .generate() for fair comparison with native PyTorch baselines
-                    # Check if this is a causal LM with generation parameters
+                    # OSDI FIX: Support token-by-token generation with KV cache tracking
+                    # For semantic scheduler, we need KV caches to be extracted and stored
                     generation_params = gpu_inputs.pop('_generation_params', None)
                     if generation_params and hasattr(gpu_model, 'generate'):
-                        # Use autoregressive generation (same as native PyTorch baseline)
-                        logger.info(f"🎯 Using model.generate() with params: {generation_params}")
-                        execution_output = gpu_model.generate(**gpu_inputs, **generation_params)
+                        # ✅ FIXED: Use forward loop instead of generate() to capture KV cache
+                        logger.info(f"🎯 Using token-by-token forward loop with params: {generation_params}")
+                        
+                        # Extract generation parameters
+                        max_new_tokens = generation_params.get('max_new_tokens', 50)
+                        do_sample = generation_params.get('do_sample', False)
+                        temperature = generation_params.get('temperature', 1.0)
+                        top_p = generation_params.get('top_p', 1.0)
+                        top_k = generation_params.get('top_k', 0)
+                        
+                        # Initialize with input tokens
+                        input_ids = gpu_inputs.get('input_ids')
+                        past_key_values = gpu_inputs.get('past_key_values', None)
+                        
+                        if input_ids is None:
+                            raise ValueError("input_ids required for generation")
+                        
+                        # Token-by-token generation loop
+                        generated_ids = []
+                        for step in range(max_new_tokens):
+                            # Forward pass with KV reuse
+                            model_output = gpu_model(
+                                input_ids=input_ids,
+                                past_key_values=past_key_values,
+                                use_cache=True,
+                                return_dict=True
+                            )
+                            
+                            # Extract logits and KV cache
+                            logits = model_output.logits[:, -1:, :]  # Last token logits
+                            past_key_values = model_output.past_key_values  # Updated KV cache
+                            
+                            # Sampling
+                            if do_sample:
+                                logits = logits / temperature
+                                probs = torch.softmax(logits, dim=-1)
+                                if top_k > 0:
+                                    top_k_probs, top_k_ids = torch.topk(probs, top_k)
+                                    probs = torch.zeros_like(probs).scatter(-1, top_k_ids, top_k_probs)
+                                    probs = probs / probs.sum(dim=-1, keepdim=True)
+                                next_token = torch.multinomial(probs.squeeze(-2), num_samples=1)
+                            else:
+                                # Greedy decoding
+                                next_token = logits.argmax(dim=-1)
+                            
+                            generated_ids.append(next_token)
+                            input_ids = next_token
+                        
+                        # Concatenate all generated tokens
+                        if generated_ids:
+                            generated_tokens = torch.cat(generated_ids, dim=-1)
+                        else:
+                            generated_tokens = torch.tensor([], dtype=torch.long, device=gpu_model.device)
+                        
+                        # ✅ Return output with KV cache for semantic scheduler storage
+                        execution_output = {
+                            'generated_ids': generated_tokens,
+                            'past_key_values': past_key_values,
+                            'logits': model_output.logits  # Also include final logits
+                        }
+                        logger.debug(f"✅ Forward loop generation complete: {generated_tokens.shape}")
                     else:
                         # Standard forward pass
                         execution_output = gpu_model(**gpu_inputs)
@@ -589,6 +647,42 @@ class HybridExecutor:
                 return self.phase_executor._detect_phase(None, inputs)
             except Exception:
                 pass
+        return None
+
+    def _extract_kv_from_model(self, model: nn.Module) -> Optional[Any]:
+        """
+        Extract KV cache from model internals after generation.
+        
+        HuggingFace LLMs store KV cache in various ways:
+        - model.past_key_values (if explicitly stored)
+        - model.cache (for newer HF versions with DynamicCache)
+        - model._cache (private attribute)
+        """
+        try:
+            # Try public attributes first
+            if hasattr(model, 'past_key_values') and model.past_key_values is not None:
+                return model.past_key_values
+            if hasattr(model, 'cache') and model.cache is not None:
+                return model.cache
+            if hasattr(model, '_cache') and model._cache is not None:
+                return model._cache
+            
+            # Try model.decoder or similar (for encoder-decoder models)
+            if hasattr(model, 'decoder'):
+                decoder = model.decoder
+                if hasattr(decoder, 'cache') and decoder.cache is not None:
+                    return decoder.cache
+            
+            # Try model.model (HF models wrap actual model in .model)
+            if hasattr(model, 'model'):
+                inner_model = model.model
+                if hasattr(inner_model, 'cache') and inner_model.cache is not None:
+                    return inner_model.cache
+                if hasattr(inner_model, 'past_key_values'):
+                    return inner_model.past_key_values
+        except Exception as e:
+            logger.debug(f"Failed to extract KV cache from model: {e}")
+        
         return None
 
     def _prepare_inputs_for_phase(self, phase: Optional[ExecutionPhase], inputs: Dict[str, Any]) -> Dict[str, Any]:

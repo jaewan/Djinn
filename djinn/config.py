@@ -146,7 +146,7 @@ class VmuConfig:
     stack_ratio: float = 0.15
 
     workload_profile: str = "balanced"  # llm_inference / vision / balanced
-    default_session_arena_mb: float = 256.0
+    default_session_arena_mb: float = 64.0
     
     # Ring buffer configuration (for weight streaming)
     enable_ring_buffer: bool = False
@@ -163,7 +163,7 @@ class VmuConfig:
             data_ratio=float(os.getenv("GENIE_VMU_DATA_RATIO", 0.35)),
             stack_ratio=float(os.getenv("GENIE_VMU_STACK_RATIO", 0.15)),
             workload_profile=os.getenv("GENIE_VMU_PROFILE", "balanced"),
-            default_session_arena_mb=float(os.getenv("GENIE_VMU_SESSION_ARENA_MB", 256.0)),
+            default_session_arena_mb=float(os.getenv("GENIE_VMU_SESSION_ARENA_MB", 64.0)),
             enable_ring_buffer=os.getenv("GENIE_VMU_RING_BUFFER", "false").lower() == "true",
             ring_buffer_capacity_gb=float(os.getenv("GENIE_VMU_RING_BUFFER_GB", 48.0)),
             ring_buffer_prefetch_workers=int(os.getenv("GENIE_VMU_RING_BUFFER_WORKERS", 1)),

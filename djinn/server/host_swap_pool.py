@@ -120,30 +120,56 @@ class HostSwapPool:
             if session_id in self.swapped_sessions:
                 raise RuntimeError(f"Session {session_id} already swapped to host")
             
-            # Align offset
-            aligned_offset = (self.current_offset + self.alignment - 1) & ~(self.alignment - 1)
+            # ✅ DEFRAGMENTATION: Try to reuse freed regions before bump pointer
+            allocated_offset = None
             
-            # Check capacity
-            if aligned_offset + size_bytes > self.pool_size_bytes:
-                available = self.pool_size_bytes - aligned_offset
-                raise RuntimeError(
-                    f"Swap pool exhausted: requested {size_bytes} bytes, "
-                    f"available {available} bytes in {self.pool_size_bytes/1024**3:.1f}GB pool"
-                )
+            for idx, (free_offset, free_size) in enumerate(self._freed_regions):
+                aligned_free_offset = (free_offset + self.alignment - 1) & ~(self.alignment - 1)
+                alignment_overhead = aligned_free_offset - free_offset
+                available_after_align = free_size - alignment_overhead
+                
+                if available_after_align >= size_bytes:
+                    allocated_offset = aligned_free_offset
+                    
+                    # Update the freed region
+                    remainder_offset = aligned_free_offset + size_bytes
+                    remainder_size = free_size - alignment_overhead - size_bytes
+                    
+                    if remainder_size > 0:
+                        self._freed_regions[idx] = (remainder_offset, remainder_size)
+                    else:
+                        self._freed_regions.pop(idx)
+                    
+                    logger.debug(f"Reusing freed region: offset={allocated_offset}, size={size_bytes} bytes")
+                    break
+            
+            # If no freed region fits, use bump pointer
+            if allocated_offset is None:
+                aligned_offset = (self.current_offset + self.alignment - 1) & ~(self.alignment - 1)
+                
+                # Check capacity
+                if aligned_offset + size_bytes > self.pool_size_bytes:
+                    available = self.pool_size_bytes - aligned_offset
+                    raise RuntimeError(
+                        f"Swap pool exhausted: requested {size_bytes} bytes, "
+                        f"available {available} bytes in {self.pool_size_bytes/1024**3:.1f}GB pool"
+                    )
+                
+                allocated_offset = aligned_offset
+                self.current_offset = aligned_offset + size_bytes
             
             # Create view and track allocation
-            view = self.pool[aligned_offset:aligned_offset + size_bytes]
+            view = self.pool[allocated_offset:allocated_offset + size_bytes]
             
             import time
             mapping = SwapMapping(
                 session_id=session_id,
-                host_offset=aligned_offset,
+                host_offset=allocated_offset,
                 size_bytes=size_bytes,
                 gpu_device=gpu_device,
                 timestamp=time.time(),
             )
             self.swapped_sessions[session_id] = mapping
-            self.current_offset = aligned_offset + size_bytes
             
             # Update stats
             self.stats["swaps_performed"] += 1
@@ -156,10 +182,10 @@ class HostSwapPool:
             
             logger.debug(
                 f"Allocated swap space: session_id={session_id}, "
-                f"offset={aligned_offset}, size={size_bytes/1024**2:.1f}MB"
+                f"offset={allocated_offset}, size={size_bytes/1024**2:.1f}MB"
             )
             
-            return aligned_offset, view
+            return allocated_offset, view
     
     def get_mapping(self, session_id: str) -> Optional[SwapMapping]:
         """

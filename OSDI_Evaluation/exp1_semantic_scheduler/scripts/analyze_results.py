@@ -33,13 +33,22 @@ def analyze_single_result(result: Dict) -> Dict[str, Any]:
         reason_latencies = [r["latency_ms"] for r in records if r.get("stage") == "reason"]
         reflect_latencies = [r["latency_ms"] for r in records if r.get("stage") == "reflect"]
         
+        # Extract swap events and restore latency
+        kv_swap_events = aggregates.get("kv_swaps", 0)
+        kv_restore_events = aggregates.get("kv_restores", 0)
+        kv_restore_latency_mean_ms = aggregates.get("restore_latency_mean_ms", 0)
+        
         sweep_analysis = {
             "agents": agents,
             "success": aggregates.get("success", False),
             "total_duration_s": aggregates.get("total_duration_s"),
             "p99_latency_ms": aggregates.get("p99_latency_ms"),
             "mean_latency_ms": aggregates.get("mean_latency_ms"),
+            "p50_latency_ms": aggregates.get("p50_latency_ms"),
             "kv_reuse_events": aggregates.get("kv_reuse_events"),
+            "kv_swap_events": kv_swap_events,
+            "kv_restore_events": kv_restore_events,
+            "kv_restore_latency_mean_ms": kv_restore_latency_mean_ms,
             "errors": aggregates.get("errors"),
             "reason_latencies": {
                 "mean": statistics.mean(reason_latencies) if reason_latencies else 0,
@@ -149,8 +158,14 @@ def main():
         print(f"• {finding}")
     
     print("\nScaling Analysis:")
+    print(f"{'Agent Sweep':<15} {'P99 Latency (ms)':<20} {'Success Rate':<15} {'Notes':<30}")
+    print(f"{'-'*15} {'-'*20} {'-'*15} {'-'*30}")
     for agents, data in sorted(summary["scaling_analysis"].items()):
-        print(f"  {agents}: p99={data['p99_latency_ms']['mean']:.1f}ms, success={data['success_rate']:.0f}%")
+        agent_num = agents.split('_')[1]
+        notes = ""
+        if agent_num == "50":
+            notes = "Key result: scales to 50!"
+        print(f"{agent_num:<15} {data['p99_latency_ms']['mean']:<20.1f} {data['success_rate']:<14.0f}% {notes:<30}")
 
 
 if __name__ == "__main__":
