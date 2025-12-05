@@ -30,6 +30,7 @@ from ..backend.runtime.unified_vmu import get_vmu
 from .qos import BasicQosScheduler, QoSClass
 from .session_manager import get_session_manager
 from .multi_tenant.kv_session_manager import get_kv_session_manager
+from .memory_metrics import get_metrics
 from .diagnostics_server import DiagnosticsServer
 from .architecture_registry import get_architecture_registry
 from .kv_cache_estimator import (
@@ -1726,34 +1727,39 @@ class DjinnServer:
             
             if phase == 'IO_WAIT':
                 # Immediate eviction - bypass idle timeout
-                asyncio.create_task(self._semantic_evict(session_id))
+                # HARDENED: Add exception callback to fire-and-forget task
+                evict_task = asyncio.create_task(self._semantic_evict(session_id))
+                evict_task.add_done_callback(
+                    lambda t: self._handle_background_task_result(t, f"evict:{session_id[:12]}")
+                )
                 logger.info(f"IO_WAIT signal: scheduling eviction for {session_id[:12]}")
                 
                 # If client provided estimate, schedule proactive pre-fetch
                 if estimated_resume_ms and estimated_resume_ms > 0:
                     restore_delay_ms = max(0, estimated_resume_ms - 500)  # 500ms safety margin
-                    asyncio.create_task(
+                    prefetch_task = asyncio.create_task(
                         self._schedule_prefetch(session_id, restore_delay_ms)
+                    )
+                    prefetch_task.add_done_callback(
+                        lambda t: self._handle_background_task_result(t, f"prefetch:{session_id[:12]}")
                     )
                     logger.debug(f"Prefetch scheduled for {session_id[:12]}: "
                                f"delay={restore_delay_ms}ms (estimated_resume={estimated_resume_ms}ms)")
             
             elif phase == 'COMPUTE':
-                # ✅ RACE CONDITION FIX: Check if prefetch is already in progress
-                # If prefetch is scheduled, COMPUTE signal should skip restore (already done)
-                try:
-                    from .multi_tenant.kv_session_manager import get_kv_session_manager
-                    kv_mgr = get_kv_session_manager()
-                    if kv_mgr and session_id in kv_mgr._sessions:
-                        sess = kv_mgr._sessions[session_id]
-                        if sess.prefetch_in_progress:
-                            logger.info(f"COMPUTE signal: prefetch already in progress for {session_id[:12]}, skipping restore")
-                            return {'status': 'ok', 'phase': phase, 'session_id': session_id[:12], 'note': 'prefetch_in_progress'}
-                except Exception as e:
-                    logger.debug(f"Could not check prefetch status: {e}")
+                # HARDENED: Check prefetch status through KVSessionManager method (thread-safe)
+                kv_mgr = get_kv_session_manager()
+                if kv_mgr:
+                    prefetch_status = await kv_mgr.check_prefetch_in_progress(session_id)
+                    if prefetch_status:
+                        logger.info(f"COMPUTE signal: prefetch already in progress for {session_id[:12]}, skipping restore")
+                        return {'status': 'ok', 'phase': phase, 'session_id': session_id[:12], 'note': 'prefetch_in_progress'}
                 
-                # Normal reactive restore
-                asyncio.create_task(self._semantic_restore(session_id))
+                # Normal reactive restore with exception handling
+                restore_task = asyncio.create_task(self._semantic_restore(session_id))
+                restore_task.add_done_callback(
+                    lambda t: self._handle_background_task_result(t, f"restore:{session_id[:12]}")
+                )
                 logger.info(f"COMPUTE signal: scheduling restore for {session_id[:12]}")
             
             else:
@@ -1764,6 +1770,23 @@ class DjinnServer:
         except Exception as e:
             logger.error(f"Signal phase handler error: {e}")
             return {'status': 'error', 'message': str(e)}
+    
+    def _handle_background_task_result(self, task: asyncio.Task, task_name: str) -> None:
+        """
+        Handle completion of fire-and-forget background tasks.
+        
+        HARDENED: Ensures exceptions in background tasks are logged, not silently swallowed.
+        """
+        try:
+            # Check if task had an exception
+            exc = task.exception()
+            if exc is not None:
+                logger.error(f"Background task '{task_name}' failed with exception: {exc}", exc_info=exc)
+        except asyncio.CancelledError:
+            logger.debug(f"Background task '{task_name}' was cancelled")
+        except asyncio.InvalidStateError:
+            # Task not done yet (shouldn't happen in done callback)
+            pass
     
     async def _semantic_evict(self, session_id: str) -> None:
         """Immediate eviction triggered by IO_WAIT signal."""
@@ -1807,15 +1830,12 @@ class DjinnServer:
     
     async def _schedule_prefetch(self, session_id: str, delay_ms: int) -> None:
         """Schedule proactive KV restore ahead of expected compute resumption."""
+        kv_manager = get_kv_session_manager()
+        
         try:
-            import time
-            from .multi_tenant.kv_session_manager import get_kv_session_manager
-            from .memory_metrics import get_metrics
-            
-            # ✅ RACE CONDITION FIX: Mark prefetch as in progress
-            kv_manager = get_kv_session_manager()
-            if kv_manager and session_id in kv_manager._sessions:
-                kv_manager._sessions[session_id].prefetch_in_progress = True
+            # HARDENED: Use thread-safe setter for prefetch flag
+            if kv_manager:
+                await kv_manager.set_prefetch_in_progress(session_id, True)
                 logger.debug(f"Prefetch marked as in_progress for {session_id[:12]}")
             
             # Wait for the specified delay
@@ -1833,18 +1853,17 @@ class DjinnServer:
                 metrics = get_metrics()
                 metrics.record_semantic_prefetch(latency_ms)
                 
-                # ✅ Clear the prefetch_in_progress flag
-                if session_id in kv_manager._sessions:
-                    kv_manager._sessions[session_id].prefetch_in_progress = False
-                    logger.debug(f"Prefetch completed and cleared for {session_id[:12]}")
+                # HARDENED: Use thread-safe setter to clear flag
+                await kv_manager.set_prefetch_in_progress(session_id, False)
+                logger.debug(f"Prefetch completed and cleared for {session_id[:12]}")
+                
         except Exception as e:
-            logger.debug(f"Scheduled prefetch error: {e}")
-            # ✅ Ensure flag is cleared even on error
+            logger.error(f"Scheduled prefetch error for {session_id[:12]}: {e}")
+            # HARDENED: Ensure flag is cleared even on error
             try:
-                kv_manager = get_kv_session_manager()
-                if kv_manager and session_id in kv_manager._sessions:
-                    kv_manager._sessions[session_id].prefetch_in_progress = False
-            except:
+                if kv_manager:
+                    await kv_manager.set_prefetch_in_progress(session_id, False)
+            except Exception:
                 pass
     
     async def _handle_execute_batch(self, request: Dict) -> Dict:

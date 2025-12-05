@@ -32,9 +32,6 @@ class KVSession:
     bytes_used: int = 0
     step_count: int = 0
     is_swapped: bool = False  # Whether KV is on host (Phase 3)
-    swap_offset: Optional[int] = None  # Offset in host swap pool (Phase 3)
-    swap_bytes_actual: int = 0  # Actual bytes swapped (captured during eviction for restore)
-    kv_structure_metadata: Optional[Dict[str, Any]] = None  # Metadata to reconstruct KV structure on restore
     prefetch_in_progress: bool = False  # ✅ Prevent race condition: skip COMPUTE restore if prefetch already scheduled
 
 
@@ -272,6 +269,44 @@ class KVSessionManager:
             sess = self._sessions.get(session_id)
             return sess.kv_cache if sess else None
     
+    async def check_prefetch_in_progress(self, session_id: str) -> bool:
+        """
+        Thread-safe check if prefetch is in progress for a session.
+        
+        HARDENED: Uses proper async lock instead of direct dict access.
+        
+        Args:
+            session_id: Session to check
+            
+        Returns:
+            True if prefetch is in progress, False otherwise
+        """
+        async with self._lock:
+            sess = self._sessions.get(session_id)
+            if sess is None:
+                return False
+            return sess.prefetch_in_progress
+    
+    async def set_prefetch_in_progress(self, session_id: str, value: bool) -> bool:
+        """
+        Thread-safe setter for prefetch_in_progress flag.
+        
+        HARDENED: Uses proper async lock instead of direct dict access.
+        
+        Args:
+            session_id: Session to update
+            value: New value for prefetch_in_progress
+            
+        Returns:
+            True if session exists and was updated, False otherwise
+        """
+        async with self._lock:
+            sess = self._sessions.get(session_id)
+            if sess is None:
+                return False
+            sess.prefetch_in_progress = value
+            return True
+    
     def get_stats(self) -> Dict:
         """Get session manager statistics."""
         return {
@@ -279,6 +314,102 @@ class KVSessionManager:
             "active_sessions": len(self._sessions),
             "kv_bytes_pinned_mb": self.stats["kv_bytes_pinned"] / (1024 * 1024),
         }
+    
+    async def audit_resources(self) -> Dict:
+        """
+        HARDENED: Audit resources to detect leaks between sessions and swap pool.
+        
+        Checks for:
+        - Orphaned swaps (in swap pool but session doesn't exist)
+        - Swapped sessions without swap pool entry
+        - Sessions marked swapped but with kv_cache still set
+        
+        Returns:
+            Audit report with any detected issues
+        """
+        from djinn.server.host_swap_pool_v2 import get_swap_pool
+        
+        issues = []
+        
+        async with self._lock:
+            session_ids = set(self._sessions.keys())
+            swapped_session_ids = {sid for sid, sess in self._sessions.items() if sess.is_swapped}
+            sessions_with_kv = {sid for sid, sess in self._sessions.items() if sess.kv_cache is not None}
+            
+            swap_pool = get_swap_pool()
+            swap_pool_ids = set(swap_pool.swapped_sessions.keys())
+            
+            # Check 1: Orphaned swaps (in pool but no session)
+            orphaned_swaps = swap_pool_ids - session_ids
+            if orphaned_swaps:
+                issues.append({
+                    "type": "orphaned_swaps",
+                    "count": len(orphaned_swaps),
+                    "session_ids": list(orphaned_swaps)[:5],  # First 5
+                })
+                logger.warning(f"Resource audit: {len(orphaned_swaps)} orphaned swaps in pool")
+            
+            # Check 2: Session marked swapped but not in pool
+            missing_swaps = swapped_session_ids - swap_pool_ids
+            if missing_swaps:
+                issues.append({
+                    "type": "missing_swaps",
+                    "count": len(missing_swaps),
+                    "session_ids": list(missing_swaps)[:5],
+                })
+                logger.warning(f"Resource audit: {len(missing_swaps)} sessions marked swapped but not in pool")
+            
+            # Check 3: Session swapped but still has kv_cache (should be None)
+            bad_state_sessions = swapped_session_ids & sessions_with_kv
+            if bad_state_sessions:
+                issues.append({
+                    "type": "swapped_with_kv_cache",
+                    "count": len(bad_state_sessions),
+                    "session_ids": list(bad_state_sessions)[:5],
+                })
+                logger.warning(f"Resource audit: {len(bad_state_sessions)} swapped sessions still have kv_cache")
+        
+        return {
+            "timestamp": time.time(),
+            "total_sessions": len(session_ids),
+            "total_swapped": len(swapped_session_ids),
+            "swap_pool_entries": len(swap_pool_ids),
+            "issues": issues,
+            "healthy": len(issues) == 0,
+        }
+    
+    async def cleanup_orphaned_resources(self) -> int:
+        """
+        HARDENED: Clean up orphaned resources detected by audit.
+        
+        Returns:
+            Number of resources cleaned up
+        """
+        from djinn.server.host_swap_pool_v2 import get_swap_pool
+        
+        cleaned = 0
+        
+        async with self._lock:
+            session_ids = set(self._sessions.keys())
+            swap_pool = get_swap_pool()
+            
+            # Clean orphaned swaps
+            orphaned = set(swap_pool.swapped_sessions.keys()) - session_ids
+            for sid in orphaned:
+                with swap_pool._lock:
+                    if sid in swap_pool.swapped_sessions:
+                        del swap_pool.swapped_sessions[sid]
+                        cleaned += 1
+                        logger.info(f"Cleaned orphaned swap: {sid[:12]}")
+            
+            # Fix sessions marked swapped but not in pool
+            for sid, sess in self._sessions.items():
+                if sess.is_swapped and sid not in swap_pool.swapped_sessions:
+                    sess.is_swapped = False
+                    cleaned += 1
+                    logger.info(f"Fixed bad swap state for session: {sid[:12]}")
+        
+        return cleaned
 
     def _move_structure_to_device(self, data: Any, device: torch.device) -> Any:
         """

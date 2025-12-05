@@ -221,11 +221,13 @@ def signal_phase(
                     # ✅ FIX: Don't silently fail - log and return False
                     logger.warning(f"signal_phase({phase_name}): no running event loop, cannot send signal")
                     return False
+            else:
+                # ✅ FIX: Explicit return False when no coordinator
+                logger.debug(f"signal_phase({phase_name}): no coordinator available")
+                return False
         except Exception as e:
             logger.debug(f"signal_phase({phase_name}): coordinator error {e}")
             return False
-        
-        return True
     except Exception as e:
         logger.debug(f"signal_phase({phase_name}): error {e}")
         return False
