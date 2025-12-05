@@ -86,12 +86,11 @@ class MessageHandlerRegistry:
 # Message type constants
 class MessageType:
     """Message type constants for TCP server."""
-    EXECUTE_SUBGRAPH = 0x01  # Legacy
-    EXECUTE_OPERATION = 0x02  # Legacy
     EXECUTE_SUBGRAPH_COORDINATOR = 0x03  # Coordinator subgraph
     CACHE_QUERY = 0x04  # Cache query
     REGISTER_MODEL = 0x05  # Model registration
     EXECUTE_MODEL = 0x06  # Model execution
+    EXECUTE_WITH_BREAKPOINT = 0x07  # Breakpoint execution
     ERROR = 0xFF  # Error response
 
 
