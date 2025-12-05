@@ -85,6 +85,9 @@ ray[default]>=2.10.0
 # Note: May require separate installation if CUDA version conflicts
 vllm>=0.4.0
 
+# DeepSpeed for inference baseline comparison (ZeRO-Inference)
+deepspeed>=0.12.0
+
 # ----------------------------------------------------------------------------
 # Optional: Advanced vLLM Features (uncomment when needed)
 # ----------------------------------------------------------------------------

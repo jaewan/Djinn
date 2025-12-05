@@ -86,7 +86,8 @@ def load_model_with_deepspeed(
     """
     Load model with DeepSpeed ZeRO-Inference for memory-constrained inference.
     
-    Uses device_map="auto" for CPU-GPU offloading with DeepSpeed backend.
+    Uses DeepSpeed's init_inference() for optimized inference with kernel injection.
+    For true NVMe offloading, requires distributed launch with ds config.
     """
     logger.info(f"Loading {model_id} with DeepSpeed")
     
@@ -108,24 +109,49 @@ def load_model_with_deepspeed(
     start = time.perf_counter()
     
     try:
-        # Load model with device_map="auto" for automatic CPU/GPU partitioning
+        # Step 1: Load model to CPU with low memory usage
+        logger.info("  Step 1/3: Loading model checkpoint to CPU...")
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
             torch_dtype=torch_dtype,
-            device_map="auto",
             low_cpu_mem_usage=True,
-            offload_folder="/tmp/hf_offload",
         )
         
-        load_time = time.perf_counter() - start
-        logger.info(f"✅ Model loaded in {load_time:.1f}s")
+        logger.info("  Step 2/3: Initializing DeepSpeed Inference engine...")
         
-        # Note: DeepSpeed ZeRO-3 with NVMe offloading requires distributed training setup
-        # For inference-only, device_map="auto" is sufficient for memory-constrained scenarios
+        # Step 2: Wrap with DeepSpeed Inference for kernel injection and optimization
+        # This uses DeepSpeed's optimized kernels for attention, MLP, etc.
+        model = deepspeed.init_inference(
+            model,
+            mp_size=1,                          # Single GPU
+            dtype=torch_dtype,
+            replace_with_kernel_inject=True,   # Use optimized kernels (critical for speed)
+            enable_cuda_graph=False,            # Disable for inference (can cause issues)
+        )
+        
+        # Extract module from DeepSpeed wrapper
+        model = model.module if hasattr(model, 'module') else model
+        
+        load_time = time.perf_counter() - start
+        logger.info(f"  Step 3/3: Model ready")
+        logger.info(f"✅ Model initialized with DeepSpeed Inference in {load_time:.1f}s")
         
     except Exception as e:
-        logger.error(f"❌ Failed to load model: {e}")
-        raise
+        logger.error(f"❌ Failed to load model with DeepSpeed: {e}")
+        logger.info("   Falling back to standard inference (slower)...")
+        
+        # Fallback: Try loading without DeepSpeed
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                torch_dtype=torch_dtype,
+                device_map="auto",
+                low_cpu_mem_usage=True,
+            )
+            logger.warning("⚠️  Using standard inference (not optimized)")
+        except Exception as e2:
+            logger.error(f"❌ Failed to load model: {e2}")
+            raise
     
     return model, tokenizer
 
