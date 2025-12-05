@@ -209,7 +209,10 @@ async def main():
             await asyncio.sleep(1)
     except KeyboardInterrupt:
         logger.info("\n🛑 Shutting down...")
-        # TODO: Add proper shutdown
+        # Graceful shutdown: close server connections
+        if server:
+            await server.shutdown()
+            logger.info("✅ Server connections closed")
     except Exception as e:
         logger.error(f"Server startup failed: {e}")
         import traceback

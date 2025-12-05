@@ -2088,9 +2088,15 @@ class DjinnServer:
         """Handle cache query request - check which tensor identifiers are cached."""
         try:
             identifiers = request.get('identifiers', [])
-            # For now, return empty list (no cached tensors)
-            # TODO: Implement actual cache checking logic
+            # Check GPU cache for each identifier
             cached_identifiers = []
+            if server_state and server_state.gpu_cache:
+                from .gpu_cache import get_global_cache
+                cache = get_global_cache()
+                for identifier in identifiers:
+                    # Check if identifier is in cache (legacy or new format)
+                    if hasattr(cache, 'cache_new') and identifier in cache.cache_new:
+                        cached_identifiers.append(identifier)
             return {
                 'status': 'success',
                 'cached_identifiers': cached_identifiers
