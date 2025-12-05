@@ -218,15 +218,45 @@ class BreakpointExecutor:
                 f"[{session_id}] Continuing execution from layer {breakpoint_layer_index + 1}..."
             )
             
-            # ✅ CORRECTED: Use restored activations for final output
-            # In a real implementation, we would continue from layer N+1
-            # For validation, we return the saved output from checkpoint
+            # ✅ PROPER SEMANTICS: Continue from layer N+1 using restored activations
+            # Option A: Continue forward pass from layer N+1
             if activations and 'output' in activations:
-                model_output = activations['output']
-                logger.info(f"[{session_id}] Using restored activations from checkpoint")
+                try:
+                    # Get the intermediate activation from checkpoint
+                    checkpoint_activation = activations['output']
+                    logger.info(
+                        f"[{session_id}] Restored activation shape: {checkpoint_activation.shape}, "
+                        f"device: {checkpoint_activation.device}"
+                    )
+                    
+                    # Extract layers and continue from layer_index + 1
+                    layer_index = breakpoint_layer_index
+                    model_output = self._continue_from_layer(
+                        model=model,
+                        layer_index=layer_index,
+                        checkpoint_activation=checkpoint_activation,
+                        session_id=session_id
+                    )
+                    logger.info(
+                        f"[{session_id}] Continued execution from layer {layer_index + 1} "
+                        f"to final output"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"[{session_id}] Failed to continue from checkpoint: {e}. "
+                        f"Falling back to full model execution."
+                    )
+                    # Fallback: run full model
+                    with torch.no_grad():
+                        if isinstance(inputs_on_device, dict):
+                            model_output = model(**inputs_on_device)
+                        elif isinstance(inputs_on_device, torch.Tensor):
+                            model_output = model(inputs_on_device)
+                        else:
+                            model_output = model(*inputs_on_device)
             else:
-                # Fallback: run full model for reference
-                logger.info(f"[{session_id}] No saved activations, running full model for reference")
+                # No saved activations: run full model for reference
+                logger.info(f"[{session_id}] No saved activations, running full model")
                 with torch.no_grad():
                     if isinstance(inputs_on_device, dict):
                         model_output = model(**inputs_on_device)
@@ -283,6 +313,87 @@ class BreakpointExecutor:
                 logger.warning(f"Error removing hooks: {e}")
             logger.debug(f"[{session_id}] Cleaned up breakpoint state and removed hooks")
     
+    def _continue_from_layer(
+        self,
+        model: nn.Module,
+        layer_index: int,
+        checkpoint_activation: torch.Tensor,
+        session_id: str
+    ) -> Any:
+        """
+        Continue model execution from layer_index + 1 using restored activation.
+        
+        Args:
+            model: The model
+            layer_index: Index of layer where we paused (0-based)
+            checkpoint_activation: Activation tensor from layer_index's output
+            session_id: Session identifier for logging
+        
+        Returns:
+            Final model output (logits or prediction)
+        
+        Raises:
+            RuntimeError: If unable to extract layers or continue execution
+        """
+        from djinn.backend.runtime.breakpoint_hooks import BreakpointHookManager
+        
+        # Extract layers using existing pattern
+        hook_manager = BreakpointHookManager(
+            model=model,
+            breakpoint_layer_index=layer_index,
+            session_id=session_id
+        )
+        layers = hook_manager.layers
+        
+        if not layers or layer_index >= len(layers):
+            raise RuntimeError(
+                f"Cannot extract layers: {len(layers) if layers else 0} layers found, "
+                f"breakpoint at {layer_index}"
+            )
+        
+        # Execute layers from layer_index + 1 to end
+        current_output = checkpoint_activation
+        
+        logger.debug(
+            f"[{session_id}] Starting continuation from layer {layer_index + 1}/{len(layers)} "
+            f"with activation shape {current_output.shape}"
+        )
+        
+        with torch.no_grad():
+            # Pass through remaining layers
+            for i in range(layer_index + 1, len(layers)):
+                layer = layers[i]
+                try:
+                    current_output = layer(current_output)
+                    logger.debug(
+                        f"[{session_id}] Layer {i} output shape: {current_output.shape if hasattr(current_output, 'shape') else type(current_output)}"
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"[{session_id}] Failed at layer {i}: {e}"
+                    )
+                    raise RuntimeError(f"Failed executing layer {i}: {e}") from e
+        
+        # After passing through all transformer layers, apply final layer norm and LM head
+        # This is specific to GPT-2 architecture
+        if hasattr(model, 'transformer') and hasattr(model.transformer, 'ln_f'):
+            # Apply final layer norm
+            current_output = model.transformer.ln_f(current_output)
+            logger.debug(f"[{session_id}] Applied final layer norm")
+        
+        if hasattr(model, 'lm_head'):
+            # Apply language model head to get logits
+            current_output = model.lm_head(current_output)
+            logger.debug(
+                f"[{session_id}] Applied LM head, final logits shape: {current_output.shape}"
+            )
+        elif hasattr(model, 'score'):
+            # Alternative name for LM head in some models
+            current_output = model.score(current_output)
+            logger.debug(f"[{session_id}] Applied score layer")
+        
+        return current_output
+
     def _wait_for_resume(
         self,
         session_id: str,
