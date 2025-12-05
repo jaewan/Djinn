@@ -93,11 +93,12 @@ class ServerState:
             self.device = torch.device("cpu")
             logger.warning("⚠️  No GPU available, using CPU")
         
-        # Initialize GPU cache
+        # Initialize GPU cache with the correct device
         try:
             from .gpu_cache import get_global_cache
-            self.gpu_cache = get_global_cache(max_models=5)
-            logger.info("✅ GPU cache initialized (max_models=5)")
+            # Pass the device to ensure GPU cache uses the correct GPU
+            self.gpu_cache = get_global_cache(max_models=5, device=self.device)
+            logger.info(f"✅ GPU cache initialized (max_models=5, device={self.device})")
         except Exception as e:
             logger.warning(f"⚠️  Failed to initialize GPU cache: {e}")
             self.gpu_cache = None
