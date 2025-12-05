@@ -359,11 +359,11 @@ class SimpleGPUCache:
 _global_cache: Optional[SimpleGPUCache] = None
 
 
-def get_global_cache(max_models: int = 5) -> SimpleGPUCache:
+def get_global_cache(max_models: int = 5, device: Optional[torch.device] = None) -> SimpleGPUCache:
     """Get or create the global GPU cache instance."""
     global _global_cache
     if _global_cache is None:
-        _global_cache = SimpleGPUCache(max_models=max_models)
+        _global_cache = SimpleGPUCache(max_models=max_models, device=device)
     return _global_cache
 
 
