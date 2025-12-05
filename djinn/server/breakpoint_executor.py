@@ -246,8 +246,8 @@ class BreakpointExecutor:
             )
             
             overhead_percent = (
-                (metrics["total_overhead_ms"] / (execution_time_full * 1000)) * 100
-                if execution_time_full > 0 else 0.0
+                (metrics["total_overhead_ms"] / (total_execution_time * 1000)) * 100
+                if total_execution_time > 0 else 0.0
             )
             metrics["overhead_percent"] = overhead_percent
             
