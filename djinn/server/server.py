@@ -485,14 +485,10 @@ class DjinnServer:
                 t1 = time.time()
                 from .server_state import ServerState
                 server_state = ServerState.get_instance()
-                # Use the GPU specified in ServerConfig, or first available GPU
-                if self.config.gpu_indices and len(self.config.gpu_indices) > 0:
-                    preferred_gpu = self.config.gpu_indices[0]
-                    logger.info(f"Using GPU from ServerConfig: {preferred_gpu}")
-                else:
-                    preferred_gpu = self.capabilities.gpu_indices[0] if self.capabilities.gpu_indices else 0
-                    logger.info(f"Using GPU from capabilities: {preferred_gpu}")
-                server_state.initialize(gpu_id=preferred_gpu)
+                # After CUDA_VISIBLE_DEVICES is set, PyTorch sees only the selected GPU as ID 0
+                # So always use gpu_id=0 for ServerState.initialize()
+                logger.info(f"Using GPU ID 0 (after CUDA_VISIBLE_DEVICES restriction)")
+                server_state.initialize(gpu_id=0)
                 t2 = time.time()
                 logger.info(f"[STARTUP] T+{t2-start_time:.1f}s: ServerState initialized with GPU {preferred_gpu} ({(t2-t1)*1000:.0f}ms)")
             except Exception as init_err:
@@ -614,9 +610,8 @@ class DjinnServer:
             # 4. Initialize optimization executor (with tensor registry and fusion compiler)
             t1 = time.time()
             logger.info(f"[STARTUP] T+{t1-start_time:.1f}s: Initializing optimization executor...")
-            # Use the GPU specified in ServerConfig
-            executor_gpu = self.config.gpu_indices[0] if self.config.gpu_indices and len(self.config.gpu_indices) > 0 else 0
-            self.executor = OptimizationExecutor(gpu_id=executor_gpu)
+            # Use GPU ID 0 (after CUDA_VISIBLE_DEVICES restriction)
+            self.executor = OptimizationExecutor(gpu_id=0)
             t2 = time.time()
             logger.info(f"[STARTUP] T+{t2-start_time:.1f}s: Optimization executor ready (GPU {self.executor.gpu_id}) ({(t2-t1)*1000:.0f}ms)")
 
