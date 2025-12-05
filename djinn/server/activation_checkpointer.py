@@ -85,6 +85,9 @@ class ActivationCheckpointer:
         self.current_offset = 0
         self._freed_regions: List[Tuple[int, int]] = []  # (offset, size) for fragmentation tracking
         
+        # Async flag for DMA transfers
+        self.enable_async = True  # Enable async restoration via DMA transfers
+        
         # Statistics
         self.stats = {
             "checkpoints_created": 0,
