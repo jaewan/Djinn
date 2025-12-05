@@ -88,22 +88,19 @@ class TCPTransport(Transport):
         self._batch_size_threshold = self._central_config.network.batch_size_threshold
 
     async def initialize(self) -> bool:
-        """Start TCP receiver (server-side).
+        """Initialize TCP transport.
         
         NOTE: Message-type protocol (REGISTER_MODEL, EXECUTE_MODEL) is handled by DjinnServer
-        on data_port. TCPTransport only handles old tensor transfer protocol if needed.
-        For Phase 3, we skip starting a separate server to avoid port conflicts.
+        on data_port. This transport doesn't start a separate server to avoid port conflicts.
         """
         try:
-            # ✅ FIX: Don't start server if is_server=False (client-side transport)
-            # or if main server is already handling data_port
+            # Don't start server if is_server=False (client-side transport)
             if not getattr(self.config, 'is_server', False):
                 logger.debug("TCP transport: client-side, not starting server")
                 self.server = None
                 return True
             
-            # ✅ FIX: Skip starting server - main DjinnServer handles data_port for message-type protocol
-            # Old tensor transfer protocol is deprecated
+            # Skip starting server - main DjinnServer handles data_port for message-type protocol
             logger.info(f"TCP transport initialized (server-side, but not starting separate listener)")
             logger.info(f"Message-type protocol handled by DjinnServer on data_port {self.data_port}")
             self.server = None
@@ -395,31 +392,6 @@ class TCPTransport(Transport):
         if hasattr(self, '_connection_pool'):
             return self._connection_pool.get_stats()
         return {'error': 'Connection pool not available'}
-
-    async def _handle_connection(
-        self,
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter
-    ):
-        """
-        Handle incoming connections - route to appropriate protocol handler.
-        
-        ⚠️  NOTE: This method is currently DEAD CODE.
-        TCPTransport server is disabled (initialize() sets self.server = None).
-        All message-type protocol (REGISTER_MODEL, EXECUTE_MODEL) is handled by DjinnServer.
-        Old tensor transfer protocol is deprecated.
-        
-        This method is kept for potential future use if we need to re-enable
-        TCPTransport server for backward compatibility or special use cases.
-        """
-        # ✅ DEAD CODE: This method is never called because TCPTransport server is disabled.
-        # Keeping for potential future use, but currently unreachable.
-        addr = writer.get_extra_info('peername')
-        logger.warning(f"⚠️  TCPTransport._handle_connection called (unexpected) from {addr}")
-        raise RuntimeError(
-            "TCPTransport._handle_connection should not be called. "
-            "TCPTransport server is disabled. Use DjinnServer for message-type protocol."
-        )
 
     # ✅ OPTIMIZATION: Operation batching methods
     async def _flush_batch(self, target: str):
