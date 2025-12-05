@@ -137,15 +137,29 @@ class BreakpointExecutor:
                 f"[{session_id}] Starting execution with breakpoint at layer {breakpoint_layer_index}"
             )
             
+            # Get model device
+            model_device = next(model.parameters()).device if list(model.parameters()) else torch.device('cpu')
+            logger.debug(f"[{session_id}] Model device: {model_device}")
+            
+            # Move inputs to model device
+            if isinstance(inputs, dict):
+                inputs_on_device = {k: v.to(model_device) if isinstance(v, torch.Tensor) else v 
+                                    for k, v in inputs.items()}
+            elif isinstance(inputs, torch.Tensor):
+                inputs_on_device = inputs.to(model_device)
+            else:
+                inputs_on_device = [v.to(model_device) if isinstance(v, torch.Tensor) else v 
+                                   for v in inputs]
+            
             # Execute model (will pause at breakpoint via hook)
             # Handle both dict inputs (for transformers) and direct tensors (for Sequential)
             with torch.no_grad():
-                if isinstance(inputs, dict):
-                    model_output = model(**inputs)
-                elif isinstance(inputs, torch.Tensor):
-                    model_output = model(inputs)
+                if isinstance(inputs_on_device, dict):
+                    model_output = model(**inputs_on_device)
+                elif isinstance(inputs_on_device, torch.Tensor):
+                    model_output = model(inputs_on_device)
                 else:
-                    model_output = model(*inputs)
+                    model_output = model(*inputs_on_device)
             
             # Check if we hit the breakpoint
             breakpoint = manager.get_breakpoint(session_id)
@@ -214,7 +228,12 @@ class BreakpointExecutor:
                 # Fallback: run full model for reference
                 logger.info(f"[{session_id}] No saved activations, running full model for reference")
                 with torch.no_grad():
-                    model_output = model(**inputs)
+                    if isinstance(inputs_on_device, dict):
+                        model_output = model(**inputs_on_device)
+                    elif isinstance(inputs_on_device, torch.Tensor):
+                        model_output = model(inputs_on_device)
+                    else:
+                        model_output = model(*inputs_on_device)
             
             metrics["model_output"] = model_output
             

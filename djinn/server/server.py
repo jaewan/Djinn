@@ -468,27 +468,44 @@ class DjinnServer:
     async def start(self) -> bool:
         """Start the Djinn server."""
         try:
+            import time
+            start_time = time.time()
             logger.info(f"Starting Djinn server: {self.node_id}")
+            logger.info(f"[STARTUP] T+0.0s: Initialization beginning")
 
             # 1. Discover capabilities
             logger.info("Discovering capabilities...")
+            t1 = time.time()
             self.capabilities = CapabilityProvider.discover()
-            logger.info(f"✓ Found {self.capabilities.gpu_count} GPUs")
+            t2 = time.time()
+            logger.info(f"[STARTUP] T+{t2-start_time:.1f}s: Discovered {self.capabilities.gpu_count} GPUs ({(t2-t1)*1000:.0f}ms)")
 
             # Initialize global server state so warmup + diagnostics know which GPU to use
             try:
+                t1 = time.time()
                 from .server_state import ServerState
                 server_state = ServerState.get_instance()
-                preferred_gpu = self.capabilities.gpu_indices[0] if self.capabilities.gpu_indices else 0
+                # Use the GPU specified in ServerConfig, or first available GPU
+                if self.config.gpu_indices and len(self.config.gpu_indices) > 0:
+                    preferred_gpu = self.config.gpu_indices[0]
+                    logger.info(f"Using GPU from ServerConfig: {preferred_gpu}")
+                else:
+                    preferred_gpu = self.capabilities.gpu_indices[0] if self.capabilities.gpu_indices else 0
+                    logger.info(f"Using GPU from capabilities: {preferred_gpu}")
                 server_state.initialize(gpu_id=preferred_gpu)
+                t2 = time.time()
+                logger.info(f"[STARTUP] T+{t2-start_time:.1f}s: ServerState initialized with GPU {preferred_gpu} ({(t2-t1)*1000:.0f}ms)")
             except Exception as init_err:
-                logger.warning(f"⚠️  Failed to initialize server state GPU context: {init_err}")
+                logger.warning(f"[STARTUP] ⚠️  Failed to initialize server state GPU context: {init_err}")
+                import traceback
+                logger.warning(traceback.format_exc())
 
+            t1 = time.time()
             if os.getenv("GENIE_SKIP_TCP_GATEWAY", "0") == "1":
                 logger.info("Skipping built-in TCP gateway (GENIE_SKIP_TCP_GATEWAY=1)")
             else:
                 # 2. Start TCP server for listening to incoming operation requests
-                logger.info("Starting TCP server for operation requests...")
+                logger.info(f"[STARTUP] T+{t1-start_time:.1f}s: Starting TCP server for operation requests...")
                 # Configure socket options for high-performance network transfer
                 async def optimize_connection(reader, writer):
                     """Optimize incoming connection with Phase 3 TCP optimizations."""
@@ -550,9 +567,11 @@ class DjinnServer:
                 # Log which port we're using
                 if actual_port != self.data_port:
                     logger.warning(f"TCP server bound to port {actual_port} instead of data_port {self.data_port}")
-                logger.info(f"✓ TCP server listening on port {actual_port} for message-type protocol (REGISTER_MODEL, EXECUTE_MODEL, etc.)")
+                t2 = time.time()
+                logger.info(f"[STARTUP] T+{t2-start_time:.1f}s: TCP server listening on port {actual_port} ({(t2-t1)*1000:.0f}ms)")
 
             # Set up transport for handling operation requests and sending results
+            t1 = time.time()
             from .transport.tcp_transport import TCPTransport
             from ..core.coordinator import CoordinatorConfig
 
@@ -567,6 +586,7 @@ class DjinnServer:
             )
 
             # Initialize transport that can handle both incoming requests and outgoing results
+            logger.debug(f"[STARTUP] T+{t1-start_time:.1f}s: Initializing TCPTransport...")
             self.transport = TCPTransport(server_config)
             await self.transport.initialize()
 
@@ -585,32 +605,43 @@ class DjinnServer:
 
             self.result_transport = TCPTransport(result_config)
             # Don't initialize as server - this is for sending results only
-            logger.info("✓ Server transport with operation callback wired")
-            logger.info("✓ Result transport configured")
+            t2 = time.time()
+            logger.info(f"[STARTUP] T+{t2-start_time:.1f}s: Transport initialized ({(t2-t1)*1000:.0f}ms)")
 
             # Server doesn't need control plane for basic operation
             # Control plane is handled by the coordinator if needed
 
             # 4. Initialize optimization executor (with tensor registry and fusion compiler)
-            logger.info("Initializing optimization executor...")
-            self.executor = OptimizationExecutor(gpu_id=0)  # Use first GPU
-            logger.info(f"✓ Optimization executor ready (GPU {self.executor.gpu_id}, Registry: enabled, Fusion: enabled)")
+            t1 = time.time()
+            logger.info(f"[STARTUP] T+{t1-start_time:.1f}s: Initializing optimization executor...")
+            # Use the GPU specified in ServerConfig
+            executor_gpu = self.config.gpu_indices[0] if self.config.gpu_indices and len(self.config.gpu_indices) > 0 else 0
+            self.executor = OptimizationExecutor(gpu_id=executor_gpu)
+            t2 = time.time()
+            logger.info(f"[STARTUP] T+{t2-start_time:.1f}s: Optimization executor ready (GPU {self.executor.gpu_id}) ({(t2-t1)*1000:.0f}ms)")
 
             self.is_running = True
+            t3 = time.time()
             logger.info(f"\n🎉 Djinn server ready on {self.node_id}")
             logger.info(f"   Control plane: {self.control_port}")
             logger.info(f"   Data plane: {self.data_port}")
             logger.info(f"   GPUs: {len(self.capabilities.gpu_indices)}")
             logger.info(f"   Memory: {self.capabilities.total_memory_gb}GB")
+            logger.info(f"[STARTUP] T+{t3-start_time:.1f}s: Core initialization complete")
 
             # Start background tasks
+            logger.debug(f"[STARTUP] T+{time.time()-start_time:.1f}s: Starting background tasks...")
             asyncio.create_task(self._heartbeat_loop())
             asyncio.create_task(self._transfer_handler_loop())
             
             # ✅ Phase 3: Start health reporting to global coordinator
+            logger.debug(f"[STARTUP] T+{time.time()-start_time:.1f}s: Starting health reporting...")
             await self._start_health_reporting()
+            logger.debug(f"[STARTUP] T+{time.time()-start_time:.1f}s: Starting diagnostics server...")
             await self._start_diagnostics_server()
 
+            total_time = time.time() - start_time
+            logger.info(f"[STARTUP] ✅ Server startup complete in {total_time:.1f}s")
             return True
 
         except Exception as e:

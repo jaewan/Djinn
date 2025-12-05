@@ -73,18 +73,12 @@ class ActivationCheckpointer:
         self.alignment = alignment
         self._lock = threading.Lock()
         
-        # Allocate pinned memory pool
+        # Allocate pinned memory pool (lazily - avoid blocking on startup)
+        self.pool_size_gb = host_pool_size_gb
         self.pool_size_bytes = int(host_pool_size_gb * 1024**3)
-        try:
-            pool_tensor = torch.empty(self.pool_size_bytes, dtype=torch.uint8)
-            self.pool = pool_tensor.pin_memory()
-            logger.info(f"✅ Allocated activation checkpoint pool: {host_pool_size_gb:.1f}GB")
-        except RuntimeError as e:
-            logger.error(f"❌ Failed to allocate pinned memory: {e}")
-            raise RuntimeError(
-                f"Cannot allocate {host_pool_size_gb}GB pinned memory for activation checkpoints. "
-                f"Check ulimit -l and available system RAM."
-            ) from e
+        self.pool = None
+        self._pool_initialized = False
+        logger.info(f"ActivationCheckpointer will lazily allocate pool: {host_pool_size_gb:.1f}GB (on first checkpoint)")
         
         # Checkpoint tracking
         self.checkpoints: Dict[str, CheckpointMetadata] = {}
@@ -106,6 +100,54 @@ class ActivationCheckpointer:
             f"pool_size={host_pool_size_gb:.1f}GB, "
             f"alignment={alignment}B"
         )
+    
+    def _ensure_pool_initialized(self):
+        """Lazily initialize pinned memory pool on first checkpoint."""
+        if self._pool_initialized:
+            return
+        
+        with self._lock:
+            if self._pool_initialized:
+                return  # Double-check locking
+            
+            logger.info(f"[LAZY INIT] Allocating pinned memory pool for checkpoints: {self.pool_size_gb:.1f}GB...")
+            try:
+                pool_tensor = torch.empty(self.pool_size_bytes, dtype=torch.uint8)
+                logger.debug(f"[LAZY INIT] Created empty tensor, pinning to host memory...")
+                # Try with a shorter timeout via threading
+                import threading
+                pinned_pool = [None]
+                error_holder = [None]
+                
+                def pin_memory_worker():
+                    try:
+                        pinned_pool[0] = pool_tensor.pin_memory()
+                    except Exception as e:
+                        error_holder[0] = e
+                
+                thread = threading.Thread(target=pin_memory_worker, daemon=False)
+                thread.start()
+                thread.join(timeout=30.0)  # 30 second timeout
+                
+                if thread.is_alive():
+                    logger.error("Pinned memory allocation timed out after 30 seconds")
+                    logger.info("Falling back to regular memory for checkpoints")
+                    self.pool = pool_tensor
+                elif error_holder[0]:
+                    logger.error(f"Pinned memory allocation failed: {error_holder[0]}")
+                    logger.info("Falling back to regular memory for checkpoints")
+                    self.pool = pool_tensor
+                else:
+                    self.pool = pinned_pool[0]
+                    logger.info(f"✅ Allocated pinned memory pool: {self.pool_size_gb:.1f}GB")
+                
+                self._pool_initialized = True
+            except Exception as e:
+                logger.error(f"❌ Failed to allocate memory for checkpoints: {e}")
+                # Use regular memory as fallback
+                pool_tensor = torch.empty(self.pool_size_bytes, dtype=torch.uint8)
+                self.pool = pool_tensor
+                self._pool_initialized = True
     
     def checkpoint(
         self,
@@ -131,6 +173,9 @@ class ActivationCheckpointer:
         Raises:
             RuntimeError: If insufficient space or invalid activations
         """
+        # Lazy initialization of pool on first checkpoint
+        self._ensure_pool_initialized()
+        
         if not activations:
             logger.warning(f"Checkpoint {checkpoint_id}: no activations provided")
             return CheckpointMetadata(

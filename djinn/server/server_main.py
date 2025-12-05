@@ -66,6 +66,11 @@ async def main():
     logger.info(f"   Max concurrent requests: {args.max_concurrent}")
     logger.info(f"   Max VRAM per tenant: {args.max_vram_gb} GB")
     
+    # Set CUDA_VISIBLE_DEVICES to ensure server uses correct GPU
+    import os
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
+    logger.info(f"   CUDA_VISIBLE_DEVICES: {args.gpu}")
+    
     # Ring buffer configuration
     if args.ring_buffer:
         logger.info(f"   Ring Buffer: ENABLED")
@@ -138,24 +143,40 @@ async def main():
     
     # Experiment 3: Initialize breakpoint debugging components
     if args.enable_breakpoints:
-        from .activation_checkpointer import get_activation_checkpointer
-        from .breakpoint_manager import get_breakpoint_manager
-        from .breakpoint_executor import get_breakpoint_executor
-        
-        # Initialize checkpointer
-        checkpointer = get_activation_checkpointer(pool_size_gb=args.checkpoint_pool_gb)
-        
-        # Initialize breakpoint manager
-        manager = get_breakpoint_manager()
-        
-        # Initialize executor
-        executor = get_breakpoint_executor()
-        executor.activation_checkpointer = checkpointer
-        executor.breakpoint_manager = manager
-        
-        logger.info(f"   ✅ ActivationCheckpointer initialized ({args.checkpoint_pool_gb} GB)")
-        logger.info(f"   ✅ BreakpointManager initialized")
-        logger.info(f"   ✅ BreakpointExecutor initialized")
+        try:
+            logger.info("Initializing breakpoint debugging components...")
+            from .activation_checkpointer import get_activation_checkpointer
+            logger.info("✓ Imported get_activation_checkpointer")
+            from .breakpoint_manager import get_breakpoint_manager
+            logger.info("✓ Imported get_breakpoint_manager")
+            from .breakpoint_executor import get_breakpoint_executor
+            logger.info("✓ Imported get_breakpoint_executor")
+            
+            # Initialize checkpointer
+            logger.info(f"Initializing ActivationCheckpointer (pool_size_gb={args.checkpoint_pool_gb})...")
+            checkpointer = get_activation_checkpointer(pool_size_gb=args.checkpoint_pool_gb)
+            logger.info(f"✓ ActivationCheckpointer initialized")
+            
+            # Initialize breakpoint manager
+            logger.info("Initializing BreakpointManager...")
+            manager = get_breakpoint_manager()
+            logger.info("✓ BreakpointManager initialized")
+            
+            # Initialize executor
+            logger.info("Initializing BreakpointExecutor...")
+            executor = get_breakpoint_executor()
+            executor.activation_checkpointer = checkpointer
+            executor.breakpoint_manager = manager
+            logger.info("✓ BreakpointExecutor initialized")
+            
+            logger.info(f"   ✅ ActivationCheckpointer initialized ({args.checkpoint_pool_gb} GB)")
+            logger.info(f"   ✅ BreakpointManager initialized")
+            logger.info(f"   ✅ BreakpointExecutor initialized")
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize breakpoint components: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            raise
     
     config = ServerConfig(
         node_id='djinn-server',
