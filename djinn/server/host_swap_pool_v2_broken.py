@@ -1,5 +1,5 @@
 """
-Host Swap Pool v2 (FIXED): Simplified pinned host memory management using PyTorch's allocator.
+Host Swap Pool v2: Simplified pinned host memory management using PyTorch's allocator.
 
 Purpose:
 - Provide pinned memory for KV cache eviction (swap-to-CPU)
@@ -11,6 +11,11 @@ Architecture:
 - Djinn manages only the POLICY (when to swap), not the MECHANISM (how to allocate)
 - Track session_id -> cpu_tensor mapping for lifecycle management
 - Thread-safe with lock protection
+
+Key Insight:
+- PyTorch's allocator handles fragmentation via slab allocation
+- We don't need to build our own bump-pointer allocator
+- Focus on ADMISSION CONTROL (prefill) to prevent OOM, not memory management
 """
 
 import logging
@@ -72,31 +77,12 @@ class HostSwapPool:
             f"Djinn manages policy (target: {pool_size_gb:.1f}GB)"
         )
     
-    def _ensure_flat_tensor(self, data):
-        """
-        Recursively flatten any KV structure to a single contiguous tensor on GPU.
-        Handles: raw tensors, tuples, lists, nested structures
-        """
-        if torch.is_tensor(data):
-            return data.contiguous()
-        elif isinstance(data, (list, tuple)):
-            # Flatten all tensors in the list/tuple
-            flat_tensors = []
-            for item in data:
-                flat_item = self._ensure_flat_tensor(item)
-                if torch.is_tensor(flat_item):
-                    flat_tensors.append(flat_item.flatten())
-            if flat_tensors:
-                return torch.cat(flat_tensors)
-            else:
-                raise RuntimeError("No tensors found in list/tuple structure")
-        else:
-            raise RuntimeError(f"Cannot flatten type: {type(data)}")
-    
     def allocate_and_swap(self, session_id: str, kv_cache_gpu, 
                          gpu_device: int = 0) -> int:
         """
         Swap KV cache from GPU to pinned host memory.
+        
+        Supports both raw Tensors and HuggingFace DynamicCache objects.
         
         SYNCHRONIZATION: This synchronizes the GPU stream to ensure data is fully copied
         before returning. This is safe because:
@@ -106,7 +92,7 @@ class HostSwapPool:
         
         Args:
             session_id: Session identifier
-            kv_cache_gpu: KV cache (any structure) on GPU
+            kv_cache_gpu: KV cache (Tensor or DynamicCache) on GPU
             gpu_device: GPU device this is being swapped from
             
         Returns:
@@ -120,28 +106,40 @@ class HostSwapPool:
                 raise RuntimeError(f"Session {session_id} already swapped")
             
             try:
-                # Step 1: Flatten any KV structure to a single GPU tensor
-                flat_kv_gpu = self._ensure_flat_tensor(kv_cache_gpu)
+                # Handle all KV formats: DynamicCache, legacy tuples, or raw tensors
+                from transformers.modeling_outputs import Cache
                 
-                if not torch.is_tensor(flat_kv_gpu):
-                    raise RuntimeError(f"Flatten failed: got {type(flat_kv_gpu)}")
+                # First, flatten to a single tensor (handles all formats)
+                if isinstance(kv_cache_gpu, Cache):
+                    # DynamicCache object
+                    flat_kv = self._flatten_dynamic_cache(kv_cache_gpu)
+                elif isinstance(kv_cache_gpu, (list, tuple)):
+                    # Legacy tuple format from to_legacy_cache()
+                    flat_kv = self._flatten_dynamic_cache(kv_cache_gpu)
+                elif torch.is_tensor(kv_cache_gpu):
+                    # Already a tensor
+                    flat_kv = kv_cache_gpu
+                else:
+                    # Try to flatten as generic object
+                    flat_kv = self._flatten_dynamic_cache(kv_cache_gpu)
                 
-                if flat_kv_gpu.device.type != 'cuda':
-                    raise RuntimeError(f"KV cache must be on GPU, got {flat_kv_gpu.device}")
+                # Now flat_kv is definitely a tensor
+                if not torch.is_tensor(flat_kv):
+                    raise RuntimeError(f"Failed to flatten KV to tensor. Got: {type(flat_kv)}")
                 
-                size_bytes = flat_kv_gpu.numel() * flat_kv_gpu.element_size()
-                logger.debug(f"Swapping {session_id}: size={size_bytes/1024**2:.1f}MB")
+                # ✅ CRITICAL: Allocate pinned CPU tensor (pin_memory requires CPU allocation)
+                # 1. Create empty tensor on CPU with pinned memory
+                cpu_buffer = torch.empty(flat_kv.shape, dtype=flat_kv.dtype, pin_memory=True)
                 
-                # Step 2: Allocate pinned CPU tensor
-                cpu_buffer = torch.empty(flat_kv_gpu.shape, dtype=flat_kv_gpu.dtype, pin_memory=True)
+                # 2. Copy from GPU tensor to pinned CPU buffer (non-blocking for async DMA)
+                cpu_buffer.copy_(flat_kv, non_blocking=True)
                 
-                # Step 3: Copy from GPU to pinned CPU (async)
-                cpu_buffer.copy_(flat_kv_gpu, non_blocking=True)
-                
-                # Step 4: Synchronize to ensure copy completes
+                # ✅ SYNCHRONIZE: Ensure copy is complete before returning
+                # This prevents race conditions if caller deletes GPU tensor
                 torch.cuda.current_stream().synchronize()
                 
-                # Step 5: Track the swap
+                # Track the swap
+                size_bytes = kv_cache_gpu.numel() * kv_cache_gpu.element_size()
                 mapping = SwapMapping(
                     session_id=session_id,
                     cpu_tensor=cpu_buffer,
@@ -175,7 +173,49 @@ class HostSwapPool:
                 logger.error(f"Failed to swap session {session_id}: {e}")
                 raise
     
-    def restore_and_copy(self, session_id: str, gpu_device: int = 0) -> torch.Tensor:
+    def _flatten_dynamic_cache(self, dyn_cache):
+        """
+        Flatten a HuggingFace DynamicCache to a single tensor.
+        
+        Handles both:
+        1. DynamicCache objects with key_cache/value_cache lists
+        2. Legacy tuple format from to_legacy_cache()
+        """
+        try:
+            flat_list = []
+            
+            # Case 1: DynamicCache with key_cache/value_cache attributes
+            if hasattr(dyn_cache, 'key_cache') and hasattr(dyn_cache, 'value_cache'):
+                for layer_kv in dyn_cache.key_cache:
+                    if layer_kv is not None and torch.is_tensor(layer_kv):
+                        flat_list.append(layer_kv.flatten())
+                for layer_kv in dyn_cache.value_cache:
+                    if layer_kv is not None and torch.is_tensor(layer_kv):
+                        flat_list.append(layer_kv.flatten())
+            
+            # Case 2: Legacy tuple format (tuple of (key, value) tuples per layer)
+            elif isinstance(dyn_cache, (list, tuple)):
+                for kv_pair in dyn_cache:
+                    if isinstance(kv_pair, (list, tuple)):
+                        for kv in kv_pair:
+                            if kv is not None and torch.is_tensor(kv):
+                                flat_list.append(kv.flatten())
+                    elif torch.is_tensor(kv_pair):
+                        flat_list.append(kv_pair.flatten())
+            
+            if not flat_list:
+                raise RuntimeError(
+                    f"DynamicCache is empty or contains no tensors. "
+                    f"Type: {type(dyn_cache)}, Has key_cache: {hasattr(dyn_cache, 'key_cache')}"
+                )
+            
+            # Concatenate all flattened tensors
+            return torch.cat(flat_list)
+        except Exception as e:
+            logger.error(f"Failed to flatten DynamicCache: {e}")
+            raise
+    
+    def restore_and_copy(self, session_id: str, gpu_device: int = 0) -> int:
         """
         Restore KV cache from pinned host memory back to GPU.
         
@@ -184,7 +224,7 @@ class HostSwapPool:
             gpu_device: GPU device to restore to
             
         Returns:
-            Restored GPU tensor (NOT just size bytes!)
+            Bytes restored, or 0 if not found/not swapped
             
         Raises:
             RuntimeError: If restore fails
@@ -193,7 +233,7 @@ class HostSwapPool:
             mapping = self.swapped_sessions.get(session_id)
             if mapping is None:
                 logger.debug(f"Session {session_id} not swapped, skipping restore")
-                return None
+                return 0
             
             try:
                 # Allocate new GPU tensor
@@ -222,8 +262,8 @@ class HostSwapPool:
                     f"total_swapped={self.stats['current_swapped_mb']:.1f}MB"
                 )
                 
-                # ✅ CRITICAL FIX: Return the GPU tensor so it doesn't get GC'd!
-                return gpu_tensor
+                # Return the new GPU tensor for the caller to use
+                return size_bytes
                 
             except Exception as e:
                 self.stats["restore_errors"] += 1

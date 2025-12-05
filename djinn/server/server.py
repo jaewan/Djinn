@@ -1144,6 +1144,8 @@ class DjinnServer:
                     response = await self._handle_cache_query(request)
                 elif msg_type == MessageType.QUERY_RESULT:
                     response = await self._handle_query_result(request)
+                elif msg_type == MessageType.SIGNAL_PHASE:
+                    response = await self._handle_signal_phase(request)
                 elif msg_type == MessageType.EXECUTE_BATCH:
                     response = await self._handle_execute_batch(request)
                 elif msg_type == MessageType.REGISTER_MODEL_CHUNKED:
@@ -1692,6 +1694,159 @@ class DjinnServer:
                 'message': f'Task {task_id} not found or expired'
             }
     
+    async def _handle_signal_phase(self, request: Dict) -> Dict:
+        """Handle semantic phase signal from client for proactive KV management."""
+        try:
+            session_id = request.get('session_id')
+            phase = request.get('phase', '').upper()
+            estimated_resume_ms = request.get('estimated_resume_ms')
+            
+            if not session_id:
+                return {'status': 'error', 'message': 'Missing session_id'}
+            
+            logger.debug(f"Signal phase: {phase} for session {session_id[:12]}, "
+                       f"estimated_resume_ms={estimated_resume_ms}")
+            
+            # Record signal reception
+            try:
+                from .memory_metrics import get_metrics
+                metrics = get_metrics()
+                metrics.record_semantic_signal(phase)
+            except Exception as e:
+                logger.debug(f"Could not record signal metric: {e}")
+            
+            # Mark session as signal-managed (skip 1-second timeout fallback)
+            try:
+                from .semantic_idle_detector import get_activity_tracker
+                tracker = get_activity_tracker()
+                if tracker:
+                    tracker.mark_signal_managed(session_id)
+            except Exception as e:
+                logger.debug(f"Could not mark signal-managed: {e}")
+            
+            if phase == 'IO_WAIT':
+                # Immediate eviction - bypass idle timeout
+                asyncio.create_task(self._semantic_evict(session_id))
+                logger.info(f"IO_WAIT signal: scheduling eviction for {session_id[:12]}")
+                
+                # If client provided estimate, schedule proactive pre-fetch
+                if estimated_resume_ms and estimated_resume_ms > 0:
+                    restore_delay_ms = max(0, estimated_resume_ms - 500)  # 500ms safety margin
+                    asyncio.create_task(
+                        self._schedule_prefetch(session_id, restore_delay_ms)
+                    )
+                    logger.debug(f"Prefetch scheduled for {session_id[:12]}: "
+                               f"delay={restore_delay_ms}ms (estimated_resume={estimated_resume_ms}ms)")
+            
+            elif phase == 'COMPUTE':
+                # ✅ RACE CONDITION FIX: Check if prefetch is already in progress
+                # If prefetch is scheduled, COMPUTE signal should skip restore (already done)
+                try:
+                    from .multi_tenant.kv_session_manager import get_kv_session_manager
+                    kv_mgr = get_kv_session_manager()
+                    if kv_mgr and session_id in kv_mgr._sessions:
+                        sess = kv_mgr._sessions[session_id]
+                        if sess.prefetch_in_progress:
+                            logger.info(f"COMPUTE signal: prefetch already in progress for {session_id[:12]}, skipping restore")
+                            return {'status': 'ok', 'phase': phase, 'session_id': session_id[:12], 'note': 'prefetch_in_progress'}
+                except Exception as e:
+                    logger.debug(f"Could not check prefetch status: {e}")
+                
+                # Normal reactive restore
+                asyncio.create_task(self._semantic_restore(session_id))
+                logger.info(f"COMPUTE signal: scheduling restore for {session_id[:12]}")
+            
+            else:
+                return {'status': 'error', 'message': f'Unknown phase: {phase}'}
+            
+            return {'status': 'ok', 'phase': phase, 'session_id': session_id[:12]}
+        
+        except Exception as e:
+            logger.error(f"Signal phase handler error: {e}")
+            return {'status': 'error', 'message': str(e)}
+    
+    async def _semantic_evict(self, session_id: str) -> None:
+        """Immediate eviction triggered by IO_WAIT signal."""
+        try:
+            import time
+            from .multi_tenant.kv_session_manager import get_kv_session_manager
+            from .memory_metrics import get_metrics
+            
+            start_time = time.perf_counter()
+            kv_manager = get_kv_session_manager()
+            if kv_manager:
+                await kv_manager.evict_kv_to_host(session_id)
+                latency_ms = (time.perf_counter() - start_time) * 1000
+                logger.info(f"✅ Semantic evict: {session_id[:12]} (IO_WAIT signal) in {latency_ms:.1f}ms")
+                
+                # Record metrics
+                metrics = get_metrics()
+                metrics.record_semantic_eviction(latency_ms)
+        except Exception as e:
+            logger.debug(f"Semantic evict error: {e}")
+    
+    async def _semantic_restore(self, session_id: str) -> None:
+        """Background restore triggered by COMPUTE signal."""
+        try:
+            import time
+            from .multi_tenant.kv_session_manager import get_kv_session_manager
+            from .memory_metrics import get_metrics
+            
+            start_time = time.perf_counter()
+            kv_manager = get_kv_session_manager()
+            if kv_manager:
+                await kv_manager.restore_kv_from_host(session_id)
+                latency_ms = (time.perf_counter() - start_time) * 1000
+                logger.info(f"✅ Semantic restore: {session_id[:12]} (COMPUTE signal) in {latency_ms:.1f}ms")
+                
+                # Record metrics
+                metrics = get_metrics()
+                metrics.record_semantic_restore(latency_ms)
+        except Exception as e:
+            logger.debug(f"Semantic restore error: {e}")
+    
+    async def _schedule_prefetch(self, session_id: str, delay_ms: int) -> None:
+        """Schedule proactive KV restore ahead of expected compute resumption."""
+        try:
+            import time
+            from .multi_tenant.kv_session_manager import get_kv_session_manager
+            from .memory_metrics import get_metrics
+            
+            # ✅ RACE CONDITION FIX: Mark prefetch as in progress
+            kv_manager = get_kv_session_manager()
+            if kv_manager and session_id in kv_manager._sessions:
+                kv_manager._sessions[session_id].prefetch_in_progress = True
+                logger.debug(f"Prefetch marked as in_progress for {session_id[:12]}")
+            
+            # Wait for the specified delay
+            await asyncio.sleep(delay_ms / 1000.0)
+            
+            # Perform restoration
+            start_time = time.perf_counter()
+            if kv_manager:
+                await kv_manager.restore_kv_from_host(session_id)
+                latency_ms = (time.perf_counter() - start_time) * 1000
+                logger.info(f"✅ Prefetch completed: {session_id[:12]} (scheduled {delay_ms}ms ahead) "
+                           f"restore_latency={latency_ms:.1f}ms")
+                
+                # Record metrics
+                metrics = get_metrics()
+                metrics.record_semantic_prefetch(latency_ms)
+                
+                # ✅ Clear the prefetch_in_progress flag
+                if session_id in kv_manager._sessions:
+                    kv_manager._sessions[session_id].prefetch_in_progress = False
+                    logger.debug(f"Prefetch completed and cleared for {session_id[:12]}")
+        except Exception as e:
+            logger.debug(f"Scheduled prefetch error: {e}")
+            # ✅ Ensure flag is cleared even on error
+            try:
+                kv_manager = get_kv_session_manager()
+                if kv_manager and session_id in kv_manager._sessions:
+                    kv_manager._sessions[session_id].prefetch_in_progress = False
+            except:
+                pass
+    
     async def _handle_execute_batch(self, request: Dict) -> Dict:
         """Handle batch execution request - execute multiple models/inputs in one pass."""
         try:
@@ -2128,6 +2283,9 @@ class DjinnServer:
         """Internal implementation of model execution (non-blocking)."""
         executor_start = time.time()
         try:
+            # DEBUG: Verify method is called
+            with open("/tmp/execute_model_called.txt", "a") as f:
+                f.write(f"_execute_model_impl called with phase={request.get('_execution_phase')}\n")
             fingerprint = request.get('fingerprint', '')
             inputs = request.get('inputs', {})
             profile_id = request.get('profile_id')
@@ -2273,19 +2431,31 @@ class DjinnServer:
                     try:
                         await kv_manager.update_kv(session_id, kv_cache)
                         logger.debug(f"✅ KV cache stored for session {session_id[:12]}")
-                        
-                        # ✅ NOW register with activity tracker (after KV is actually updated)
-                        if activity_tracker_temp and session_id_from_client:
-                            try:
-                                activity_tracker_temp.register_session(session_id_from_client)
-                                activity_tracker_temp.record_operation(session_id_from_client)
-                                logger.debug(f"✅ Session {session_id_from_client[:12]} registered for idle tracking")
-                            except Exception as e:
-                                logger.debug(f"Activity tracker registration error: {e}")
                     except Exception as e:
                         logger.warning(f"⚠️ Failed to store KV cache: {e}")
                 else:
                     logger.debug(f"⚠️ No KV cache found in execution result for session {session_id[:12]}")
+            
+            # ✅ CRITICAL FIX: Register activity REGARDLESS of KV extraction success
+            # Activity tracking (idle detection) is orthogonal to KV caching
+            # Sessions must be registered even if KV extraction failed
+            try:
+                with open("/tmp/activity_tracker_debug.txt", "a") as f:
+                    f.write(f"Check: tracker={activity_tracker_temp is not None}, session={session_id_from_client is not None}, phase={execution_phase}\n")
+            except:
+                pass
+            
+            if activity_tracker_temp and session_id_from_client and execution_phase:
+                try:
+                    activity_tracker_temp.register_session(session_id_from_client)
+                    activity_tracker_temp.record_operation(session_id_from_client)
+                    with open("/tmp/activity_tracker_debug.txt", "a") as f:
+                        f.write(f"REGISTERED: {session_id_from_client[:12]} phase={execution_phase}\n")
+                    logger.info(f"✅ Session {session_id_from_client[:12]} registered for idle tracking (phase={execution_phase})")
+                except Exception as e:
+                    with open("/tmp/activity_tracker_debug.txt", "a") as f:
+                        f.write(f"ERROR: {e}\n")
+                    logger.debug(f"Activity tracker registration error: {e}")
             
             executor_time = (time.time() - executor_start) * 1000.0
             # PHASE 1.5 FIX: Log slow executions for investigation
@@ -3096,6 +3266,24 @@ class DjinnServer:
             snapshot["status"] = "ok"
             snapshot["vmu"] = vmu_metrics
             snapshot["summary"] = self._summarize_vmu_metrics(vmu_metrics)
+            
+            # ✅ Add Phase 3 semantic scheduler metrics
+            try:
+                from .semantic_idle_detector import get_activity_tracker
+                from .host_swap_pool_v2 import get_swap_pool
+                
+                activity_tracker = get_activity_tracker()
+                swap_pool = get_swap_pool()
+                
+                semantic_metrics = {}
+                if activity_tracker:
+                    semantic_metrics["activity_tracker"] = activity_tracker.get_stats()
+                if swap_pool:
+                    semantic_metrics["swap_pool"] = swap_pool.get_stats()
+                
+                snapshot["semantic_scheduler"] = semantic_metrics
+            except Exception as e:
+                logger.debug(f"Could not collect semantic scheduler metrics: {e}")
         except Exception as exc:  # pragma: no cover - defensive
             snapshot["status"] = "error"
             snapshot["error"] = str(exc)

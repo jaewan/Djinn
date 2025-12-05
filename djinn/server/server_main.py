@@ -104,9 +104,10 @@ async def main():
         os.environ['GENIE_VMU_RING_BUFFER_WORKERS'] = str(args.ring_buffer_workers)
     
     # Phase 3: Initialize semantic scheduler components
+    print(f"DEBUG: enable_semantic_scheduler = {args.enable_semantic_scheduler}")
     if args.enable_semantic_scheduler:
         from .semantic_idle_detector import get_activity_tracker
-        from .host_swap_pool import get_swap_pool
+        from .host_swap_pool_v2 import get_swap_pool
         from .multi_tenant.kv_session_manager import get_kv_session_manager
         
         # Initialize activity tracker
@@ -188,6 +189,11 @@ async def main():
     except KeyboardInterrupt:
         logger.info("\n🛑 Shutting down...")
         # TODO: Add proper shutdown
+    except Exception as e:
+        logger.error(f"Server startup failed: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
     
     logger.info("✅ Server stopped")
 

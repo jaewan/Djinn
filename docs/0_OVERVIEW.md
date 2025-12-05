@@ -8,7 +8,7 @@
 **Implementation Status:**
 - ✅ **Phase 1 (Infrastructure):** 50% - Pinned memory verified, OS config documented, NUMA binding pending
 - ✅ **Phase 2 (Ring Buffer):** 100% - Skip-End allocator, async pipelining, hook integration complete
-- ✅ **Phase 3 (Semantic Scheduler):** 100% - Idle detector, swap-to-host, LIFO scheduling implemented and tested (20/20 unit tests)
+- ✅ **Phase 3 (Semantic Scheduler):** 75% - Idle detector, swap-to-host, basic SRG extraction implemented and tested with Poisson experiment (N=80, 647 swaps, 6s P99)
 - ✅ **Phase 4 (Validation):** 100% - Logit equivalence, PCIe flatline, agent sleep/resume tests implemented and validated
 
 ---
@@ -253,7 +253,7 @@ Under the hood a **Basic QoS Scheduler** keeps per-class queues, enforces config
 
 For multi-agent and long-context workloads, the **Semantic Scheduler** proactively manages KV cache eviction by understanding application-level semantics rather than relying on reactive heuristics.
 
-**Three Components:**
+**Implemented Components:**
 
 1. **Idle Detector (SemanticActivityTracker)**
    - Monitors session activity (model execution timestamps)
@@ -269,10 +269,10 @@ For multi-agent and long-context workloads, the **Semantic Scheduler** proactive
    - Pre-calculates `swap_bytes_actual` to prevent size mismatches during restoration
    - Zero GPU synchronization overhead (stream-specific, not global `torch.cuda.synchronize()`)
 
-3. **Queue Fairness (LIFO Scheduling)**
-   - During system overload (queue depth > 2× concurrency): switches to LIFO pop
-   - Ensures newly-arriving requests don't timeout waiting for old ones
-   - Metrics: `lifo_switches` counter tracks overload transitions
+3. **Basic SRG Extraction**
+   - Extracts Semantically Rich Graph (SRG) from model outputs
+   - Provides lightweight tensor metadata (shape, dtype, operation)
+   - Feeds into basic eviction priority calculation
 
 4. **Semantic Eviction Policy (Multi-Tenant Coordinator)**
    - Never evicts INTERACTIVE clients with active requests (protects user-facing agents)
@@ -302,7 +302,7 @@ python -m djinn.server.server_main \
     --host-swap-pool-gb 32
 ```
 
-**Benefit:** Enables 50+ concurrent agents with 2GB KV cache each (100GB total) on 60GB GPU by proactively swapping idle sessions, vs. vLLM's reactive OOM.
+**Validated Results:** N=80 agents with 647 KV swaps and 351 restores, achieving 6-second P99 latency on 80GB GPU. Enables 67% more concurrent agents than vLLM's OOM limit of 48, demonstrating memory virtualization through semantic scheduling.
 
 ---
 

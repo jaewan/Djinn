@@ -146,14 +146,14 @@ class HostSwapPool:
             # If no freed region fits, use bump pointer
             if allocated_offset is None:
                 aligned_offset = (self.current_offset + self.alignment - 1) & ~(self.alignment - 1)
-                
-                # Check capacity
-                if aligned_offset + size_bytes > self.pool_size_bytes:
-                    available = self.pool_size_bytes - aligned_offset
-                    raise RuntimeError(
-                        f"Swap pool exhausted: requested {size_bytes} bytes, "
-                        f"available {available} bytes in {self.pool_size_bytes/1024**3:.1f}GB pool"
-                    )
+            
+            # Check capacity
+            if aligned_offset + size_bytes > self.pool_size_bytes:
+                available = self.pool_size_bytes - aligned_offset
+                raise RuntimeError(
+                    f"Swap pool exhausted: requested {size_bytes} bytes, "
+                    f"available {available} bytes in {self.pool_size_bytes/1024**3:.1f}GB pool"
+                )
                 
                 allocated_offset = aligned_offset
                 self.current_offset = aligned_offset + size_bytes

@@ -1974,6 +1974,62 @@ class DjinnCoordinator:
             logger.debug(traceback.format_exc())
             raise
     
+    async def send_signal_phase(self, session_id: str, phase: str, estimated_resume_ms: Optional[int] = None) -> bool:
+        """
+        Send semantic phase signal to server for proactive KV management.
+        
+        This is a fire-and-forget RPC that tells the server:
+        - phase="IO_WAIT": Session is entering idle/think phase → evict KV cache immediately
+          (optional: provide estimated_resume_ms for proactive pre-fetch scheduling)
+        - phase="COMPUTE": Session is resuming → pre-fetch KV cache in background
+        
+        Args:
+            session_id: Session ID to signal
+            phase: Phase name ("IO_WAIT" or "COMPUTE")
+            estimated_resume_ms: Optional hint for IO_WAIT - ms until COMPUTE signal (enables proactive pre-fetch)
+        
+        Returns:
+            True if signal was sent successfully
+        """
+        try:
+            from .transport.protocol import MessageType
+            from .secure_serializer import SecureSerializer
+            
+            server_address = self.config.server_address or 'localhost:5556'
+            
+            # Prepare signal request
+            request = {
+                'session_id': session_id,
+                'phase': phase,
+                'estimated_resume_ms': estimated_resume_ms,
+            }
+            
+            # Serialize and send
+            request_data = SecureSerializer.serialize_request(request)
+            
+            # Send via TCP (fire-and-forget)
+            try:
+                status_code, response_data = await self._send_tcp_request(
+                    server_address,
+                    MessageType.SIGNAL_PHASE,
+                    request_data
+                )
+                
+                if status_code == 200:
+                    logger.debug(f"Signal {phase} sent for session {session_id[:12]}, "
+                               f"estimated_resume_ms={estimated_resume_ms}")
+                    return True
+                else:
+                    logger.warning(f"Signal {phase} failed with status {status_code}")
+                    return False
+            except Exception as e:
+                logger.debug(f"Signal {phase} send error: {e}")
+                return False
+        
+        except Exception as e:
+            logger.debug(f"send_signal_phase error: {e}")
+            return False
+    
     async def stop(self):
         """Shutdown coordinator."""
         logger.info("Stopping DjinnCoordinator...")
