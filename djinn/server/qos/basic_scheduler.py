@@ -59,7 +59,7 @@ class BasicQosScheduler:
         max_concurrency: int,
         class_shares: Optional[Dict[str, float]] = None,
         escalation_delay_ms: float = 800.0,
-        overload_threshold_multiplier: float = 2.0,
+        overload_threshold_multiplier: float = 0.5,
         use_lifo_on_overload: bool = True,
     ):
         if max_concurrency <= 0:
@@ -146,6 +146,8 @@ class BasicQosScheduler:
     ) -> Any:
         """
         Submit work for execution under the specified QoS class.
+        
+        FAST PATH: Decode requests skip queue if GPU slot available.
         """
         metadata = metadata or {}
         loop = asyncio.get_running_loop()
@@ -153,8 +155,17 @@ class BasicQosScheduler:
         work = ScheduledWork(coro_factory=coro_factory, future=future, metadata=metadata)
 
         async with self._lock:
-            self._queues[qos_class].append(work)
-            await self._maybe_dispatch_locked()
+            # FAST PATH: Decode with available slot = immediate execution (no queue)
+            if (metadata.get('execution_phase') == 'decode' 
+                and self._inflight_total < self._max_concurrency):
+                self._inflight_total += 1
+                self._inflight_per_class[qos_class] += 1
+                # Execute immediately, bypass queue
+                asyncio.create_task(self._execute_work(qos_class, work))
+            else:
+                # Normal path: append to queue
+                self._queues[qos_class].append(work)
+                await self._maybe_dispatch_locked()
 
         return await future
 
@@ -164,13 +175,27 @@ class BasicQosScheduler:
             if not next_class:
                 break
 
+            queue = self._queues[next_class]
+            if not queue:
+                break  # Safety check: queue became empty between calls
+
             # Phase 3: Check for overload and use LIFO if needed
             is_overload = self._check_overload()
-            if is_overload and self.use_lifo_on_overload:
-                work = self._queues[next_class].pop()  # LIFO: pop from end
+            
+            # Decide between FIFO and LIFO
+            # - LIFO for recent decode requests (cache locality)
+            # - LIFO during overload (fairness for all requests)
+            # - FIFO otherwise (FCFS discipline)
+            
+            # Check if the LAST item (most recent) is a decode for potential LIFO
+            if queue and queue[-1].metadata.get('execution_phase') == 'decode':
+                work = queue.pop()  # LIFO: pop most recent decode
+                self.stats["lifo_scheduled"] += 1
+            elif is_overload and self.use_lifo_on_overload and queue:
+                work = queue.pop()  # LIFO: pop most recent on overload
                 self.stats["lifo_scheduled"] += 1
             else:
-                work = self._queues[next_class].popleft()  # FIFO: pop from start
+                work = queue.popleft()  # FIFO: pop oldest request
                 self.stats["fifo_scheduled"] += 1
             
             self._inflight_total += 1
@@ -206,6 +231,21 @@ class BasicQosScheduler:
     
     def _pick_next_class_locked(self) -> Optional[QoSClass]:
         now = time.time()
+        
+        # PHASE 2.2: Check for decode requests first (any class) - they're short and latency-sensitive
+        for qos in QoSClass:
+            queue = self._queues[qos]
+            for i, work in enumerate(queue):
+                if work.metadata.get('execution_phase') == 'decode':
+                    # Decode found - promote to front if not already
+                    if i > 0:
+                        # Remove from current position, insert at front
+                        queue.remove(work)
+                        queue.appendleft(work)
+                        logger.debug(f"Decode-priority: promoted {work.metadata.get('request_id')} to front")
+                    return qos
+        
+        # Fall back to existing priority logic
         for qos in QoSClass:
             queue = self._queues[qos]
             if not queue:

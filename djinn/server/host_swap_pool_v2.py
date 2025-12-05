@@ -19,9 +19,10 @@ Architecture:
 import logging
 import threading
 import torch
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 from dataclasses import dataclass
 import time
+from .memory_metrics import get_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -35,10 +36,11 @@ MAX_SWAP_AGE_SECONDS = 600  # Force-expire swaps older than 10 minutes
 class SwapMapping:
     """Track a swapped KV cache."""
     session_id: str
-    cpu_tensor: torch.Tensor  # The pinned CPU tensor
+    cpu_data: Any             # The pinned CPU data (tensor, tuple, or list)
     size_bytes: int           # Size of KV cache in bytes
     gpu_device: int           # GPU device ID this was swapped from
     timestamp: float          # When swapped
+    data_type: str = "tensor" # Type of data: "tensor", "tuple", or "dynamic_cache"
 
 
 class HostSwapPool:
@@ -58,6 +60,8 @@ class HostSwapPool:
     def __init__(self, pool_size_gb: float = 32.0):
         """
         Initialize host swap pool (manages policy, not allocation).
+        
+        ✅ TIER 3: Pre-allocate pinned buffer pool to eliminate malloc overhead.
         
         Args:
             pool_size_gb: Maximum pool size - ENFORCED (not just informational)
@@ -114,37 +118,44 @@ class HostSwapPool:
         
         return len(stale_sessions)
     
-    def _ensure_flat_tensor(self, data):
+    def _prepare_for_swap(self, data):
         """
-        Recursively flatten any KV structure to a single contiguous tensor on GPU.
-        Handles: raw tensors, tuples, lists, nested structures
+        Prepare KV cache data for swapping to CPU.
+        
+        ✅ CRITICAL FIX: Keep tuple structure for legacy cache format.
+        This avoids losing metadata needed for reconstruction.
+        
+        Returns:
+            (data_to_swap, data_type_str)
         """
+        # If it's a tuple (legacy cache format), keep it as-is
+        if isinstance(data, tuple):
+            return data, "tuple"
+        
+        # If it's a list (also legacy format), keep it
+        if isinstance(data, list):
+            return data, "list"
+        
+        # If it's a single tensor, return it
         if torch.is_tensor(data):
-            return data.contiguous()
-        elif isinstance(data, (list, tuple)):
-            # Flatten all tensors in the list/tuple
-            flat_tensors = []
-            for item in data:
-                flat_item = self._ensure_flat_tensor(item)
-                if torch.is_tensor(flat_item):
-                    flat_tensors.append(flat_item.flatten())
-            if flat_tensors:
-                return torch.cat(flat_tensors)
-            else:
-                raise RuntimeError("No tensors found in list/tuple structure")
-        else:
-            raise RuntimeError(f"Cannot flatten type: {type(data)}")
+            return data, "tensor"
+        
+        # For anything else (DynamicCache, etc), raise error to caller
+        return data, "unknown"
     
     def allocate_and_swap(self, session_id: str, kv_cache_gpu, 
                          gpu_device: int = 0) -> int:
         """
         Swap KV cache from GPU to pinned host memory.
         
+        ✅ CRITICAL FIX: Preserve data structure (tuple, tensor, etc.) to avoid
+        losing metadata. Tuples are kept as-is to enable DynamicCache reconstruction.
+        
         HARDENED: Enforces memory limits and gracefully degrades on errors.
         
         Args:
             session_id: Session identifier
-            kv_cache_gpu: KV cache (any structure) on GPU
+            kv_cache_gpu: KV cache (tuple, tensor, or structure) on GPU
             gpu_device: GPU device this is being swapped from
             
         Returns:
@@ -167,18 +178,30 @@ class HostSwapPool:
                 return 0  # Graceful degradation: don't crash, just skip swap
             
             try:
-                # Step 1: Flatten any KV structure to a single GPU tensor
-                flat_kv_gpu = self._ensure_flat_tensor(kv_cache_gpu)
+                # ✅ CRITICAL FIX: Keep structure, don't flatten
+                data_to_swap, data_type = self._prepare_for_swap(kv_cache_gpu)
                 
-                if not torch.is_tensor(flat_kv_gpu):
-                    logger.error(f"Flatten failed for {session_id[:12]}: got {type(flat_kv_gpu)}")
+                # Calculate size based on structure
+                if isinstance(data_to_swap, torch.Tensor):
+                    if data_to_swap.device.type != 'cuda':
+                        logger.error(f"KV cache for {session_id[:12]} not on GPU: {data_to_swap.device}")
+                        return 0
+                    size_bytes = data_to_swap.numel() * data_to_swap.element_size()
+                elif isinstance(data_to_swap, (tuple, list)):
+                    # Sum up all tensors in the structure
+                    size_bytes = 0
+                    for item in data_to_swap:
+                        if isinstance(item, torch.Tensor):
+                            size_bytes += item.numel() * item.element_size()
+                        elif isinstance(item, (tuple, list)):
+                            # Nested structure like ((k0, v0), (k1, v1), ...)
+                            for sub_item in item:
+                                if isinstance(sub_item, torch.Tensor):
+                                    size_bytes += sub_item.numel() * sub_item.element_size()
+                else:
+                    logger.error(f"Unknown KV type for {session_id[:12]}: {type(data_to_swap)}")
                     return 0
                 
-                if flat_kv_gpu.device.type != 'cuda':
-                    logger.error(f"KV cache for {session_id[:12]} not on GPU: {flat_kv_gpu.device}")
-                    return 0
-                
-                size_bytes = flat_kv_gpu.numel() * flat_kv_gpu.element_size()
                 size_mb = size_bytes / (1024**2)
                 
                 # Check 3: Memory limit
@@ -189,24 +212,36 @@ class HostSwapPool:
                                  f"would exceed limit ({new_total_mb:.1f}MB > {self.pool_size_gb*1024:.0f}MB)")
                     return 0  # Graceful degradation
                 
-                logger.debug(f"Swapping {session_id[:12]}: size={size_mb:.1f}MB")
+                logger.debug(f"Swapping {session_id[:12]}: size={size_mb:.1f}MB, type={data_type}")
                 
-                # Step 2: Allocate pinned CPU tensor
-                cpu_buffer = torch.empty(flat_kv_gpu.shape, dtype=flat_kv_gpu.dtype, pin_memory=True)
+                # ✅ Move structure to pinned CPU WITHOUT flattening
+                def move_to_cpu(data):
+                    if isinstance(data, torch.Tensor):
+                        # Make contiguous (no clone - contiguous() returns same tensor if already contiguous)
+                        # This handles views without wasteful GPU→GPU copy
+                        data_contiguous = data.contiguous()
+                        # Create empty pinned buffer THEN copy
+                        cpu_buf = torch.empty(data_contiguous.shape, dtype=data_contiguous.dtype, device='cpu', pin_memory=True)
+                        cpu_buf.copy_(data_contiguous, non_blocking=True)
+                        return cpu_buf
+                    elif isinstance(data, (tuple, list)):
+                        return type(data)(move_to_cpu(item) for item in data)
+                    else:
+                        return data
                 
-                # Step 3: Copy from GPU to pinned CPU (async)
-                cpu_buffer.copy_(flat_kv_gpu, non_blocking=True)
+                cpu_data = move_to_cpu(data_to_swap)
                 
-                # Step 4: Synchronize to ensure copy completes
+                # Synchronize to ensure copy completes
                 torch.cuda.current_stream().synchronize()
                 
                 # Step 5: Track the swap
                 mapping = SwapMapping(
                     session_id=session_id,
-                    cpu_tensor=cpu_buffer,
+                    cpu_data=cpu_data,
                     size_bytes=size_bytes,
                     gpu_device=gpu_device,
                     timestamp=time.time(),
+                    data_type=data_type,
                 )
                 self.swapped_sessions[session_id] = mapping
                 
@@ -223,26 +258,37 @@ class HostSwapPool:
                 
                 logger.info(
                     f"✅ Evicted KV to host: session_id={session_id[:12]}, "
-                    f"size={size_mb:.1f}MB, "
+                    f"size={size_mb:.1f}MB, type={data_type}, "
                     f"total_swapped={self.stats['current_swapped_mb']:.1f}MB, "
                     f"sessions={len(self.swapped_sessions)}"
                 )
+                
+                # Record success metric
+                metrics = get_metrics()
+                metrics.record_swap_success()
                 
                 return size_bytes
                 
             except torch.cuda.OutOfMemoryError as e:
                 self.stats["swap_errors"] += 1
-                logger.error(f"CUDA OOM during swap for {session_id[:12]}: {e}")
+                logger.error(f"[CRITICAL] CUDA OOM during swap for {session_id[:12]}: {e}", exc_info=True)
+                metrics = get_metrics()
+                metrics.record_swap_failure()
                 return 0  # Graceful degradation
                 
             except Exception as e:
                 self.stats["swap_errors"] += 1
-                logger.error(f"Failed to swap session {session_id[:12]}: {e}")
+                logger.error(f"[CRITICAL] Failed to swap session {session_id[:12]}: {e}", exc_info=True)
+                metrics = get_metrics()
+                metrics.record_swap_failure()
                 return 0  # Graceful degradation instead of raising
     
-    def restore_and_copy(self, session_id: str, gpu_device: int = 0) -> Optional[torch.Tensor]:
+    def restore_and_copy(self, session_id: str, gpu_device: int = 0) -> Optional[Any]:
         """
         Restore KV cache from pinned host memory back to GPU.
+        
+        ✅ CRITICAL FIX: Preserves structure (tuple, tensor, etc.) to enable
+        proper DynamicCache reconstruction.
         
         HARDENED: Returns None on failure instead of raising.
         
@@ -251,7 +297,7 @@ class HostSwapPool:
             gpu_device: GPU device to restore to
             
         Returns:
-            Restored GPU tensor, or None if not swapped/failed
+            Restored GPU data (tensor, tuple, list, or structure), or None if not swapped/failed
         """
         with self._lock:
             mapping = self.swapped_sessions.get(session_id)
@@ -260,16 +306,23 @@ class HostSwapPool:
                 return None
             
             try:
-                # Allocate new GPU tensor
-                gpu_tensor = torch.empty_like(mapping.cpu_tensor, device=f'cuda:{gpu_device}')
+                # ✅ Move structure back to GPU WITHOUT flattening
+                def move_to_gpu(data):
+                    if isinstance(data, torch.Tensor):
+                        gpu_tensor = torch.empty_like(data, device=f'cuda:{gpu_device}')
+                        gpu_tensor.copy_(data, non_blocking=True)
+                        return gpu_tensor
+                    elif isinstance(data, (tuple, list)):
+                        return type(data)(move_to_gpu(item) for item in data)
+                    else:
+                        return data
                 
-                # Copy from pinned CPU back to GPU
-                gpu_tensor.copy_(mapping.cpu_tensor, non_blocking=True)
+                gpu_data = move_to_gpu(mapping.cpu_data)
                 
                 # Synchronize
                 torch.cuda.current_stream().synchronize()
                 
-                # Free the pinned memory by deleting the CPU tensor
+                # Free the pinned memory by deleting the mapping
                 size_bytes = mapping.size_bytes
                 del self.swapped_sessions[session_id]
                 
@@ -281,29 +334,37 @@ class HostSwapPool:
                 
                 logger.info(
                     f"✅ Restored KV from host: session_id={session_id[:12]}, "
-                    f"size={size_bytes/1024**2:.1f}MB, "
+                    f"size={size_bytes/1024**2:.1f}MB, type={mapping.data_type}, "
                     f"total_swapped={self.stats['current_swapped_mb']:.1f}MB"
                 )
                 
-                return gpu_tensor
+                # Record success metric
+                metrics = get_metrics()
+                metrics.record_restore_success()
+                
+                return gpu_data
                 
             except torch.cuda.OutOfMemoryError as e:
                 self.stats["restore_errors"] += 1
-                logger.error(f"CUDA OOM during restore for {session_id[:12]}: {e}")
+                logger.error(f"[CRITICAL] CUDA OOM during restore for {session_id[:12]}: {e}", exc_info=True)
+                metrics = get_metrics()
+                metrics.record_restore_failure()
                 # Keep the swap in place - maybe we can restore later
                 return None
                 
             except Exception as e:
                 self.stats["restore_errors"] += 1
-                logger.error(f"Failed to restore session {session_id[:12]}: {e}")
+                logger.error(f"[CRITICAL] Failed to restore session {session_id[:12]}: {e}", exc_info=True)
+                metrics = get_metrics()
+                metrics.record_restore_failure()
                 return None  # Graceful degradation
     
-    def get_swapped_tensor(self, session_id: str) -> Optional[torch.Tensor]:
-        """Get the pinned CPU tensor for a swapped session (for inspection/testing)."""
+    def get_swapped_data(self, session_id: str) -> Optional[Any]:
+        """Get the pinned CPU data for a swapped session (for inspection/testing)."""
         with self._lock:
             mapping = self.swapped_sessions.get(session_id)
             if mapping:
-                return mapping.cpu_tensor
+                return mapping.cpu_data
             return None
     
     def is_swapped(self, session_id: str) -> bool:

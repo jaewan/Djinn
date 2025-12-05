@@ -1992,7 +1992,7 @@ class DjinnCoordinator:
             True if signal was sent successfully
         """
         try:
-            from .transport.protocol import MessageType
+            from djinn.server.transport.protocol import MessageType
             from .secure_serializer import SecureSerializer
             
             server_address = self.config.server_address or 'localhost:5556'
@@ -2009,18 +2009,26 @@ class DjinnCoordinator:
             
             # Send via TCP (fire-and-forget)
             try:
-                status_code, response_data = await self._send_tcp_request(
+                response_msg_type, response_data = await self._send_tcp_request(
                     server_address,
                     MessageType.SIGNAL_PHASE,
                     request_data
                 )
                 
-                if status_code == 200:
-                    logger.debug(f"Signal {phase} sent for session {session_id[:12]}, "
+                # Check for error response (message type 0x01 = ERROR)
+                if response_msg_type == MessageType.ERROR:
+                    error = SecureSerializer.deserialize_response(response_data)
+                    logger.warning(f"Signal {phase} error: {error.get('message', 'Unknown')}")
+                    return False
+                
+                # Any non-error response indicates success
+                response = SecureSerializer.deserialize_response(response_data)
+                if response.get('status') == 'ok':
+                    logger.info(f"✅ Signal {phase} sent for session {session_id[:12]}, "
                                f"estimated_resume_ms={estimated_resume_ms}")
                     return True
                 else:
-                    logger.warning(f"Signal {phase} failed with status {status_code}")
+                    logger.warning(f"Signal {phase} failed: {response}")
                     return False
             except Exception as e:
                 logger.debug(f"Signal {phase} send error: {e}")

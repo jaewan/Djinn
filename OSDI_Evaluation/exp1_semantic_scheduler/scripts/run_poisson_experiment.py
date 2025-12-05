@@ -98,14 +98,15 @@ async def agent_lifecycle_poisson(
             inputs = {"input_ids": current_input_ids}
             
             with djinn.session(phase="prefill", session_id=session_id, priority="normal"):
-                reason_result = await manager.execute_model(
+                reason_result, reason_server_metrics = await manager.execute_model(
                     model,
                     inputs,
                     hints={
                         "use_generate": True,
                         "max_new_tokens": config.get("new_tokens", 50),
                         "do_sample": False,
-                    }
+                    },
+                    return_metrics=True,
                 )
             
             reason_latency_ms = (time.perf_counter() - start_reason) * 1000.0
@@ -118,6 +119,7 @@ async def agent_lifecycle_poisson(
                 "tokens_generated": config.get("new_tokens", 50),
                 "kv_reused": False,
                 "arrival_time_s": arrival_time,
+                "server_metrics": reason_server_metrics,
             })
             
             # PHASE 2: ACT (Simulated Tool Use / Idle Period)
@@ -141,14 +143,15 @@ async def agent_lifecycle_poisson(
             wake_start = time.perf_counter()
             
             with djinn.session(phase="decode", session_id=session_id, priority="normal"):
-                reflect_result = await manager.execute_model(
+                reflect_result, reflect_server_metrics = await manager.execute_model(
                     model,
                     inputs,
                     hints={
                         "use_generate": True,
                         "max_new_tokens": config.get("new_tokens", 50),
                         "do_sample": False,
-                    }
+                    },
+                    return_metrics=True,
                 )
             
             wake_latency_ms = (time.perf_counter() - wake_start) * 1000.0
@@ -162,6 +165,7 @@ async def agent_lifecycle_poisson(
                 "tokens_generated": config.get("new_tokens", 50),
                 "kv_reused": True,
                 "arrival_time_s": arrival_time,
+                "server_metrics": reflect_server_metrics,
             })
             
             logger.debug(f"[Agent {agent_idx}] Cycle {iteration} complete: "
@@ -305,11 +309,32 @@ async def run_poisson_experiment(
         
         kv_reused = sum(1 for r in success_records if r.get("kv_reused", False))
         errors = len(error_records)
+        
+        # Server-side queue profiling (optional)
+        queue_latencies = sorted([
+            r.get("server_metrics", {}).get("queue_latency_ms", 0.0)
+            for r in success_records
+            if r.get("server_metrics", {}).get("queue_latency_ms") is not None
+        ])
+        executor_latencies = sorted([
+            r.get("server_metrics", {}).get("executor_time_ms", 0.0)
+            for r in success_records
+            if r.get("server_metrics", {}).get("executor_time_ms") is not None
+        ])
+        queue_p99 = (
+            queue_latencies[min(int(len(queue_latencies) * 0.99), len(queue_latencies) - 1)]
+            if queue_latencies else 0.0
+        )
+        exec_p99 = (
+            executor_latencies[min(int(len(executor_latencies) * 0.99), len(executor_latencies) - 1)]
+            if executor_latencies else 0.0
+        )
     else:
         mean_lat = p50_lat = p99_lat = 0.0
         p50_wake = p99_wake = 0.0
         kv_reused = 0
         errors = 0
+        queue_p99 = exec_p99 = 0.0
     
     # Try to collect swap metrics and scheduler stats from server
     kv_swaps = 0
@@ -370,6 +395,10 @@ async def run_poisson_experiment(
                 "swaps": kv_swaps,
                 "restores": kv_restores,
             },
+            "server_latency_stats": {
+                "queue_p99_ms": queue_p99,
+                "executor_p99_ms": exec_p99,
+            },
             "scheduler_stats": scheduler_stats,
         },
     }
@@ -382,6 +411,7 @@ async def run_poisson_experiment(
     logger.info(f"Success Rate: {payload['aggregates']['success_count']}/{config['workload'].get('total_agents', 200)}")
     logger.info(f"Latency (P99): {p99_lat:.1f}ms")
     logger.info(f"Wake-up Latency (P99): {p99_wake:.1f}ms")
+    logger.info(f"Queue Latency (P99): {queue_p99:.1f}ms")
     logger.info(f"KV Swaps: {kv_swaps}")
     logger.info(f"KV Restores: {kv_restores}")
     logger.info("=" * 70)

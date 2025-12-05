@@ -278,8 +278,6 @@ class SemanticActivityTracker:
             callback: Function(session_id) -> None or Coroutine
         """
         self._idle_callbacks.add(callback)
-        with open("/tmp/idle_detector_detections.txt", "a") as f:
-            f.write(f"[REGISTER_IDLE] Callback: {callback.__name__ if hasattr(callback, '__name__') else str(callback)}\n")
     
     def register_resume_callback(self, callback: Callable[[str], Optional[Awaitable[None]]]) -> None:
         """
@@ -362,9 +360,6 @@ class SemanticActivityTracker:
     def _monitor_loop(self) -> None:
         """Background thread: detect idle sessions and emit events."""
         logger.info("🔄 Idle detection monitor loop started")
-        # Debug: Write to file to verify thread is running
-        with open("/tmp/idle_detector_running.txt", "a") as f:
-            f.write("Idle detector thread started\n")
         
         while not self._stop_event.is_set():
             try:
@@ -400,9 +395,6 @@ class SemanticActivityTracker:
                 idle_duration = now - activity.last_op_time
                 if idle_duration >= self.idle_threshold_seconds:
                     to_mark_idle.append((session_id, activity))
-                    # ✅ DEBUG: Log idle detection
-                    with open("/tmp/idle_detector_detections.txt", "a") as f:
-                        f.write(f"[DETECT] {session_id[:12]} idle_duration={idle_duration:.2f}s >= threshold={self.idle_threshold_seconds}s\n")
         
         # Emit idle events (outside lock to avoid deadlock)
         for session_id, activity in to_mark_idle:
@@ -415,13 +407,9 @@ class SemanticActivityTracker:
                     self.stats["idle_detections"] += 1
             
             logger.debug(f"Detected idle session: {session_id}")
-            with open("/tmp/idle_detector_detections.txt", "a") as f:
-                f.write(f"[CALLBACK] Emitting idle callback for {session_id[:12]}, {len(self._idle_callbacks)} callbacks registered\n")
             
             # Emit callbacks
             for callback in self._idle_callbacks:
-                with open("/tmp/idle_detector_detections.txt", "a") as f:
-                    f.write(f"[INVOKE] {session_id[:12]} callback={callback.__name__ if hasattr(callback, '__name__') else 'unknown'}\n")
                 self._invoke_callback(callback, session_id, "idle")
     
     def get_stats(self) -> Dict:

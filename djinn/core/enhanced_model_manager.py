@@ -13,7 +13,7 @@ import socket
 import threading
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -177,7 +177,9 @@ class EnhancedModelManager:
         model_id: Optional[str] = None,
         profile_id: Optional[str] = None,
         hints: Optional[Dict[str, Any]] = None,
-    ) -> torch.Tensor:
+        *,
+        return_metrics: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, Any]]]:
         fingerprint, _ = self._compute_fingerprint(model, model_id=model_id)
 
         if fingerprint not in self.registered_models:
@@ -200,6 +202,7 @@ class EnhancedModelManager:
             inputs=inputs,
             hints=semantic_hints or None,
             profile_id=profile_id,
+            return_metrics=return_metrics,
         )
 
     async def _execute_via_graph(self, model: nn.Module, inputs: Dict[str, Any]):
@@ -219,7 +222,9 @@ class EnhancedModelManager:
         inputs: Dict[str, Any],
         hints: Optional[Dict[str, Any]] = None,
         profile_id: Optional[str] = None,
-    ) -> torch.Tensor:
+        *,
+        return_metrics: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, Any]]]:
         if fingerprint not in self.registered_models:
             raise ModelNotRegisteredError(f"Model {fingerprint} not registered")
 
@@ -241,6 +246,8 @@ class EnhancedModelManager:
                     semantic_hints=semantic_payload,
                 )
                 self._last_execution_metrics = metrics or {}
+                if return_metrics:
+                    return result, self._last_execution_metrics
                 return result
             except Exception as exc:
                 logger.warning("Remote execution failed: %s", exc)

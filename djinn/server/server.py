@@ -137,6 +137,23 @@ class DjinnServer:
         # Only MAX_CONCURRENT_PREFILLS agents can do prefill simultaneously
         # Others queue up while semantic scheduler swaps idle agents to host
         self.MAX_CONCURRENT_PREFILLS = 4  # Configurable, but 4 is safe for Llama-13B
+        prefill_override = os.getenv("GENIE_MAX_CONCURRENT_PREFILLS")
+        if prefill_override:
+            try:
+                override_value = max(1, int(prefill_override))
+                if override_value != self.MAX_CONCURRENT_PREFILLS:
+                    logger.info(
+                        "GENIE_MAX_CONCURRENT_PREFILLS override detected: %s -> %s",
+                        self.MAX_CONCURRENT_PREFILLS,
+                        override_value,
+                    )
+                    self.MAX_CONCURRENT_PREFILLS = override_value
+            except ValueError:
+                logger.warning(
+                    "Invalid GENIE_MAX_CONCURRENT_PREFILLS value: %s. Using default %s.",
+                    prefill_override,
+                    self.MAX_CONCURRENT_PREFILLS,
+                )
         self.prefill_semaphore = asyncio.Semaphore(self.MAX_CONCURRENT_PREFILLS)
         self.prefill_queue_depth = 0
         self._prefill_queue_lock = asyncio.Lock()
@@ -1736,7 +1753,7 @@ class DjinnServer:
                 
                 # If client provided estimate, schedule proactive pre-fetch
                 if estimated_resume_ms and estimated_resume_ms > 0:
-                    restore_delay_ms = max(0, estimated_resume_ms - 500)  # 500ms safety margin
+                    restore_delay_ms = max(0, estimated_resume_ms - 150)  # 150ms margin (restore takes ~50ms)
                     prefetch_task = asyncio.create_task(
                         self._schedule_prefetch(session_id, restore_delay_ms)
                     )
@@ -1806,7 +1823,7 @@ class DjinnServer:
                 metrics = get_metrics()
                 metrics.record_semantic_eviction(latency_ms)
         except Exception as e:
-            logger.debug(f"Semantic evict error: {e}")
+            logger.error(f"[CRITICAL] Semantic evict error: {e}", exc_info=True)
     
     async def _semantic_restore(self, session_id: str) -> None:
         """Background restore triggered by COMPUTE signal."""
@@ -1826,7 +1843,7 @@ class DjinnServer:
                 metrics = get_metrics()
                 metrics.record_semantic_restore(latency_ms)
         except Exception as e:
-            logger.debug(f"Semantic restore error: {e}")
+            logger.error(f"[CRITICAL] Semantic restore error: {e}", exc_info=True)
     
     async def _schedule_prefetch(self, session_id: str, delay_ms: int) -> None:
         """Schedule proactive KV restore ahead of expected compute resumption."""
@@ -1846,7 +1863,7 @@ class DjinnServer:
             if kv_manager:
                 await kv_manager.restore_kv_from_host(session_id)
                 latency_ms = (time.perf_counter() - start_time) * 1000
-                logger.info(f"✅ Prefetch completed: {session_id[:12]} (scheduled {delay_ms}ms ahead) "
+                logger.debug(f"✅ Prefetch completed: {session_id[:12]} (scheduled {delay_ms}ms ahead) "
                            f"restore_latency={latency_ms:.1f}ms")
                 
                 # Record metrics
@@ -2302,9 +2319,6 @@ class DjinnServer:
         """Internal implementation of model execution (non-blocking)."""
         executor_start = time.time()
         try:
-            # DEBUG: Verify method is called
-            with open("/tmp/execute_model_called.txt", "a") as f:
-                f.write(f"_execute_model_impl called with phase={request.get('_execution_phase')}\n")
             fingerprint = request.get('fingerprint', '')
             inputs = request.get('inputs', {})
             profile_id = request.get('profile_id')
@@ -2359,6 +2373,7 @@ class DjinnServer:
             phase_alias = (execution_phase or "").lower()
             decode_phases = {'decode', 'llm_decode'}
             prefill_phases = {'prefill', 'llm_prefill'}
+            
             if phase_alias in decode_phases.union(prefill_phases) and session_id_from_client:
                 if session_id_from_client not in session_mgr.sessions:
                     logger.debug(f"Creating session {session_id_from_client[:12]} for phase {execution_phase}")
@@ -2373,18 +2388,62 @@ class DjinnServer:
             
             kv_manager = None
             kv_session = None
+            restore_task = None  # ✅ TIER 3: Start restore task early
             gpu_index = self.capabilities.gpu_indices[0] if (self.capabilities and self.capabilities.gpu_indices) else 0
 
             if phase_alias in prefill_phases.union(decode_phases) and session_id:
                 kv_manager = get_kv_session_manager()
                 kv_session = await kv_manager.get_or_create(session_id, gpu_index)
-                if execution_phase == 'decode' and kv_session.kv_cache is not None:
-                    inputs = dict(inputs)
-                    inputs['past_key_values'] = kv_session.kv_cache
+                if phase_alias in decode_phases:
+                    if kv_session.is_swapped:
+                        logger.debug(
+                            "Decode phase: session %s KV cache swapped out; scheduling async restore",
+                            session_id[:12] if session_id else "unknown",
+                        )
+                        # ✅ TIER 3: Start restore immediately (async), will wait later
+                        restore_task = asyncio.create_task(
+                            kv_manager.restore_kv_from_host(session_id)
+                        )
+                        logger.debug(f"Restore task scheduled (async) for {session_id[:12]}")
 
-            # Get model from cache
+            # Get model from cache (this happens in parallel with restore)
             model_cache = get_model_cache_v23()
             model = model_cache.get_model(fingerprint)
+            
+            # ✅ TIER 3: Wait for restore to complete (if scheduled)
+            if restore_task is not None:
+                try:
+                    bytes_restored = await restore_task
+                    if bytes_restored == 0:
+                        logger.error(
+                            "[CRITICAL] Restore returned 0 bytes for %s - swap may have failed",
+                            session_id[:12] if session_id else "unknown",
+                        )
+                except Exception as restore_exc:
+                    logger.error(
+                        "[CRITICAL] Decode phase: failed to restore KV cache for session %s: %s",
+                        session_id[:12] if session_id else "unknown",
+                        restore_exc,
+                        exc_info=True,
+                    )
+            
+            # Update session with restored KV if decode phase
+            if phase_alias in decode_phases and kv_manager and kv_session:
+                cache_obj = kv_session.kv_cache
+                if cache_obj is None:
+                    logger.error(
+                        "[CRITICAL] Decode phase: session %s has no KV cache after restore attempt (swapped=%s)",
+                        session_id[:12] if session_id else "unknown",
+                        kv_session.is_swapped,
+                    )
+                else:
+                    logger.debug(
+                        "Decode phase: session %s KV cache type=%s",
+                        session_id[:12] if session_id else "unknown",
+                        type(cache_obj).__name__,
+                    )
+                    inputs = dict(inputs)
+                    inputs['past_key_values'] = cache_obj
             
             if model is None:
                 return {
@@ -2423,10 +2482,26 @@ class DjinnServer:
             # Others queue up while semantic scheduler swaps idle agents to host
             is_prefill = (execution_phase or "").lower() in {'prefill', 'llm_prefill'}
             if is_prefill:
-                async with self.prefill_semaphore:
-                    async with self._prefill_queue_lock:
-                        self.prefill_queue_depth = self.prefill_semaphore._value
-                    logger.info(f"🔒 PREFILL ACQUIRED (queue_depth={self.prefill_queue_depth})")
+                wait_start = time.perf_counter()
+                async with self._prefill_queue_lock:
+                    queued_before = max(
+                        0, self.MAX_CONCURRENT_PREFILLS - self.prefill_semaphore._value
+                    )
+                    self.prefill_queue_depth = max(self.prefill_queue_depth, queued_before)
+                await self.prefill_semaphore.acquire()
+                wait_ms = (time.perf_counter() - wait_start) * 1000.0
+                inflight_prefill = max(
+                    0, self.MAX_CONCURRENT_PREFILLS - self.prefill_semaphore._value
+                )
+                metrics = get_metrics()
+                metrics.record_prefill_admission(wait_ms, queued_before, inflight_prefill)
+                logger.info(
+                    "🔒 PREFILL ACQUIRED (queue_depth=%s, wait=%.1fms, inflight=%s)",
+                    queued_before,
+                    wait_ms,
+                    inflight_prefill,
+                )
+                try:
                     execution_result, execution_metrics = await executor.execute_with_lazy_outputs(
                         model=model,
                         inputs=inputs,
@@ -2434,6 +2509,8 @@ class DjinnServer:
                         return_lazy=False,  # Return concrete tensors over network
                         execution_phase=execution_phase
                     )
+                finally:
+                    self.prefill_semaphore.release()
             else:
                 # Decode can run concurrently without admission control
                 execution_result, execution_metrics = await executor.execute_with_lazy_outputs(
@@ -2458,22 +2535,12 @@ class DjinnServer:
             # ✅ CRITICAL FIX: Register activity REGARDLESS of KV extraction success
             # Activity tracking (idle detection) is orthogonal to KV caching
             # Sessions must be registered even if KV extraction failed
-            try:
-                with open("/tmp/activity_tracker_debug.txt", "a") as f:
-                    f.write(f"Check: tracker={activity_tracker_temp is not None}, session={session_id_from_client is not None}, phase={execution_phase}\n")
-            except:
-                pass
-            
             if activity_tracker_temp and session_id_from_client and execution_phase:
                 try:
                     activity_tracker_temp.register_session(session_id_from_client)
                     activity_tracker_temp.record_operation(session_id_from_client)
-                    with open("/tmp/activity_tracker_debug.txt", "a") as f:
-                        f.write(f"REGISTERED: {session_id_from_client[:12]} phase={execution_phase}\n")
                     logger.info(f"✅ Session {session_id_from_client[:12]} registered for idle tracking (phase={execution_phase})")
                 except Exception as e:
-                    with open("/tmp/activity_tracker_debug.txt", "a") as f:
-                        f.write(f"ERROR: {e}\n")
                     logger.debug(f"Activity tracker registration error: {e}")
             
             executor_time = (time.time() - executor_start) * 1000.0
@@ -3303,6 +3370,18 @@ class DjinnServer:
                 snapshot["semantic_scheduler"] = semantic_metrics
             except Exception as e:
                 logger.debug(f"Could not collect semantic scheduler metrics: {e}")
+            
+            # ✅ Add QoS scheduler stats
+            try:
+                if self.qos_scheduler:
+                    snapshot["scheduler"] = {
+                        "lifo_switches": self.qos_scheduler.stats.get("lifo_switches", 0),
+                        "lifo_scheduled": self.qos_scheduler.stats.get("lifo_scheduled", 0),
+                        "fifo_scheduled": self.qos_scheduler.stats.get("fifo_scheduled", 0),
+                        "max_concurrency": self.qos_scheduler._max_concurrency,
+                    }
+            except Exception as e:
+                logger.debug(f"Could not collect QoS scheduler metrics: {e}")
         except Exception as exc:  # pragma: no cover - defensive
             snapshot["status"] = "error"
             snapshot["error"] = str(exc)
