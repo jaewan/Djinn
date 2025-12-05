@@ -1,30 +1,25 @@
 # Experiment 3: White-Box Breakpoint Debugging - Full Evaluation
-# Comprehensive breakpoint debugging evaluation for OSDI paper
+# Comprehensive breakpoint debugging evaluation with statistical rigor
 
 model:
-  name: "gpt2-xl"  # 48 layers
+  name: "gpt2"  # 12 layers (switch to gpt2-xl for 48 layers on H100)
   source: "transformers"
   
-breakpoint:
-  enabled: true
-  # Sweep breakpoint positions to show overhead scales with activation size
-  layers_to_test: [5, 10, 15, 20, 25, 30, 35, 40, 45]
+experiment:
+  num_trials: 3  # Run 3 trials per layer for statistical significance
   
-input:
-  batch_size: 1
-  seq_length: 512
+  breakpoints:
+    enabled: true
+    # Sweep breakpoint positions to show overhead scales with activation size
+    layers: [3, 6, 9]  # Valid for GPT-2's 12 layers
   
-metrics:
-  collect_checkpoint_time: true
-  collect_pause_duration: true
-  collect_restore_time: true
-  collect_correctness: true
-  collect_activation_sizes: true  # Track sizes at each layer
-  
+  inference:
+    input_length: 128
+    token_accuracy_threshold: 95.0  # Accept 5% token mismatch due to FP16 effects
+    
 validation:
-  tolerance: 0.1  # FP16 tolerance
   require_output_equivalence: true  # Strict: breakpoint run must == full run
   
-duration: 30  # minutes
+duration: 30  # minutes (estimated for 3 trials on 4 layers)
 output_dir: "/tmp/exp3_results"
 

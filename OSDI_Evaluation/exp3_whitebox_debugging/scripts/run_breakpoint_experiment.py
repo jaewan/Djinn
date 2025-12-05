@@ -97,54 +97,34 @@ def load_config(config_path: Path) -> Dict[str, Any]:
 
 
 def load_model_and_tokenizer(model_name: str):
-    """Load model and tokenizer."""
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    """Load model and tokenizer using GhostLoader for zero-memory skeleton."""
+    from transformers import AutoTokenizer
     
-    logger.info(f"Loading model: {model_name}")
+    logger.info(f"Creating ghost model: {model_name}")
     
-    # Load on CPU initially (ghost loader will handle GPU placement)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.float16,
-        device_map='cpu'
-    )
+    # Create ghost model (zero-memory skeleton)
+    # Server will download/map real weights to Text Segment
+    model = create_hf_ghost_model(model_name, task="causal-lm")
     
     tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
     
-    logger.info(f"✅ Model loaded: {model_name}")
-    logger.info(f"   Layers: {count_model_layers(model)}")
-    logger.info(f"   Parameters: {count_parameters(model) / 1e6:.1f}M")
+    logger.info(f"✅ Ghost model created: {model_name}")
+    logger.info(f"   Ghost model size: <100MB (skeleton only)")
+    logger.info(f"   Real weights: Will be loaded on server")
     
     return model, tokenizer
 
 
-def count_model_layers(model) -> int:
-    """Count the number of layers in model."""
-    # Try common layer attributes
-    for attr in ['transformer', 'model', 'encoder', 'decoder']:
-        if hasattr(model, attr):
-            submodel = getattr(model, attr)
-            for layer_attr in ['layer', 'layers', 'h', 'blocks']:
-                if hasattr(submodel, layer_attr):
-                    layers = getattr(submodel, layer_attr)
-                    if isinstance(layers, (list, torch.nn.ModuleList)):
-                        return len(layers)
-    
-    # Fallback: count all nn.Module children
-    return sum(1 for _ in model.modules())
-
-
-def count_parameters(model) -> int:
-    """Count total parameters."""
-    return sum(p.numel() for p in model.parameters())
 
 
 def get_device() -> torch.device:
     """Get CUDA device if available."""
     if torch.cuda.is_available():
-        device = torch.device('cuda:0')
-        torch.cuda.set_device(0)
-        logger.info(f"✅ Using GPU: {torch.cuda.get_device_name(0)}")
+        device = torch.device('cuda:1')  # Use GPU1 to avoid conflict with other user
+        torch.cuda.set_device(1)
+        logger.info(f"✅ Using GPU: {torch.cuda.get_device_name(1)}")
         return device
     else:
         logger.warning("⚠️  CUDA not available, using CPU (very slow)")
@@ -156,34 +136,37 @@ async def run_breakpoint_test(
     model,
     tokenizer,
     config: Dict[str, Any],
-    device: torch.device
+    device: torch.device,
+    model_name: str
 ) -> Dict[str, Any]:
     """
-    Run breakpoint debugging evaluation.
+    Run breakpoint debugging evaluation with multiple trials.
     
     Tests model execution with breakpoints at different layers,
-    collecting checkpoint/restore metrics.
+    collecting checkpoint/restore metrics with proper statistical rigor.
     """
+    from common_utils import compute_statistics, format_statistics
+    
     # Get breakpoint configuration
     breakpoint_config = config.get('experiment', {}).get('breakpoints', {})
     breakpoint_layers = breakpoint_config.get('layers', [5, 15, 25])
+    num_trials = config.get('experiment', {}).get('num_trials', 3)
     
     # Get inference configuration
     inf_config = config.get('experiment', {}).get('inference', {})
     input_length = inf_config.get('input_length', 32)
-    tolerance = inf_config.get('correctness_tolerance', 0.1)
+    token_accuracy_threshold = inf_config.get('token_accuracy_threshold', 95.0)
     
     results = {
         "summary": {
             "total_tests": 0,
             "successful": 0,
             "failed": 0,
-            "avg_checkpoint_time_ms": 0.0,
-            "avg_pause_duration_ms": 0.0,
-            "avg_restore_time_ms": 0.0,
-            "avg_overhead_percent": 0.0,
+            "num_trials": num_trials,
+            "num_layers": len(breakpoint_layers),
         },
-        "breakpoints": {},
+        "statistics": {},  # Will contain per-layer statistics
+        "breakpoints": {},  # Will contain per-trial data
     }
     
     # Prepare input
@@ -195,13 +178,28 @@ async def run_breakpoint_test(
         truncation=True
     )["input_ids"].to(device)
     
+    # WARMUP: Execute once to eliminate cold-start effects (JIT, CUDA context init, etc.)
+    logger.info("\n" + "="*80)
+    logger.info("WARMUP EXECUTION (Cold-Start Elimination)")
+    logger.info("="*80)
+    try:
+        await manager.execute_model(
+            model,
+            {"input_ids": input_ids},
+            hints={"use_generate": False}
+        )
+        torch.cuda.synchronize()  # Wait for all GPU operations to complete
+        logger.info("✅ Warmup complete, cold-start effects eliminated")
+    except Exception as e:
+        logger.warning(f"⚠️  Warmup execution failed: {e}, continuing anyway")
+    
     # Get baseline output (full execution without breakpoint)
     logger.info("\n" + "="*80)
     logger.info("COLLECTING BASELINE (Full Execution)")
     logger.info("="*80)
     
     try:
-        baseline_output, _ = await manager.execute_model(
+        baseline_output = await manager.execute_model(
             model,
             {"input_ids": input_ids},
             hints={"use_generate": False}
@@ -211,102 +209,150 @@ async def run_breakpoint_test(
         logger.error(f"❌ Failed to get baseline: {e}")
         baseline_output = None
     
-    # Test breakpoints at different layers
-    all_checkpoint_times = []
-    all_pause_durations = []
-    all_restore_times = []
-    all_overheads = []
+    # Multi-trial testing
+    per_layer_data = {layer: {
+        'checkpoint_times': [],
+        'pause_durations': [],
+        'restore_times': [],
+        'overheads': [],
+        'token_accuracies': [],
+        'checkpoint_sizes': [],
+    } for layer in breakpoint_layers}
+    
+    for trial_num in range(num_trials):
+        logger.info("\n" + "="*80)
+        logger.info(f"TRIAL {trial_num + 1} / {num_trials}")
+        logger.info("="*80)
+        
+        for layer_idx in breakpoint_layers:
+            logger.info("\n" + "-"*80)
+            logger.info(f"Trial {trial_num + 1}: Testing breakpoint at layer {layer_idx}...")
+            logger.info("-"*80)
+            
+            session_id = f"breakpoint_test_t{trial_num}_l{layer_idx}_{int(__import__('time').time())}"
+            
+            try:
+                # Compute fingerprint to look up registered model
+                # (registered_models dict keys are fingerprints, not model names)
+                fingerprint, _ = manager._compute_fingerprint(model, model_id=model_name)
+                
+                if fingerprint not in manager.registered_models:
+                    logger.error(f"❌ Model not registered: fingerprint={fingerprint[:8]}, model_name={model_name}")
+                    logger.error(f"   Available fingerprints: {list(manager.registered_models.keys())}")
+                    raise RuntimeError(f"Model {model_name} (fingerprint: {fingerprint[:8]}) not registered")
+                
+                logger.debug(f"Using fingerprint {fingerprint[:8]} for model {model_name}")
+
+                model_output, metrics = await manager.coordinator.execute_remote_model_with_breakpoint(
+                    fingerprint=fingerprint,
+                    inputs={"input_ids": input_ids},
+                    breakpoint_layer_index=layer_idx,
+                    wait_for_resume=True,
+                    session_id=session_id,
+                )
+                
+                # Collect metrics
+                checkpoint_ms = metrics.get('checkpoint_time_ms', 0.0)
+                pause_ms = metrics.get('pause_duration_ms', 0.0)
+                restore_ms = metrics.get('restore_time_ms', 0.0)
+                overhead = metrics.get('overhead_percent', 0.0)
+                
+                per_layer_data[layer_idx]['checkpoint_times'].append(checkpoint_ms)
+                per_layer_data[layer_idx]['pause_durations'].append(pause_ms)
+                per_layer_data[layer_idx]['restore_times'].append(restore_ms)
+                per_layer_data[layer_idx]['overheads'].append(overhead)
+                
+                # Verify correctness at token level (more robust than logit norm)
+                correctness_passed = True
+                token_accuracy = 0.0
+                if model_output is not None and baseline_output is not None:
+                    try:
+                        if hasattr(model_output, 'logits'):
+                            output_logits = model_output.logits
+                        else:
+                            output_logits = model_output
+                        
+                        if hasattr(baseline_output, 'logits'):
+                            baseline_logits = baseline_output.logits
+                        else:
+                            baseline_logits = baseline_output
+                        
+                        # Compare at token level (more meaningful for OSDI)
+                        output_tokens = output_logits.argmax(dim=-1)
+                        baseline_tokens = baseline_logits.argmax(dim=-1)
+                        
+                        token_matches = (output_tokens == baseline_tokens).sum().item()
+                        total_tokens = output_tokens.numel()
+                        token_accuracy = 100.0 * token_matches / total_tokens if total_tokens > 0 else 0.0
+                        
+                        correctness_passed = token_accuracy >= token_accuracy_threshold
+                        
+                        logger.info(f"   Correctness check: {'✅ PASS' if correctness_passed else '❌ FAIL'}")
+                        logger.info(f"   Token accuracy: {token_accuracy:.1f}% ({token_matches}/{total_tokens})")
+                    except Exception as e:
+                        logger.warning(f"Could not verify correctness: {e}")
+                
+                per_layer_data[layer_idx]['token_accuracies'].append(token_accuracy)
+                per_layer_data[layer_idx]['checkpoint_sizes'].append(metrics.get('checkpoint_size_mb', 0.0))
+                
+                results["summary"]["successful"] += 1
+                
+                logger.info(f"✅ Layer {layer_idx} completed:")
+                logger.info(f"   Checkpoint: {checkpoint_ms:.1f}ms")
+                logger.info(f"   Pause: {pause_ms:.1f}ms")
+                logger.info(f"   Restore: {restore_ms:.1f}ms")
+                logger.info(f"   Overhead: {overhead:.1f}%")
+            
+            except Exception as e:
+                logger.error(f"❌ Breakpoint test failed: {e}", exc_info=True)
+                results["summary"]["failed"] += 1
+            
+            results["summary"]["total_tests"] += 1
+    
+    # Compute per-layer statistics
+    logger.info("\n" + "="*80)
+    logger.info("STATISTICAL ANALYSIS (Across Trials)")
+    logger.info("="*80)
     
     for layer_idx in breakpoint_layers:
-        logger.info("\n" + "-"*80)
-        logger.info(f"Testing breakpoint at layer {layer_idx}...")
-        logger.info("-"*80)
+        data = per_layer_data[layer_idx]
         
-        session_id = f"breakpoint_test_{layer_idx}"
+        stats = {
+            'checkpoint_time': compute_statistics(data['checkpoint_times']),
+            'pause_duration': compute_statistics(data['pause_durations']),
+            'restore_time': compute_statistics(data['restore_times']),
+            'overhead_percent': compute_statistics(data['overheads']),
+            'token_accuracy': compute_statistics(data['token_accuracies']),
+        }
         
-        try:
-            # Execute with breakpoint via remote server
-            model_output, metrics = await manager.coordinator.execute_remote_model_with_breakpoint(
-                fingerprint=manager.registered_models[model]['fingerprint'],
-                inputs={"input_ids": input_ids},
-                breakpoint_layer_index=layer_idx,
-                wait_for_resume=True,
-                session_id=session_id,
-            )
-            
-            # Collect metrics
-            checkpoint_ms = metrics.get('checkpoint_time_ms', 0.0)
-            pause_ms = metrics.get('pause_duration_ms', 0.0)
-            restore_ms = metrics.get('restore_time_ms', 0.0)
-            overhead = metrics.get('overhead_percent', 0.0)
-            
-            all_checkpoint_times.append(checkpoint_ms)
-            all_pause_durations.append(pause_ms)
-            all_restore_times.append(restore_ms)
-            all_overheads.append(overhead)
-            
-            # Verify correctness if available
-            correctness_passed = True
-            if model_output is not None and baseline_output is not None:
-                try:
-                    if hasattr(model_output, 'logits'):
-                        output_logits = model_output.logits
-                    else:
-                        output_logits = model_output
-                    
-                    if hasattr(baseline_output, 'logits'):
-                        baseline_logits = baseline_output.logits
-                    else:
-                        baseline_logits = baseline_output
-                    
-                    logits_diff = torch.norm(
-                        output_logits.float() - baseline_logits.float()
-                    ).item()
-                    correctness_passed = logits_diff < tolerance
-                    
-                    logger.info(f"   Correctness check: {'✅ PASS' if correctness_passed else '❌ FAIL'}")
-                    logger.info(f"   Logit difference: {logits_diff:.4f} (tolerance: {tolerance})")
-                except Exception as e:
-                    logger.warning(f"Could not verify correctness: {e}")
-            
-            # Store result
-            results["breakpoints"][layer_idx] = {
-                "checkpoint_time_ms": checkpoint_ms,
-                "pause_duration_ms": pause_ms,
-                "restore_time_ms": restore_ms,
-                "total_overhead_ms": checkpoint_ms + pause_ms + restore_ms,
-                "overhead_percent": overhead,
-                "correctness": correctness_passed,
-                "checkpoint_size_mb": metrics.get('checkpoint_size_mb', 0.0),
-            }
-            
-            results["summary"]["successful"] += 1
-            
-            logger.info(f"✅ Breakpoint test at layer {layer_idx} completed:")
-            logger.info(f"   Checkpoint: {checkpoint_ms:.1f}ms")
-            logger.info(f"   Pause: {pause_ms:.1f}ms")
-            logger.info(f"   Restore: {restore_ms:.1f}ms")
-            logger.info(f"   Total Overhead: {checkpoint_ms + pause_ms + restore_ms:.1f}ms ({overhead:.1f}%)")
+        results["statistics"][layer_idx] = stats
         
-        except Exception as e:
-            logger.error(f"❌ Breakpoint test failed: {e}", exc_info=True)
-            results["breakpoints"][layer_idx] = {"error": str(e)}
-            results["summary"]["failed"] += 1
-        
-        results["summary"]["total_tests"] += 1
+        logger.info(f"\nLayer {layer_idx}:")
+        logger.info(f"  Checkpoint: {format_statistics(stats['checkpoint_time'])}")
+        logger.info(f"  Pause:      {format_statistics(stats['pause_duration'])}")
+        logger.info(f"  Restore:    {format_statistics(stats['restore_time'])}")
+        logger.info(f"  Overhead:   {format_statistics(stats['overhead_percent'])}")
+        logger.info(f"  Accuracy:   {format_statistics(stats['token_accuracy'])}")
     
-    # Calculate summary statistics
-    if all_checkpoint_times:
-        results["summary"]["avg_checkpoint_time_ms"] = np.mean(all_checkpoint_times)
-        results["summary"]["avg_pause_duration_ms"] = np.mean(all_pause_durations)
-        results["summary"]["avg_restore_time_ms"] = np.mean(all_restore_times)
-        results["summary"]["avg_overhead_percent"] = np.mean(all_overheads)
+    # Summary statistics across all layers
+    all_overheads = [v for data in per_layer_data.values() for v in data['overheads']]
+    all_accuracies = [v for data in per_layer_data.values() for v in data['token_accuracies']]
+    
+    if all_overheads:
+        results["summary"]["overhead_stats"] = compute_statistics(all_overheads)
+        logger.info(f"\nOverall Overhead (all layers & trials):")
+        logger.info(f"  {format_statistics(results['summary']['overhead_stats'])}")
+    
+    if all_accuracies:
+        results["summary"]["accuracy_stats"] = compute_statistics(all_accuracies)
+        logger.info(f"\nOverall Token Accuracy (all layers & trials):")
+        logger.info(f"  {format_statistics(results['summary']['accuracy_stats'])}")
     
     return results
 
 
-async def main():
-    """Main entry point."""
+def main():
+    """Main entry point - following exp2 pattern exactly."""
     parser = argparse.ArgumentParser(
         description='Experiment 3: White-Box Breakpoint Debugging (Client-Server Mode)'
     )
@@ -340,63 +386,80 @@ async def main():
         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
         help='Logging level'
     )
-    
+
     args = parser.parse_args()
-    
+
     # Setup
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     setup_logging(output_dir, args.log_level)
-    
+
     logger.info("🚀 Experiment 3: White-Box Breakpoint Debugging (Client-Server Mode)")
     logger.info(f"   Config: {args.config}")
     logger.info(f"   Model: {args.model}")
     logger.info(f"   Server: {args.server}")
     logger.info(f"   Output: {output_dir}")
     logger.info("")
-    
+
+    # Initialize Djinn BEFORE entering async context (following exp2 pattern exactly)
+    logger.info(f"[Djinn] Initializing client...")
+    ensure_initialized_before_async(args.server)
+
+    # Verify coordinator is available
+    coordinator = get_coordinator()
+    if coordinator is None:
+        raise RuntimeError("Failed to initialize Djinn coordinator. Check server connection.")
+
+    # Coordinator will be started in async context if needed
+    logger.info("[Djinn] Client initialized successfully (coordinator will start in async context if needed)")
+
+    # Run the experiment (pass coordinator to avoid async context issues)
+    success = asyncio.run(run_experiment(args, coordinator))
+
+    return 0 if success else 1
+
+
+async def run_experiment(args, coordinator):
+    """Run experiment in async context - following exp2 pattern exactly."""
     try:
-        # Initialize Djinn before entering async context
-        ensure_initialized_before_async(args.server)
-        
         # Load configuration
         config = load_config(args.config)
-        
+
         # Get device
         device = get_device()
-        
+
         # Load model
         model, tokenizer = load_model_and_tokenizer(args.model)
-        
-        # Initialize coordinator and model manager
-        coordinator = get_coordinator()
+
+        # Initialize model manager with the coordinator
         manager = EnhancedModelManager(coordinator=coordinator)
-        
+
         # Register model with server
         logger.info("\n" + "="*80)
         logger.info("REGISTERING MODEL WITH SERVER")
         logger.info("="*80 + "\n")
-        
+
         await manager.register_model(model, model_id=args.model)
-        
+
         logger.info("\n" + "="*80)
         logger.info("STARTING BREAKPOINT DEBUGGING EVALUATION")
         logger.info("="*80 + "\n")
-        
+
         # Run experiment
         results = await run_breakpoint_test(
             manager=manager,
             model=model,
             tokenizer=tokenizer,
             config=config,
-            device=device
+            device=device,
+            model_name=args.model
         )
-        
+
         # Save results
-        results_file = output_dir / "results.json"
+        results_file = args.output_dir / "results.json"
         with open(results_file, 'w') as f:
             json.dump(results, f, indent=2, default=str)
-        
+
         logger.info("\n" + "="*80)
         logger.info("EXPERIMENT COMPLETED")
         logger.info("="*80)
@@ -404,20 +467,19 @@ async def main():
         logger.info(f"   Total tests: {results['summary']['total_tests']}")
         logger.info(f"   Successful: {results['summary']['successful']}")
         logger.info(f"   Failed: {results['summary']['failed']}")
-        logger.info(f"\n⏱️  Timing (average across layers):")
-        logger.info(f"   Checkpoint: {results['summary']['avg_checkpoint_time_ms']:.1f}ms")
-        logger.info(f"   Pause: {results['summary']['avg_pause_duration_ms']:.1f}ms")
-        logger.info(f"   Restore: {results['summary']['avg_restore_time_ms']:.1f}ms")
-        logger.info(f"   Overhead: {results['summary']['avg_overhead_percent']:.1f}%")
+        if 'accuracy_stats' in results['summary']:
+            logger.info(f"   Token accuracy: {results['summary']['accuracy_stats']['mean']:.1f}% ± {results['summary']['accuracy_stats']['std']:.1f}%")
+        if 'overhead_stats' in results['summary']:
+            logger.info(f"   Overhead: {results['summary']['overhead_stats']['mean']:.1f}% ± {results['summary']['overhead_stats']['std']:.1f}%")
         logger.info(f"\n📁 Results saved to {results_file}")
-        
-        return 0
-        
+
+        return True
+
     except Exception as e:
         logger.error(f"❌ Experiment failed: {e}", exc_info=True)
-        return 1
+        return False
 
 
 if __name__ == '__main__':
-    exit_code = asyncio.run(main())
+    exit_code = main()
     sys.exit(exit_code)

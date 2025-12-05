@@ -1213,10 +1213,19 @@ class DjinnServer:
                         response_bytes = response['_serialized_response']
                         logger.info("✅ Response using pre-serialized binary protocol (EXECUTE_WITH_BREAKPOINT)")
                     else:
-                        # Fallback: error response using JSON
-                        from djinn.core.secure_serializer import SecureSerializer
-                        response_bytes = SecureSerializer.serialize_response(response)
-                        logger.warning("⚠️  Using JSON fallback for EXECUTE_WITH_BREAKPOINT error response")
+                        # Fallback: error response using binary protocol (same as success path)
+                        from djinn.core.model_execution_serializer import ModelExecutionSerializer
+                        response_bytes = ModelExecutionSerializer.serialize_execute_with_breakpoint_response(
+                            result=None,
+                            checkpoint_time_ms=0.0,
+                            restore_time_ms=0.0,
+                            checkpoint_size_mb=0.0,
+                            overhead_percent=0.0,
+                            metrics={},
+                            status='error',
+                            message=response.get('message', 'Breakpoint execution failed')
+                        )
+                        logger.warning("⚠️  Using error response with binary protocol (EXECUTE_WITH_BREAKPOINT)")
                 else:
                     # Use secure JSON protocol for other message types
                     from djinn.core.secure_serializer import SecureSerializer
