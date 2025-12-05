@@ -2730,14 +2730,20 @@ class DjinnServer:
             restore_time_ms = metrics.get('restore_time_ms', 0.0)
             checkpoint_size_mb = metrics.get('checkpoint_size_mb', 0.0)
             overhead_percent = metrics.get('overhead_percent', 0.0)
-            
+
+            # Filter metrics to only include JSON-serializable values (exclude tensors)
+            serializable_metrics = {
+                k: v for k, v in metrics.items()
+                if k != 'model_output' and isinstance(v, (int, float, str, bool, type(None)))
+            }
+
             response_data = ModelExecutionSerializer.serialize_execute_with_breakpoint_response(
                 result=model_output,
                 checkpoint_time_ms=checkpoint_time_ms,
                 restore_time_ms=restore_time_ms,
                 checkpoint_size_mb=checkpoint_size_mb,
                 overhead_percent=overhead_percent,
-                metrics=metrics,
+                metrics=serializable_metrics,
                 status='success',
             )
             
