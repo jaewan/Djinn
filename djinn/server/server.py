@@ -490,7 +490,7 @@ class DjinnServer:
                 logger.info(f"Using GPU ID 0 (after CUDA_VISIBLE_DEVICES restriction)")
                 server_state.initialize(gpu_id=0)
                 t2 = time.time()
-                logger.info(f"[STARTUP] T+{t2-start_time:.1f}s: ServerState initialized with GPU {preferred_gpu} ({(t2-t1)*1000:.0f}ms)")
+                logger.info(f"[STARTUP] T+{t2-start_time:.1f}s: ServerState initialized with GPU 0 ({(t2-t1)*1000:.0f}ms)")
             except Exception as init_err:
                 logger.warning(f"[STARTUP] ⚠️  Failed to initialize server state GPU context: {init_err}")
                 import traceback
