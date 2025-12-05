@@ -255,6 +255,32 @@ class HybridExecutor:
                         execution_output = gpu_model(**gpu_inputs)
                 timing_breakdown['execution'] = (time.perf_counter() - exec_start) * 1000
 
+                # ✅ Phase 3: Extract and analyze SRG for lifetime-based eviction
+                try:
+                    from djinn.frontend.core.srg_view import build_srg_view
+                    srg_start = time.perf_counter()
+                    srg_nodes = build_srg_view(execution_output, max_nodes=1000)
+                    
+                    # Analyze tensor lifetimes for eviction priority
+                    if self.phase_executor and self.phase_executor.lifetime_evictor and srg_nodes:
+                        # Build edges from DAG
+                        srg_edges = []
+                        for node in srg_nodes:
+                            node_id = node.get('id')
+                            for inp_id in node.get('input_ids', []):
+                                srg_edges.append({
+                                    'source_id': inp_id,
+                                    'target_id': node_id,
+                                    'tensor_id': f"{inp_id}_{node_id}"
+                                })
+                        
+                        self.phase_executor.lifetime_evictor.analyze_graph_lifetimes(srg_nodes, srg_edges)
+                        logger.debug(f"SRG lifetime analysis complete for {len(srg_nodes)} nodes")
+                    
+                    timing_breakdown['srg_analysis'] = (time.perf_counter() - srg_start) * 1000
+                except Exception as e:
+                    logger.debug(f"SRG analysis error (non-critical): {e}")
+
                 skel_start = time.perf_counter()
                 if return_lazy:
                     prepared_output = self._skeletonize(execution_output, session_id)

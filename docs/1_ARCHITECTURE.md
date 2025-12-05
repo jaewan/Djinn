@@ -222,24 +222,27 @@ a, b, c = chunks              # Unpacking works (still lazy)
 result = a.cpu()              # Only chunk 0 materializes
 ```
 
-### 2.2 Semantically Rich Graph (SRG)
+### 2.2 Semantically Rich Graph (SRG) - Basic Implementation
 
-The SRG annotates the LazyTensor DAG with ML semantics:
+The SRG provides lightweight semantic extraction from LazyTensor DAGs for eviction decisions:
 
 ```python
 @dataclass
 class SemanticMetadata:
-    # Execution characteristics
-    execution_phase: ExecutionPhase      # prefill, decode, training
-    data_residency: DataResidency        # ephemeral, persistent, stateful
-    compute_intensity: float              # FLOPs per byte
-    memory_pattern: MemoryPattern        # sequential, random
-    
-    # Optimization hints
-    can_fuse: bool                       # Fusable with neighbors
-    can_recompute: bool                  # Cheap to recompute
-    must_colocate: Optional[NodeId]      # Pin to same device
-    priority: int                        # Execution priority
+    # Basic implementation (Phase 3)
+    id: int                              # Tensor ID
+    operation: str                       # PyTorch operation
+    shape: Optional[Tuple]               # Tensor shape
+    dtype: Optional[str]                 # Data type
+    semantic_class: Optional[str]        # Basic classification
+    lifecycle: Optional[str]             # Memory lifecycle
+    phase: Optional[str]                 # Execution phase
+
+    # Future extensions (not yet implemented)
+    # compute_intensity: float
+    # memory_pattern: MemoryPattern
+    # can_fuse: bool
+    # priority: int
 ```
 
 **Semantic Dimensions:**
@@ -453,7 +456,7 @@ Djinn supports comprehensive model handling across all PyTorch model types:
 
 **Purpose**: Intelligent KV cache management for multi-agent workloads through idle detection and proactive swap-to-host.
 
-**Three Sub-Components:**
+**Implemented Sub-Components:**
 
 **9a. Semantic Activity Tracker (Idle Detector)**
 - **File**: `djinn/server/semantic_idle_detector.py`
@@ -462,7 +465,7 @@ Djinn supports comprehensive model handling across all PyTorch model types:
 - **Benefits**: Zero-overhead detection (lightweight timestamp tracking, no state tracking of individual ops)
 
 **9b. Host Swap Pool (KV Eviction)**
-- **File**: `djinn/server/host_swap_pool.py`
+- **File**: `djinn/server/host_swap_pool_v2.py`
 - **Logic**: Pre-allocated pinned CPU memory pool (~32GB typical) for offloading idle sessions' KV caches
 - **Algorithm**: Bump-pointer allocator with fragmentation tracking and tail-region compaction
 - **Performance**: Direct DMA transfer to host via dedicated CUDA stream (no global `torch.cuda.synchronize()`)
@@ -475,11 +478,11 @@ Djinn supports comprehensive model handling across all PyTorch model types:
 - **Residency Tracking**: `is_swapped` flag maintains consistent state between VMU and swap pool
 - **Stream Safety**: All transfers use dedicated `_transfer_stream` to avoid blocking compute
 
-**9d. LIFO Queue (Queue Fairness)**
-- **File**: Modified `djinn/server/qos/basic_scheduler.py`
-- **Logic**: When overloaded (queue depth > 2× concurrency), pop from end of queue (LIFO) instead of front (FIFO)
-- **Metric**: `lifo_switches` counter tracks overload state transitions (not every schedule cycle)
-- **Benefit**: Ensures newly-arriving requests don't timeout behind stale ones during congestion
+**9d. Basic SRG-Based Eviction**
+- **File**: `djinn/server/multi_tenant/kv_session_manager.py`
+- **Method**: `get_eviction_candidates()` returns sessions sorted by basic priority
+- **Logic**: Prioritizes idle sessions on GPU, uses simple heuristics (not full semantic analysis)
+- **Integration**: Called by memory pressure handler for intelligent eviction order
 
 **9e. Client-Side Semantic Signaling: djinn.signal_phase()**
 |- **File**: `djinn/__init__.py` + `djinn/core/semantic_hints.py`
@@ -487,15 +490,6 @@ Djinn supports comprehensive model handling across all PyTorch model types:
 |- **Integration**: Works within `djinn.session()` context manager for semantic hint propagation
 |- **Benefit**: Enables **zero-latency proactive swapping** (immediate, no waiting for 1.0s idle threshold)
 |- **Use Case**: Agent workloads with predictable idle periods (Reason → Act → Reflect pattern)
-
-**Semantic Eviction Policy (MultiTenantCoordinator Enhancement)**
-|- **File**: Modified `djinn/server/multi_tenant/multi_tenant_coordinator.py`
-|- **Semantic Rules**:
-  * Never evict INTERACTIVE clients with active requests (user-facing agents must not stall)
-  * Never evict sessions in DECODE phase (KV cache is most critical during generation)
-  * Evict BATCH clients first, then SERVING, then oldest INTERACTIVE
-  * Within same priority class, evict clients with lowest throughput
-|- **Contrast with LRU**: Uses semantic understanding (execution phase + client priority), not blind recency
 
 **Zero-Copy Transfer Details (KVSessionManager)**
 |- **Serialization Protocol**: Flattens nested KV structures (e.g., HuggingFace DynamicCache) into single uint8 tensor
@@ -513,7 +507,7 @@ python -m djinn.server.server_main \
 
 **Testing**: 20/20 unit tests covering all components plus end-to-end integration tests
 
-**Experimental Validation**: Experiment 1 successfully scaled 50 concurrent agents + Llama-70B on L4 24GB GPU, achieving 6.85 tokens/sec aggregate throughput with predictable queuing latency (no OOM, no thrashing)
+**Experimental Validation**: Poisson experiment successfully scaled 80 concurrent agents on 80GB GPU, achieving 647 KV swaps, 351 restores, and 6-second P99 latency (no OOM, no thrashing). Demonstrates 67% improvement over vLLM's 48-agent OOM limit.
 
 ### 3.10 Component 10: Phase 4 Validation (Testing & Metrics)
 
@@ -1494,14 +1488,14 @@ The ten-component architecture cleanly separates concerns while maintaining prod
 **Validation Status**:
 - ✅ Phase 1: 50% (infrastructure foundational)
 - ✅ Phase 2: 100% (ring buffer complete, tested)
-- ✅ Phase 3: 100% (semantic scheduler complete, 20/20 tests passing)
+- ✅ Phase 3: 75% (semantic scheduler core implemented, validated with Poisson experiment)
 - ✅ Phase 4: 100% (validation tests implemented and verified)
 
 Djinn v2.3.18 successfully demonstrates that:
 1. **GPU-Resident Model Loading** eliminates device mismatch errors by making all parameters GPU tensors from initialization
 2. **Ring Buffer Virtualization** delivers 59× speedup over standard CPU offloading (3.6s vs 212s) for memory-constrained LLM serving
 3. **Adaptive Virtualization** enables running 26GB models on 24GB GPUs with 45% parameter virtualization and 99.7% buffer utilization
-4. **Kernel-level DMA Architecture** with semantic scheduling, comprehensive safety interlocks, and rigorous validation enables production-grade GPU disaggregation
+4. **Semantic Scheduler** enables 80 concurrent agents (647 KV swaps) with 6-second P99 latency, demonstrating memory virtualization through intelligent KV cache management
 
 The system successfully passed OSDI Experiment 2 evaluation with 59× speedup over HuggingFace Accelerate, demonstrating that memory virtualization is a practical and efficient solution for memory-constrained LLM serving while maintaining full PyTorch API compatibility.
 

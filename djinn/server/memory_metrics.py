@@ -334,6 +334,50 @@ vmu_models_loaded = Gauge(
 
 
 # ============================================================================
+# SEMANTIC SIGNAL METRICS (PHASE 5)
+# ============================================================================
+
+semantic_signals_received = Counter(
+    'genie_semantic_signals_total',
+    'Semantic phase signals received from clients',
+    ['phase']  # IO_WAIT, COMPUTE
+)
+
+semantic_evictions = Counter(
+    'genie_semantic_evictions_total',
+    'Evictions triggered by semantic IO_WAIT signals (not timeout)'
+)
+
+semantic_restores = Counter(
+    'genie_semantic_restores_total',
+    'Pre-fetches triggered by semantic COMPUTE signals'
+)
+
+semantic_eviction_latency_ms = Histogram(
+    'genie_semantic_eviction_latency_ms',
+    'Latency of semantic-triggered evictions in milliseconds',
+    buckets=(1, 5, 10, 50, 100, 500, 1000, 5000)
+)
+
+semantic_restore_latency_ms = Histogram(
+    'genie_semantic_restore_latency_ms',
+    'Latency of semantic-triggered restores in milliseconds',
+    buckets=(1, 5, 10, 50, 100, 500, 1000, 5000)
+)
+
+semantic_prefetches = Counter(
+    'genie_semantic_prefetches_scheduled_total',
+    'Prefetches scheduled based on estimated resume time'
+)
+
+semantic_prefetch_latency_ms = Histogram(
+    'genie_semantic_prefetch_latency_ms',
+    'Latency of proactive prefetch operations in milliseconds',
+    buckets=(1, 5, 10, 50, 100, 500, 1000, 5000)
+)
+
+
+# ============================================================================
 # METRICS COLLECTION HELPER
 # ============================================================================
 
@@ -527,6 +571,30 @@ class MetricsCollector:
         if self.prometheus_enabled:
             vmu_active_sessions.set(active_sessions)
             vmu_models_loaded.set(models_loaded)
+    
+    # Semantic Signal Metrics
+    def record_semantic_signal(self, phase: str) -> None:
+        """Record semantic phase signal received."""
+        if self.prometheus_enabled:
+            semantic_signals_received.labels(phase=phase.upper()).inc()
+    
+    def record_semantic_eviction(self, latency_ms: float) -> None:
+        """Record eviction triggered by IO_WAIT signal."""
+        if self.prometheus_enabled:
+            semantic_evictions.inc()
+            semantic_eviction_latency_ms.observe(latency_ms)
+    
+    def record_semantic_restore(self, latency_ms: float) -> None:
+        """Record restore triggered by COMPUTE signal."""
+        if self.prometheus_enabled:
+            semantic_restores.inc()
+            semantic_restore_latency_ms.observe(latency_ms)
+    
+    def record_semantic_prefetch(self, latency_ms: float) -> None:
+        """Record proactive prefetch scheduled by estimated resume time."""
+        if self.prometheus_enabled:
+            semantic_prefetches.inc()
+            semantic_prefetch_latency_ms.observe(latency_ms)
 
 
 # Global metrics collector instance

@@ -15,7 +15,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, List
 
 import torch
 
@@ -35,6 +35,7 @@ class KVSession:
     swap_offset: Optional[int] = None  # Offset in host swap pool (Phase 3)
     swap_bytes_actual: int = 0  # Actual bytes swapped (captured during eviction for restore)
     kv_structure_metadata: Optional[Dict[str, Any]] = None  # Metadata to reconstruct KV structure on restore
+    prefetch_in_progress: bool = False  # ✅ Prevent race condition: skip COMPUTE restore if prefetch already scheduled
 
 
 class KVSessionManager:
@@ -280,7 +281,15 @@ class KVSessionManager:
         }
 
     def _move_structure_to_device(self, data: Any, device: torch.device) -> Any:
-        """Recursively move tensors to the specified device."""
+        """
+        Recursively move tensors to the specified device.
+        
+        CRITICAL FIX for DynamicCache: Must deep-clone the cache object to capture
+        tensor state BEFORE HuggingFace's internal loop modifies/clears it.
+        
+        Without this deep-copy, the DynamicCache object becomes a zombie with empty
+        key_cache/value_cache lists after model.generate() completes.
+        """
         if isinstance(data, torch.Tensor):
             return data.to(device, non_blocking=True)
         if isinstance(data, (list, tuple)):
@@ -288,6 +297,64 @@ class KVSessionManager:
             return type(data)(converted)
         if isinstance(data, dict):
             return {k: self._move_structure_to_device(v, device) for k, v in data.items()}
+        
+        # ✅ CRITICAL: Handle HuggingFace DynamicCache (or any Cache subclass)
+        # Deep-copy the tensor references to capture state NOW, not later
+        try:
+            from transformers.cache_utils import Cache
+            if isinstance(data, Cache):
+                logger.debug(f"Deep-copying DynamicCache to {device} (capturing tensor state)")
+                
+                # Try the recommended approach: to_legacy_cache -> copy -> restore
+                try:
+                    # Convert to legacy tuple format (more stable)
+                    legacy_cache = data.to_legacy_cache()
+                    if legacy_cache is not None:
+                        # Deep copy the legacy cache (list of tuples of tensors)
+                        copied_legacy = self._move_structure_to_device(legacy_cache, device)
+                        logger.debug("✅ Converted DynamicCache to legacy format and deep-copied")
+                        return copied_legacy
+                except Exception as e:
+                    logger.warning(f"Failed to use to_legacy_cache: {e}, falling back to direct copy")
+                
+                # Fallback: Direct key_cache/value_cache clone
+                # This is more fragile but works for current HuggingFace versions
+                if hasattr(data, 'key_cache') and hasattr(data, 'value_cache'):
+                    try:
+                        new_key_cache = []
+                        for k in data.key_cache:
+                            if k is not None:
+                                # Clone to capture value NOW, before it gets cleared
+                                new_key_cache.append(k.clone().to(device, non_blocking=True))
+                            else:
+                                new_key_cache.append(None)
+                        
+                        new_value_cache = []
+                        for v in data.value_cache:
+                            if v is not None:
+                                # Clone to capture value NOW
+                                new_value_cache.append(v.clone().to(device, non_blocking=True))
+                            else:
+                                new_value_cache.append(None)
+                        
+                        # Reconstruct the cache object
+                        from transformers.cache_utils import DynamicCache
+                        new_cache = DynamicCache()
+                        new_cache.key_cache = new_key_cache
+                        new_cache.value_cache = new_value_cache
+                        
+                        logger.debug(f"✅ Deep-cloned DynamicCache: {len(new_key_cache)} layers")
+                        return new_cache
+                    except Exception as e:
+                        logger.error(f"Failed to deep-copy DynamicCache tensors: {e}")
+                        raise
+        except ImportError:
+            # transformers not available, just pass through
+            pass
+        except Exception as e:
+            logger.warning(f"Exception handling DynamicCache: {e}")
+            # Fall through to return data as-is
+        
         return data
 
     def _estimate_size_bytes(self, data: Any) -> int:
@@ -377,6 +444,9 @@ class KVSessionManager:
                 sess.is_swapped = True
                 self.stats["kv_bytes_pinned"] -= actual_bytes
                 
+                # ✅ CRITICAL FIX: Clear kv_cache to free GPU memory immediately!
+                sess.kv_cache = None
+                
                 return actual_bytes
             
             except Exception as e:
@@ -412,27 +482,22 @@ class KVSessionManager:
                 logger.debug(f"Session {session_id} not swapped")
                 return 0
             
-            if sess.kv_cache is None:
-                logger.warning(f"Session {session_id} missing KV cache")
-                return 0
-            
             try:
-                # ✅ SIMPLIFIED: Delegate to PyTorch's allocator
-                # This method handles:
-                # 1. Getting the pinned CPU tensor from swap pool
-                # 2. Allocating new GPU tensor
-                # 3. Copying from CPU to GPU (with non_blocking=True)
-                # 4. Synchronizing the GPU stream
-                # 5. Freeing the pinned memory (PyTorch allocator reclaims it)
-                
+                # ✅ CRITICAL FIX: restore_and_copy now returns GPU tensor, not just size!
                 swap_pool = get_swap_pool()
-                size_bytes = await asyncio.to_thread(
+                restored_tensor = await asyncio.to_thread(
                     swap_pool.restore_and_copy,
                     session_id,
                     sess.gpu_id
                 )
                 
-                # Mark as restored
+                if restored_tensor is None:
+                    logger.warning(f"Restore failed: session {session_id} returned None")
+                    return 0
+                
+                # ✅ CRITICAL FIX: Store the restored tensor in kv_cache!
+                size_bytes = restored_tensor.numel() * restored_tensor.element_size()
+                sess.kv_cache = restored_tensor
                 sess.is_swapped = False
                 self.stats["kv_bytes_pinned"] += size_bytes
                 
@@ -775,6 +840,44 @@ class KVSessionManager:
         except Exception as e:
             logger.debug(f"Could not verify swap pool state: {e}")
             return sess.is_swapped
+    
+    def get_eviction_candidates(self, memory_pressure_bytes: int = 0) -> List[str]:
+        """
+        Get sessions to evict based on SRG lifetime analysis and priority.
+        
+        Returns sessions sorted by eviction priority (lowest priority first).
+        Candidates are sessions that are NOT already swapped and HAVE KV cache.
+        
+        Args:
+            memory_pressure_bytes: Bytes needed (for future heuristics)
+        
+        Returns:
+            List of session IDs sorted by eviction priority
+        """
+        candidates = []
+        
+        try:
+            with self._lock:
+                for session_id, sess in self._sessions.items():
+                    if sess.is_swapped or sess.kv_cache is None:
+                        continue  # Skip already swapped or empty sessions
+                    
+                    # Use eviction priority from semantic memory manager
+                    # Lower priority value = evict first
+                    priority_value = sess.eviction_priority.value if hasattr(sess, 'eviction_priority') and sess.eviction_priority else 5
+                    candidates.append((session_id, priority_value))
+            
+            # Sort by priority (lowest first)
+            candidates.sort(key=lambda x: x[1])
+            
+            # Return just the session IDs
+            result = [s for s, _ in candidates]
+            logger.debug(f"Eviction candidates: {len(result)} sessions, top 3: {[s[:12] for s in result[:3]]}")
+            return result
+        
+        except Exception as e:
+            logger.debug(f"Error getting eviction candidates: {e}")
+            return []
 
 
 _global_kv_session_manager: Optional[KVSessionManager] = None

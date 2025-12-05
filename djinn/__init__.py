@@ -164,17 +164,24 @@ from .backend.runtime.initialization import (
 from .core.semantic_hints import session, SemanticHints, Priority, get_current_hints
 
 # Public API - Phase 3 (Semantic Signaling for Agent Scheduling)
-def signal_phase(phase_name: str, session_id: Optional[str] = None) -> bool:
+def signal_phase(
+    phase_name: str,
+    session_id: Optional[str] = None,
+    estimated_resume_ms: Optional[int] = None
+) -> bool:
     """
     Signal to the server that an agent has entered a new execution phase.
     
     This enables the Semantic Scheduler to make proactive decisions:
     - "IO_WAIT": Agent is entering tool use / idle phase → swap KV cache to host
+      (optional: provide estimated_resume_ms for proactive pre-fetch scheduling)
     - "COMPUTE": Agent is resuming computation → restore KV cache from host
     
     Args:
         phase_name: Phase identifier ("IO_WAIT", "COMPUTE", etc.)
         session_id: Optional session ID to signal. If None, uses current session context.
+        estimated_resume_ms: Optional hint for IO_WAIT phase - estimated ms until COMPUTE signal.
+                           Enables server to schedule KV restore ahead of time (proactive pre-fetch).
     
     Returns:
         True if signal was processed, False if no session context available
@@ -183,9 +190,9 @@ def signal_phase(phase_name: str, session_id: Optional[str] = None) -> bool:
         >>> import djinn
         >>> with djinn.session(phase="prefill", session_id="agent_0"):
         ...     output = model(input_ids)  # Reason phase
-        ...     djinn.signal_phase("IO_WAIT")  # Tell server: entering Act phase
-        ...     await asyncio.sleep(10)  # Simulate tool use
-        ...     djinn.signal_phase("COMPUTE")  # Tell server: resuming computation
+        ...     djinn.signal_phase("IO_WAIT", estimated_resume_ms=15000)  # 15s think time
+        ...     await asyncio.sleep(15)  # Simulate tool use
+        ...     djinn.signal_phase("COMPUTE")  # Cache already pre-fetched!
     """
     try:
         from .core.semantic_hints import get_current_hints
@@ -198,10 +205,26 @@ def signal_phase(phase_name: str, session_id: Optional[str] = None) -> bool:
             logger.debug(f"signal_phase({phase_name}): no session context available")
             return False
         
-        # In a real implementation, this would send a message to the server
-        # For now, we just log it - the actual signaling happens via semantic hints
-        # in the execute_model call which includes the phase in request headers
-        logger.debug(f"signal_phase({phase_name}): session_id={session_id}")
+        # Send signal to server via coordinator RPC (fire-and-forget)
+        try:
+            coordinator = get_coordinator()
+            if coordinator:
+                # Use asyncio.create_task for fire-and-forget semantics
+                import asyncio
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(coordinator.send_signal_phase(session_id, phase_name, estimated_resume_ms))
+                    logger.debug(f"signal_phase({phase_name}): session_id={session_id}, phase={phase_name}, "
+                               f"estimated_resume_ms={estimated_resume_ms}")
+                    return True
+                except RuntimeError:
+                    # ✅ FIX: Don't silently fail - log and return False
+                    logger.warning(f"signal_phase({phase_name}): no running event loop, cannot send signal")
+                    return False
+        except Exception as e:
+            logger.debug(f"signal_phase({phase_name}): coordinator error {e}")
+            return False
+        
         return True
     except Exception as e:
         logger.debug(f"signal_phase({phase_name}): error {e}")

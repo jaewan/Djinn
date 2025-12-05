@@ -28,6 +28,7 @@ class MessageType(IntEnum):
     EXECUTE_BATCH = 0x0D  # ✅ NEW: Execute batch of models
     EXECUTE_STAGE = 0x0E  # Stage-level execution (encoder/decoder)
     EXECUTE_WITH_BREAKPOINT = 0x0F  # ✅ NEW: Execute with mid-inference breakpoint (Exp3)
+    SIGNAL_PHASE = 0x10  # ✅ NEW: Semantic phase signal (IO_WAIT, COMPUTE)
 
     # Error response
     ERROR = 0xFF

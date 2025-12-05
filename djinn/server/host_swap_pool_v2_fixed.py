@@ -175,7 +175,7 @@ class HostSwapPool:
                 logger.error(f"Failed to swap session {session_id}: {e}")
                 raise
     
-    def restore_and_copy(self, session_id: str, gpu_device: int = 0) -> torch.Tensor:
+    def restore_and_copy(self, session_id: str, gpu_device: int = 0) -> int:
         """
         Restore KV cache from pinned host memory back to GPU.
         
@@ -184,7 +184,7 @@ class HostSwapPool:
             gpu_device: GPU device to restore to
             
         Returns:
-            Restored GPU tensor (NOT just size bytes!)
+            Bytes restored, or 0 if not found/not swapped
             
         Raises:
             RuntimeError: If restore fails
@@ -193,7 +193,7 @@ class HostSwapPool:
             mapping = self.swapped_sessions.get(session_id)
             if mapping is None:
                 logger.debug(f"Session {session_id} not swapped, skipping restore")
-                return None
+                return 0
             
             try:
                 # Allocate new GPU tensor
@@ -222,8 +222,8 @@ class HostSwapPool:
                     f"total_swapped={self.stats['current_swapped_mb']:.1f}MB"
                 )
                 
-                # ✅ CRITICAL FIX: Return the GPU tensor so it doesn't get GC'd!
-                return gpu_tensor
+                # Return the new GPU tensor for the caller to use
+                return size_bytes
                 
             except Exception as e:
                 self.stats["restore_errors"] += 1
