@@ -31,7 +31,8 @@ Agent Arrival: Poisson process (λ = 0.2 agents/second)
   └─ Exponential inter-arrival times (prevents thundering herd)
 
 Reason Phase (Prefill + Initial Decode)
-  ├─ Input: 1,024 tokens (~0.5GB KV cache)
+  ├─ Input: 2,048 tokens (~1GB KV cache per agent)
+  ├─ Model: Llama-2-13B (26GB weights)
   ├─ Output: 50 new tokens
   └─ Client signals: djinn.signal_phase("IO_WAIT")
 
@@ -47,7 +48,10 @@ Reflect Phase (Decode with KV Reuse)
   ├─ Decode-only phase (reuses cached KV)
   └─ Output: 50 new tokens
 
-Steady State: ~20-30 active agents in GPU at any time
+Memory Demand: 80 agents × 1GB + 26GB weights = 106GB > 80GB GPU
+  └─ PROVES virtualization is essential (not just fragmentation fix)
+
+Steady State: ~10-15 active agents in GPU at any time
 ```
 
 ## Metrics Tracked

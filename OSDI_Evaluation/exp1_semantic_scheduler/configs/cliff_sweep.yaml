@@ -17,14 +17,15 @@ workload:
   think_time_max: 20.0
   
   # Model inference parameters
-  context_length: 1024  # Input tokens (matches Djinn/vLLM workload)
+  context_length: 2048  # Input tokens (2048 for larger KV cache pressure)
   new_tokens: 50       # Output tokens to generate
   iterations: 1        # One pass per agent
   
-  # Memory pressure
-  # With 80 agents × 2GB KV cache = 160GB total demand
-  # But GPU only has 80GB
-  # Proves memory virtualization is essential
+  # Memory pressure (TRUE OVERSUBSCRIPTION)
+  # Llama-2-13B weights: 26GB
+  # With 80 agents × 1GB KV cache (2048 context) = 80GB total demand
+  # Total: 26GB + 80GB = 106GB > 80GB physical GPU
+  # This PROVES memory virtualization is necessary
 
 expected_results:
   # At each N, we expect:

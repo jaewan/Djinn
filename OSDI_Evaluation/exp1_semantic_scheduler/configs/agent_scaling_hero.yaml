@@ -4,7 +4,7 @@ experiment:
   version: "1.0"
 
 workload:
-  model_id: "meta-llama/Llama-2-7b-hf"
+  model_id: "meta-llama/Llama-2-13b-hf"
   dtype: "float16"
   total_agents: 80                     # Well above vLLM's OOM point (N=48)
   arrival_rate: 0.2                    # 1 agent per 5 seconds (sustainable)
@@ -12,7 +12,7 @@ workload:
   think_time_max: 20.0
   new_tokens: 50
   iterations: 1
-  context_length: 1024
+  context_length: 2048                 # Increased for true virtualization proof
 
 semantic_scheduler:
   enabled: true
