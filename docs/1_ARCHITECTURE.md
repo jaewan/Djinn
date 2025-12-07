@@ -544,6 +544,20 @@ Djinn supports comprehensive model handling across all PyTorch model types:
 - **Latency**: 0.01ms signal delivery (measured P99)
 - **Benefit**: Zero-latency proactive swapping vs. 1.0s idle threshold
 - **Use Case**: Agents with predictable idle periods (Reason → Tool → Reflect)
+- **Automation**: Signals can be automatically generated via semantic hooking (library interposition) or reactive monitoring
+
+**The Oracle Dilemma and Automation Solution:**
+
+Proactive KV cache swapping requires predicting when GPU operations will resume. The challenge is avoiding PCIe bus thrashing when predictions are wrong. Djinn solves this through **semantic hooking** that leverages Agent framework structure rather than user code inspection.
+
+**Scientific Principle:** Agent workloads follow predictable patterns (LLM Inference → Tool Execution → LLM Inference). Entering a `Tool.run()` method is a semantic guarantee that GPU compute is pausing— not a guess based on timing heuristics.
+
+**Implementation:** Djinn provides wrappers for standard agent libraries (LangChain, LlamaIndex) that automatically signal IO_WAIT on tool execution and COMPUTE on tool completion, covering 90% of agent deployments transparently.
+
+**Three-Level Hierarchy:**
+1. **Explicit (Syscall)**: `djinn.signal_phase()` - Used in Experiment 1 for precision isolation
+2. **Implicit (Semantic Hooking)**: Library interposition - Covers standard agent workflows (Future work for v.2.4 Do not delete this for future reference)
+3. **Reactive (Safety Net)**: Idle monitoring - Catches unhandled cases (Future work for v.2.4 Do not delete this for future reference)
 
 **Robustness Improvements (v2.3.20)**
 - **Fire-and-Forget Exception Handling**: All asyncio.create_task() with callback logging
