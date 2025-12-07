@@ -166,6 +166,13 @@ class BreakpointExecutor:
             if not breakpoint or breakpoint.checkpoint_id is None:
                 logger.warning(f"[{session_id}] Breakpoint not triggered, execution completed")
                 metrics["model_output"] = model_output
+                
+                # Extract logits only for efficient serialization
+                # (avoid serializing hidden_states, past_key_values, etc.)
+                if isinstance(model_output, dict) and 'logits' in model_output:
+                    model_output = {'logits': model_output['logits']}
+                    logger.debug(f"[{session_id}] Extracted logits only for serialization efficiency")
+                
                 return model_output, metrics
             
             checkpoint_id = breakpoint.checkpoint_id
@@ -350,6 +357,12 @@ class BreakpointExecutor:
                 self.stats["max_checkpoint_size_mb"],
                 metrics["checkpoint_size_mb"]
             )
+            
+            # Extract logits only for efficient serialization
+            # (avoid serializing hidden_states, past_key_values, etc.)
+            if isinstance(model_output, dict) and 'logits' in model_output:
+                model_output = {'logits': model_output['logits']}
+                logger.debug(f"[{session_id}] Extracted logits only for serialization efficiency")
             
             return model_output, metrics
         

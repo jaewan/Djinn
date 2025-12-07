@@ -905,6 +905,7 @@ class ModelExecutionSerializer:
                 raise ValueError(f"Truncated dict header: need 4 bytes for num_entries, have {len(data) - offset}")
             num_entries = struct.unpack('>I', data[offset:offset+4])[0]
             offset += 4
+            logger.debug(f"Deserializing dict with {num_entries} entries, total data size {len(data)}, starting at offset {offset}")
             result = {}
             
             for entry_idx in range(num_entries):
