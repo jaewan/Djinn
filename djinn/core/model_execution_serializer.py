@@ -900,35 +900,59 @@ class ModelExecutionSerializer:
 
         elif result_type == RESULT_TYPE_DICT and offset < len(data):
             # ✅ CRITICAL FIX: Deserialize dict results (e.g., transformer outputs)
+            # With bounds checking for large tensors (e.g., Mistral-7B 32MB+ responses)
+            if offset + 4 > len(data):
+                raise ValueError(f"Truncated dict header: need 4 bytes for num_entries, have {len(data) - offset}")
             num_entries = struct.unpack('>I', data[offset:offset+4])[0]
             offset += 4
             result = {}
             
-            for _ in range(num_entries):
+            for entry_idx in range(num_entries):
                 # Parse key
+                if offset + 4 > len(data):
+                    raise ValueError(f"Truncated dict entry {entry_idx}: need 4 bytes for key_len at offset {offset}, data len {len(data)}")
                 key_len = struct.unpack('>I', data[offset:offset+4])[0]
                 offset += 4
+                
+                if offset + key_len > len(data):
+                    raise ValueError(f"Truncated dict entry {entry_idx}: need {key_len} bytes for key at offset {offset}, data len {len(data)}")
                 key = data[offset:offset+key_len].decode('utf-8')
                 offset += key_len
                 
                 # Parse value (tensor)
+                if offset + 4 > len(data):
+                    raise ValueError(f"Truncated dict entry '{key}': need 4 bytes for shape_len at offset {offset}, data len {len(data)}")
                 shape_len = struct.unpack('>I', data[offset:offset+4])[0]
                 offset += 4
+                
+                if offset + shape_len > len(data):
+                    raise ValueError(f"Truncated dict entry '{key}': need {shape_len} bytes for shape at offset {offset}, data len {len(data)}")
                 shape_json = data[offset:offset+shape_len].decode('utf-8')
                 shape = tuple(json.loads(shape_json))
                 offset += shape_len
                 
+                if offset + 4 > len(data):
+                    raise ValueError(f"Truncated dict entry '{key}': need 4 bytes for dtype_len at offset {offset}, data len {len(data)}")
                 dtype_len = struct.unpack('>I', data[offset:offset+4])[0]
                 offset += 4
+                
+                if offset + dtype_len > len(data):
+                    raise ValueError(f"Truncated dict entry '{key}': need {dtype_len} bytes for dtype at offset {offset}, data len {len(data)}")
                 dtype_str = data[offset:offset+dtype_len].decode('utf-8')
                 offset += dtype_len
                 
+                if offset + 8 > len(data):
+                    raise ValueError(f"Truncated dict entry '{key}': need 8 bytes for data_len at offset {offset}, data len {len(data)}")
                 data_len = struct.unpack('>Q', data[offset:offset+8])[0]
                 offset += 8
+                
+                if offset + data_len > len(data):
+                    raise ValueError(f"Truncated dict entry '{key}': need {data_len} bytes for tensor data at offset {offset}, data len {len(data)}")
                 tensor_bytes = data[offset:offset+data_len]
                 offset += data_len
                 
                 result[key] = ModelExecutionSerializer._deserialize_tensor(tensor_bytes, shape, dtype_str)
+                logger.debug(f"Deserialized dict entry '{key}': shape={shape}, dtype={dtype_str}, size={data_len} bytes")
 
         return result, checkpoint_time_ms, restore_time_ms, checkpoint_size_mb, overhead_percent, metrics, status, message
 

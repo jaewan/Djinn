@@ -124,6 +124,32 @@ def format_optional(value: Optional[float], suffix: str = "GB") -> str:
     return f"{value:.2f} {suffix}"
 
 
+def analyze_latency_breakdown(metrics: Dict[str, Any], total_latency_ms: float) -> Dict[str, Any]:
+    """
+    Analyze OS overhead by breaking down latency into components.
+    
+    For OSDI: Prove that serialization/deserialization is not the bottleneck.
+    """
+    checkpoint_time = metrics.get('checkpoint_time_ms', 0.0)
+    restore_time = metrics.get('restore_time_ms', 0.0)
+    
+    # Estimate serialization time as part of checkpoint
+    # Estimate deserialization time as part of restore
+    # The rest is model compute
+    model_compute = max(0, total_latency_ms - checkpoint_time - restore_time)
+    
+    overhead_percent = (checkpoint_time + restore_time) / max(1, total_latency_ms) * 100
+    
+    return {
+        "total_latency_ms": total_latency_ms,
+        "checkpoint_time_ms": checkpoint_time,
+        "restore_time_ms": restore_time,
+        "model_compute_ms": model_compute,
+        "os_overhead_percent": overhead_percent,
+        "overhead_acceptable": overhead_percent < 15.0,  # Target: <15% OS overhead
+    }
+
+
 # ---------------------------------------------------------------------------
 # Djinn evaluation workflows
 # ---------------------------------------------------------------------------
@@ -151,6 +177,10 @@ async def run_breakpoint_trials(
             elapsed_ms = (time.perf_counter() - start) * 1000
             logits = extract_logits(model_output).detach().cpu()
             token_accuracy = compute_token_accuracy(baseline_logits, logits)
+            
+            # Analyze latency breakdown for OS overhead assessment
+            latency_breakdown = analyze_latency_breakdown(metrics, elapsed_ms)
+            
             accuracy_entries.append({
                 "trial": trial + 1,
                 "layer": layer,
@@ -159,6 +189,7 @@ async def run_breakpoint_trials(
                 "checkpoint_time_ms": metrics.get('checkpoint_time_ms', 0.0),
                 "restore_time_ms": metrics.get('restore_time_ms', 0.0),
                 "checkpoint_size_mb": metrics.get('checkpoint_size_mb', 0.0),
+                "os_overhead_percent": latency_breakdown['os_overhead_percent'],
             })
             logger.info(
                 f"Djinn trial {trial+1}/{num_trials}, layer {layer}: "
@@ -166,13 +197,23 @@ async def run_breakpoint_trials(
             )
     accuracies = [entry["token_accuracy"] for entry in accuracy_entries]
     latency = [entry["latency_ms"] for entry in accuracy_entries]
+    os_overhead = [entry["os_overhead_percent"] for entry in accuracy_entries]
+    
     summary = {
         "entries": accuracy_entries,
         "token_accuracy_mean": statistics.mean(accuracies) if accuracies else 0.0,
         "token_accuracy_std": statistics.pstdev(accuracies) if len(accuracies) > 1 else 0.0,
         "latency_mean_ms": statistics.mean(latency) if latency else 0.0,
         "latency_std_ms": statistics.pstdev(latency) if len(latency) > 1 else 0.0,
+        "os_overhead_mean_percent": statistics.mean(os_overhead) if os_overhead else 0.0,
+        "os_overhead_max_percent": max(os_overhead) if os_overhead else 0.0,
     }
+    logger.info(
+        f"\n📊 BREAKPOINT TRIAL SUMMARY:\n"
+        f"  Token Accuracy: {summary['token_accuracy_mean']:.2f}% (±{summary['token_accuracy_std']:.2f}%)\n"
+        f"  Latency: {summary['latency_mean_ms']:.1f}ms (±{summary['latency_std_ms']:.1f}ms)\n"
+        f"  OS Overhead: {summary['os_overhead_mean_percent']:.1f}% (max {summary['os_overhead_max_percent']:.1f}%)"
+    )
     return summary
 
 
@@ -226,12 +267,17 @@ async def run_activation_steering_demo(
     steered_logits = extract_logits(steered_output).detach().cpu()
     baseline_tokens = baseline_logits.argmax(dim=-1)
     steered_tokens = steered_logits.argmax(dim=-1)
-    changed = bool(torch.any(baseline_tokens != steered_tokens).item())
+    
+    token_diff_percent = float(((baseline_tokens != steered_tokens).float().mean().item()) * 100.0)
+    changed = token_diff_percent > 0.0
 
     logger.info(
-        "Activation steering result: changed=%s (scale=%.2f)",
-        changed,
-        scale,
+        f"\n✅ ACTIVATION STEERING DEMO:\n"
+        f"  Layer: {layer}, Scale: {scale:.2f}\n"
+        f"  Output Changed: {changed}\n"
+        f"  Token Diff: {token_diff_percent:.2f}%\n"
+        f"  Resume Latency (baseline): {baseline_resume_metrics.get('restore_time_ms', 0.0):.1f}ms\n"
+        f"  Resume Latency (steered): {steered_resume_metrics.get('restore_time_ms', 0.0):.1f}ms"
     )
 
     return {
@@ -240,7 +286,8 @@ async def run_activation_steering_demo(
         "output_changed": changed,
         "baseline_restore_time_ms": baseline_resume_metrics.get('restore_time_ms', 0.0),
         "steered_restore_time_ms": steered_resume_metrics.get('restore_time_ms', 0.0),
-        "token_diff_percent": float(((baseline_tokens != steered_tokens).float().mean().item()) * 100.0),
+        "token_diff_percent": token_diff_percent,
+        "steering_successful": changed,  # True if steering actually modified output
     }
 
 
