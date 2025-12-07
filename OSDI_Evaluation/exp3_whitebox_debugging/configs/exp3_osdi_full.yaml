@@ -20,7 +20,7 @@ experiment:
     token_accuracy_threshold: 95.0
     
   activation_steering:
-    enabled: true  # ✅ NOW ENABLED: Activate steering with fixed serialization
+    enabled: false  # TODO: Debug Mistral layer unpacking in resume_from_checkpoint
     modification_type: "scale"  # Scale hidden states
     modification_factor: 0.9    # Multiply by 0.9 to "steer"
     steering_layer: 16          # Modify at mid-point layer (for Mistral-7B)

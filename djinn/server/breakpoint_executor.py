@@ -557,8 +557,12 @@ class BreakpointExecutor:
                     # ✅ Handle tuple returns (GPT-2 returns (hidden_states, present_kv, ...))
                     # Extract hidden states from position 0 if tuple
                     if isinstance(outputs, tuple):
+                        if len(outputs) == 0:
+                            raise RuntimeError(f"Layer {i} returned empty tuple")
                         current_output = outputs[0]
                         logger.debug(f"[{session_id}] Layer {i} returned tuple, extracted hidden_states")
+                    elif outputs is None:
+                        raise RuntimeError(f"Layer {i} returned None")
                     else:
                         current_output = outputs
                     
