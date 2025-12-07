@@ -543,14 +543,22 @@ class BreakpointExecutor:
                 try:
                     # ✅ CRITICAL: Pass attention_mask to transformer layers
                     # This ensures correct attention computation (not garbage output)
+                    
+                    # For Mistral and other models, try multiple calling conventions
+                    outputs = None
+                    
+                    # Try 1: With attention_mask as keyword argument (standard)
                     if attention_mask is not None:
                         try:
-                            # Try calling with attention_mask (standard transformer API)
                             outputs = layer(current_output, attention_mask=attention_mask)
-                        except TypeError:
-                            # Some layers might not accept attention_mask
-                            logger.debug(f"[{session_id}] Layer {i} doesn't accept attention_mask, calling without it")
-                            outputs = layer(current_output)
+                        except TypeError as te_mask:
+                            logger.debug(f"[{session_id}] Layer {i} doesn't accept attention_mask kwarg: {te_mask}")
+                            # Try 2: Without attention_mask (e.g., if layer is fully attention-free or self-handles it)
+                            try:
+                                outputs = layer(current_output)
+                            except Exception as e_nomask:
+                                logger.error(f"[{session_id}] Both attempts failed at layer {i}: {e_nomask}")
+                                raise RuntimeError(f"Failed executing layer {i}: {e_nomask}") from e_nomask
                     else:
                         outputs = layer(current_output)
                     

@@ -581,3 +581,4 @@ async def main_async(coordinator, args, config):
 if __name__ == "__main__":
     exit_code = main_sync()
     sys.exit(exit_code or 0)
+

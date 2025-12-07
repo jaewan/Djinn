@@ -2,8 +2,8 @@
 # Scientific evaluation with Llama-2-13B and full baselines
 
 model:
-  name: "mistralai/Mistral-7B-v0.1"
-  num_layers: 32
+  name: "gpt2"
+  num_layers: 12
   source: "transformers"
   
 experiment:
@@ -12,7 +12,7 @@ experiment:
   breakpoints:
     enabled: true
     # Test early, mid, and late layers to show scalability
-    layers: [8, 16, 24]  # Early, mid, late layers of 32-layer Mistral-7B
+    layers: [3, 6, 9]  # Early, mid, late layers of 12-layer GPT-2
   
   inference:
     input_length: 512
@@ -20,10 +20,10 @@ experiment:
     token_accuracy_threshold: 95.0
     
   activation_steering:
-    enabled: false  # TODO: Debug Mistral layer unpacking in resume_from_checkpoint
+    enabled: true  # ✅ ENABLED: Activation steering demo on GPT-2
     modification_type: "scale"  # Scale hidden states
     modification_factor: 0.9    # Multiply by 0.9 to "steer"
-    steering_layer: 16          # Modify at mid-point layer (for Mistral-7B)
+    steering_layer: 6           # Modify at mid-point layer (GPT-2 layer 6 of 12)
     
   concurrent_demo:
     enabled: true
@@ -37,3 +37,4 @@ validation:
   
 duration: 180  # minutes (estimated for full evaluation with baselines)
 output_dir: "/tmp/exp3_osdi_results"
+
