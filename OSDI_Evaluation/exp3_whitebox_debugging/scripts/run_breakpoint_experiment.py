@@ -265,14 +265,24 @@ async def run_breakpoint_test(
                 # Verify correctness at token level (more robust than logit norm)
                 correctness_passed = True
                 token_accuracy = 0.0
+
+                # DEBUG: Check what we got
+                logger.info(f"   DEBUG - model_output type: {type(model_output)}, baseline_output type: {type(baseline_output)}")
+                logger.info(f"   DEBUG - model_output is None: {model_output is None}, baseline_output is None: {baseline_output is None}")
+
                 if model_output is not None and baseline_output is not None:
                     try:
-                        if hasattr(model_output, 'logits'):
+                        # Handle both dict and object-based outputs
+                        if isinstance(model_output, dict):
+                            output_logits = model_output.get('logits', model_output)
+                        elif hasattr(model_output, 'logits'):
                             output_logits = model_output.logits
                         else:
                             output_logits = model_output
                         
-                        if hasattr(baseline_output, 'logits'):
+                        if isinstance(baseline_output, dict):
+                            baseline_logits = baseline_output.get('logits', baseline_output)
+                        elif hasattr(baseline_output, 'logits'):
                             baseline_logits = baseline_output.logits
                         else:
                             baseline_logits = baseline_output
@@ -280,7 +290,14 @@ async def run_breakpoint_test(
                         # Compare at token level (more meaningful for OSDI)
                         output_tokens = output_logits.argmax(dim=-1)
                         baseline_tokens = baseline_logits.argmax(dim=-1)
-                        
+
+                        # DEBUG: Log shapes and first few tokens
+                        logger.info(f"   DEBUG - Output logits shape: {output_logits.shape}, baseline shape: {baseline_logits.shape}")
+                        logger.info(f"   DEBUG - First 5 output tokens: {output_tokens[0][:5].tolist()}")
+                        logger.info(f"   DEBUG - First 5 baseline tokens: {baseline_tokens[0][:5].tolist()}")
+                        logger.info(f"   DEBUG - Output logits sample: {output_logits[0][0][:3].tolist()}")
+                        logger.info(f"   DEBUG - Baseline logits sample: {baseline_logits[0][0][:3].tolist()}")
+
                         token_matches = (output_tokens == baseline_tokens).sum().item()
                         total_tokens = output_tokens.numel()
                         token_accuracy = 100.0 * token_matches / total_tokens if total_tokens > 0 else 0.0

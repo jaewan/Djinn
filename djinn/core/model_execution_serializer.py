@@ -489,6 +489,10 @@ class ModelExecutionSerializer:
     @staticmethod
     def _serialize_tensor(tensor: torch.Tensor) -> bytes:
         """Serialize tensor to numpy bytes (optimized for speed)."""
+        # Detach from computation graph if needed
+        if tensor.requires_grad:
+            tensor = tensor.detach()
+        
         # Move to CPU if needed
         if tensor.device.type == 'cuda':
             tensor = tensor.cpu()
@@ -839,6 +843,9 @@ class ModelExecutionSerializer:
 
         Returns:
             (result, checkpoint_time_ms, restore_time_ms, checkpoint_size_mb, overhead_percent, metrics, status, message)
+            
+        Note: When wait_for_resume=False, result will be a dict with 'checkpoint_activation' key
+              Client code should check for this and extract the activation if needed.
         """
         # Parse header
         if len(data) < 6:
@@ -891,4 +898,284 @@ class ModelExecutionSerializer:
 
             result = ModelExecutionSerializer._deserialize_tensor(tensor_bytes, shape, dtype_str)
 
+        elif result_type == RESULT_TYPE_DICT and offset < len(data):
+            # ✅ CRITICAL FIX: Deserialize dict results (e.g., transformer outputs)
+            num_entries = struct.unpack('>I', data[offset:offset+4])[0]
+            offset += 4
+            result = {}
+            
+            for _ in range(num_entries):
+                # Parse key
+                key_len = struct.unpack('>I', data[offset:offset+4])[0]
+                offset += 4
+                key = data[offset:offset+key_len].decode('utf-8')
+                offset += key_len
+                
+                # Parse value (tensor)
+                shape_len = struct.unpack('>I', data[offset:offset+4])[0]
+                offset += 4
+                shape_json = data[offset:offset+shape_len].decode('utf-8')
+                shape = tuple(json.loads(shape_json))
+                offset += shape_len
+                
+                dtype_len = struct.unpack('>I', data[offset:offset+4])[0]
+                offset += 4
+                dtype_str = data[offset:offset+dtype_len].decode('utf-8')
+                offset += dtype_len
+                
+                data_len = struct.unpack('>Q', data[offset:offset+8])[0]
+                offset += 8
+                tensor_bytes = data[offset:offset+data_len]
+                offset += data_len
+                
+                result[key] = ModelExecutionSerializer._deserialize_tensor(tensor_bytes, shape, dtype_str)
+
         return result, checkpoint_time_ms, restore_time_ms, checkpoint_size_mb, overhead_percent, metrics, status, message
+
+    @staticmethod
+    def serialize_resume_from_checkpoint_request(
+        session_id: str,
+        fingerprint: str,
+        modified_activation: torch.Tensor,
+        layer_index: int,
+    ) -> bytes:
+        """
+        Serialize a resume-from-checkpoint request (activation steering).
+        
+        Args:
+            session_id: Session ID to resume
+            modified_activation: Modified activation tensor
+            layer_index: Layer to resume from
+        
+        Returns:
+            Serialized binary data
+        """
+        # Serialize metadata
+        metadata = {
+            'session_id': session_id,
+            'fingerprint': fingerprint,
+            'layer_index': layer_index,
+            'activation_shape': list(modified_activation.shape),
+            'activation_dtype': str(modified_activation.dtype),
+        }
+        metadata_json = json.dumps(metadata).encode('utf-8')
+        
+        # Serialize activation tensor
+        activation_bytes = ModelExecutionSerializer._serialize_tensor(modified_activation)
+        
+        # Build header
+        header = bytearray()
+        header.append(PROTOCOL_VERSION)
+        header.extend(struct.pack('>I', len(metadata_json)))
+        header.extend(struct.pack('>Q', len(activation_bytes)))
+        
+        return bytes(header) + metadata_json + activation_bytes
+
+    @staticmethod
+    def deserialize_resume_from_checkpoint_request(data: bytes) -> Tuple[str, str, torch.Tensor, int]:
+        """
+        Deserialize a resume-from-checkpoint request.
+        
+        Returns:
+            (session_id, fingerprint, modified_activation, layer_index)
+        """
+        offset = 0
+        
+        # Parse header
+        version = data[0]
+        if version != PROTOCOL_VERSION:
+            raise ValueError(f"Unsupported protocol version: {version}")
+        
+        metadata_len = struct.unpack('>I', data[1:5])[0]
+        activation_len = struct.unpack('>Q', data[5:13])[0]
+        offset = 13
+        
+        # Parse metadata
+        metadata_json = data[offset:offset+metadata_len].decode('utf-8')
+        metadata = json.loads(metadata_json)
+        offset += metadata_len
+        
+        # Parse activation tensor
+        activation_bytes = data[offset:offset+activation_len]
+        activation_shape = tuple(metadata['activation_shape'])
+        activation_dtype = metadata['activation_dtype']
+        
+        modified_activation = ModelExecutionSerializer._deserialize_tensor(
+            activation_bytes, activation_shape, activation_dtype
+        )
+        
+        return (
+            metadata['session_id'],
+            metadata.get('fingerprint', ''),
+            modified_activation,
+            metadata['layer_index'],
+        )
+
+    @staticmethod
+    def serialize_resume_from_checkpoint_response(
+        result: Any,
+        status: str = 'success',
+        message: Optional[str] = None,
+        metrics: Optional[Dict[str, Any]] = None,
+    ) -> bytes:
+        """
+        Serialize a resume-from-checkpoint response.
+        
+        Args:
+            result: Model output tensor or dict
+            status: Response status
+            message: Optional error message
+        
+        Returns:
+            Serialized binary data
+        """
+        # Determine result type
+        if isinstance(result, torch.Tensor):
+            result_type = RESULT_TYPE_TENSOR
+            result_structure = None
+        elif isinstance(result, dict):
+            result_type = RESULT_TYPE_DICT
+            result_structure = {
+                'keys': list(result.keys()),
+                'types': [type(v).__name__ for v in result.values()]
+            }
+        else:
+            result_type = RESULT_TYPE_CUSTOM
+            result_structure = {'type': type(result).__name__}
+        
+        # Prepare metadata
+        metadata = {
+            'status': status,
+            'result_structure': result_structure,
+        }
+        if metrics:
+            metadata['metrics'] = metrics
+        if message:
+            metadata['message'] = message
+        metadata_json = json.dumps(metadata).encode('utf-8')
+        
+        # Serialize result data
+        result_data = bytearray()
+        
+        if result_type == RESULT_TYPE_TENSOR and result is not None:
+            shape_json = json.dumps(list(result.shape)).encode('utf-8')
+            dtype_str = str(result.dtype).encode('utf-8')
+            tensor_bytes = ModelExecutionSerializer._serialize_tensor(result)
+            
+            result_data.extend(struct.pack('>I', len(shape_json)))
+            result_data.extend(shape_json)
+            result_data.extend(struct.pack('>I', len(dtype_str)))
+            result_data.extend(dtype_str)
+            result_data.extend(struct.pack('>Q', len(tensor_bytes)))
+            result_data.extend(tensor_bytes)
+        
+        elif result_type == RESULT_TYPE_DICT and result is not None:
+            result_data.extend(struct.pack('>I', len(result)))
+            for key, value in result.items():
+                if isinstance(value, torch.Tensor):
+                    key_bytes = key.encode('utf-8')
+                    shape_json = json.dumps(list(value.shape)).encode('utf-8')
+                    dtype_str = str(value.dtype).encode('utf-8')
+                    tensor_bytes = ModelExecutionSerializer._serialize_tensor(value)
+                    
+                    result_data.extend(struct.pack('>I', len(key_bytes)))
+                    result_data.extend(key_bytes)
+                    result_data.extend(struct.pack('>I', len(shape_json)))
+                    result_data.extend(shape_json)
+                    result_data.extend(struct.pack('>I', len(dtype_str)))
+                    result_data.extend(dtype_str)
+                    result_data.extend(struct.pack('>Q', len(tensor_bytes)))
+                    result_data.extend(tensor_bytes)
+        
+        # Build header
+        header = bytearray()
+        header.append(PROTOCOL_VERSION)
+        header.extend(struct.pack('>I', len(metadata_json)))
+        header.append(result_type)
+        
+        return bytes(header) + metadata_json + bytes(result_data)
+
+    @staticmethod
+    def deserialize_resume_from_checkpoint_response(data: bytes) -> Tuple[Any, Dict[str, Any], str, Optional[str]]:
+        """
+        Deserialize a resume-from-checkpoint response.
+        
+        Returns:
+            (result, metrics, status, message)
+        """
+        offset = 0
+        
+        # Parse header
+        if len(data) < 9:
+            raise ValueError(f"Response too short: {len(data)} bytes")
+        
+        version = data[0]
+        if version != PROTOCOL_VERSION:
+            raise ValueError(f"Unsupported protocol version: {version}")
+        
+        metadata_len = struct.unpack('>I', data[1:5])[0]
+        result_type = data[5]
+        offset = 6
+        
+        # Parse metadata
+        metadata_end = offset + metadata_len
+        if metadata_end > len(data):
+            raise ValueError(f"Metadata length exceeds message: {metadata_len}")
+        
+        metadata_json = data[offset:metadata_end].decode('utf-8')
+        metadata = json.loads(metadata_json)
+        offset = metadata_end
+        
+        # Parse result
+        result = None
+        metrics = metadata.get('metrics', {})
+        status = metadata.get('status', 'success')
+        message = metadata.get('message')
+        if result_type == RESULT_TYPE_TENSOR and offset < len(data):
+            shape_len = struct.unpack('>I', data[offset:offset+4])[0]
+            offset += 4
+            shape_json = data[offset:offset+shape_len].decode('utf-8')
+            shape = tuple(json.loads(shape_json))
+            offset += shape_len
+            
+            dtype_len = struct.unpack('>I', data[offset:offset+4])[0]
+            offset += 4
+            dtype_str = data[offset:offset+dtype_len].decode('utf-8')
+            offset += dtype_len
+            
+            data_len = struct.unpack('>Q', data[offset:offset+8])[0]
+            offset += 8
+            tensor_bytes = data[offset:offset+data_len]
+            
+            result = ModelExecutionSerializer._deserialize_tensor(tensor_bytes, shape, dtype_str)
+        
+        elif result_type == RESULT_TYPE_DICT and offset < len(data):
+            num_entries = struct.unpack('>I', data[offset:offset+4])[0]
+            offset += 4
+            result = {}
+            
+            for _ in range(num_entries):
+                key_len = struct.unpack('>I', data[offset:offset+4])[0]
+                offset += 4
+                key = data[offset:offset+key_len].decode('utf-8')
+                offset += key_len
+                
+                shape_len = struct.unpack('>I', data[offset:offset+4])[0]
+                offset += 4
+                shape_json = data[offset:offset+shape_len].decode('utf-8')
+                shape = tuple(json.loads(shape_json))
+                offset += shape_len
+                
+                dtype_len = struct.unpack('>I', data[offset:offset+4])[0]
+                offset += 4
+                dtype_str = data[offset:offset+dtype_len].decode('utf-8')
+                offset += dtype_len
+                
+                data_len = struct.unpack('>Q', data[offset:offset+8])[0]
+                offset += 8
+                tensor_bytes = data[offset:offset+data_len]
+                offset += data_len
+                
+                result[key] = ModelExecutionSerializer._deserialize_tensor(tensor_bytes, shape, dtype_str)
+        
+        return result, metrics, status, message

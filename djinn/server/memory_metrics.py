@@ -376,6 +376,53 @@ semantic_prefetch_latency_ms = Histogram(
     buckets=(1, 5, 10, 50, 100, 500, 1000, 5000)
 )
 
+# Phase 4.1: Add swap/restore success/failure counters
+semantic_swap_success = Counter(
+    'genie_semantic_swap_success_total',
+    'Successful KV swaps to host memory'
+)
+
+semantic_swap_failure = Counter(
+    'genie_semantic_swap_failure_total',
+    'Failed KV swaps to host memory'
+)
+
+semantic_restore_success = Counter(
+    'genie_semantic_restore_success_total',
+    'Successful KV restores from host memory'
+)
+
+semantic_restore_failure = Counter(
+    'genie_semantic_restore_failure_total',
+    'Failed KV restores from host memory'
+)
+
+
+# ============================================================================
+# PREFILL ADMISSION / SCHEDULING METRICS (PHASE 3)
+# ============================================================================
+
+prefill_admissions = Counter(
+    'genie_prefill_admissions_total',
+    'Total number of PREFILL executions admitted'
+)
+
+prefill_queue_wait_ms = Histogram(
+    'genie_prefill_queue_wait_ms',
+    'Time spent waiting for PREFILL semaphore before execution (milliseconds)',
+    buckets=(1, 5, 10, 50, 100, 500, 1000, 5000, 10000, 30000, 60000)
+)
+
+prefill_queue_depth_gauge = Gauge(
+    'genie_prefill_queue_depth',
+    'Current PREFILL queue depth at admission'
+)
+
+prefill_inflight_gauge = Gauge(
+    'genie_prefill_inflight',
+    'Number of PREFILL executions currently in-flight'
+)
+
 
 # ============================================================================
 # METRICS COLLECTION HELPER
@@ -595,6 +642,35 @@ class MetricsCollector:
         if self.prometheus_enabled:
             semantic_prefetches.inc()
             semantic_prefetch_latency_ms.observe(latency_ms)
+    
+    def record_swap_success(self) -> None:
+        """Record successful KV swap to host."""
+        if self.prometheus_enabled:
+            semantic_swap_success.inc()
+    
+    def record_swap_failure(self) -> None:
+        """Record failed KV swap to host."""
+        if self.prometheus_enabled:
+            semantic_swap_failure.inc()
+    
+    def record_restore_success(self) -> None:
+        """Record successful KV restore from host."""
+        if self.prometheus_enabled:
+            semantic_restore_success.inc()
+    
+    def record_restore_failure(self) -> None:
+        """Record failed KV restore from host."""
+        if self.prometheus_enabled:
+            semantic_restore_failure.inc()
+
+    # Prefill Admission Metrics
+    def record_prefill_admission(self, wait_ms: float, queue_depth: int, inflight: int) -> None:
+        """Record PREFILL semaphore acquisition statistics."""
+        if self.prometheus_enabled:
+            prefill_admissions.inc()
+            prefill_queue_wait_ms.observe(max(0.0, wait_ms))
+            prefill_queue_depth_gauge.set(max(0, queue_depth))
+            prefill_inflight_gauge.set(max(0, inflight))
 
 
 # Global metrics collector instance

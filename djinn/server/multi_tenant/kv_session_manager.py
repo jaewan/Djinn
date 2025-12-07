@@ -422,6 +422,11 @@ class KVSessionManager:
         key_cache/value_cache lists after model.generate() completes.
         """
         if isinstance(data, torch.Tensor):
+            # Avoid redundant copies when tensor already resides on target device.
+            # .to(... ) creates a new tensor even if device matches, which adds
+            # milliseconds of overhead per KV block and dominates wake latency.
+            if data.device == device:
+                return data
             return data.to(device, non_blocking=True)
         if isinstance(data, (list, tuple)):
             converted = [self._move_structure_to_device(elem, device) for elem in data]
@@ -525,6 +530,9 @@ class KVSessionManager:
         """
         Evict KV cache for a session to host swap pool (Phase 3 - SIMPLIFIED).
         
+        ✅ CRITICAL FIX: Convert DynamicCache to legacy tuple format BEFORE swapping.
+        This preserves the cache structure without needing to serialize metadata.
+        
         Uses PyTorch's CachingHostAllocator (pin_memory=True) for allocation.
         Djinn only manages the POLICY (when to swap), not the MECHANISM.
         
@@ -556,7 +564,20 @@ class KVSessionManager:
                 return 0
             
             try:
-                # ✅ SIMPLIFIED: Delegate to PyTorch's allocator via pin_memory=True
+                # ✅ CRITICAL FIX: Convert DynamicCache to legacy tuple format
+                # This preserves cache structure without metadata
+                kv_to_swap = sess.kv_cache
+                try:
+                    from transformers.cache_utils import Cache
+                    if isinstance(kv_to_swap, Cache):
+                        legacy_cache = kv_to_swap.to_legacy_cache()
+                        if legacy_cache is not None:
+                            kv_to_swap = legacy_cache
+                            logger.debug(f"Converted DynamicCache to legacy format for {session_id[:12]}")
+                except Exception as e:
+                    logger.warning(f"Could not convert to legacy cache for {session_id[:12]}: {e}, using original")
+                
+                # ✅ Delegate to PyTorch's allocator via pin_memory=True
                 # This method handles:
                 # 1. Allocating pinned CPU memory (PyTorch's CachingHostAllocator)
                 # 2. Copying KV from GPU to pinned CPU (with non_blocking=True)
@@ -567,7 +588,7 @@ class KVSessionManager:
                 actual_bytes = await asyncio.to_thread(
                     swap_pool.allocate_and_swap,
                     session_id,
-                    sess.kv_cache,
+                    kv_to_swap,
                     sess.gpu_id
                 )
                 
@@ -581,12 +602,15 @@ class KVSessionManager:
                 return actual_bytes
             
             except Exception as e:
-                logger.error(f"Failed to evict session {session_id}: {e}")
+                logger.error(f"[CRITICAL] Failed to evict session {session_id}: {e}", exc_info=True)
                 raise
     
     async def restore_kv_from_host(self, session_id: str) -> int:
         """
         Restore KV cache for a session from host swap pool to GPU (Phase 3 - SIMPLIFIED).
+        
+        ✅ CRITICAL FIX: Swap pool now preserves structure. If legacy tuple format,
+        convert back to DynamicCache for model.forward().
         
         Uses PyTorch's memory management for the actual copy operation.
         
@@ -614,28 +638,56 @@ class KVSessionManager:
                 return 0
             
             try:
-                # ✅ CRITICAL FIX: restore_and_copy now returns GPU tensor, not just size!
+                # ✅ restore_and_copy now preserves structure!
                 swap_pool = get_swap_pool()
-                restored_tensor = await asyncio.to_thread(
+                restored_data = await asyncio.to_thread(
                     swap_pool.restore_and_copy,
                     session_id,
                     sess.gpu_id
                 )
                 
-                if restored_tensor is None:
+                if restored_data is None:
                     logger.warning(f"Restore failed: session {session_id} returned None")
                     return 0
                 
-                # ✅ CRITICAL FIX: Store the restored tensor in kv_cache!
-                size_bytes = restored_tensor.numel() * restored_tensor.element_size()
-                sess.kv_cache = restored_tensor
+                # ✅ CRITICAL FIX: If restored as legacy tuple, convert back to DynamicCache
+                restored_kv = restored_data
+                try:
+                    from transformers.cache_utils import DynamicCache
+                    if isinstance(restored_data, (tuple, list)):
+                        # Legacy format: ((k_layer0, v_layer0), (k_layer1, v_layer1), ...)
+                        logger.debug(f"Restoring legacy tuple format for {session_id[:12]}, length={len(restored_data)}")
+                        restored_kv = DynamicCache.from_legacy_cache(restored_data)
+                        logger.debug(f"✅ Converted legacy tuple format back to DynamicCache for {session_id[:12]}")
+                        
+                        # Validate DynamicCache roundtrip - THIS IS CRITICAL!
+                        if hasattr(restored_kv, 'get_seq_length'):
+                            seq_len = restored_kv.get_seq_length()
+                            logger.debug(f"✅ Validated restored DynamicCache: seq_len={seq_len}, type={type(restored_kv).__name__}")
+                        else:
+                            logger.error(f"[CRITICAL] Restored KV lacks get_seq_length()! type={type(restored_kv).__name__}, expected DynamicCache")
+                            # Check if from_legacy_cache returned wrong type
+                            logger.error(f"from_legacy_cache returned: {restored_kv}, isinstance DynamicCache: {isinstance(restored_kv, DynamicCache)}")
+                            raise RuntimeError(f"from_legacy_cache failed to return DynamicCache, got {type(restored_kv)}")
+                except RuntimeError:
+                    raise  # Re-raise RuntimeErrors
+                except Exception as e:
+                    logger.error(f"[CRITICAL] Failed to reconstruct DynamicCache for {session_id[:12]}: {e}", exc_info=True)
+                    raise  # Don't silently fall back
+                
+                # ✅ Store the restored cache (now properly structured)!
+                size_bytes = self._estimate_size_bytes(restored_kv)
+                sess.kv_cache = restored_kv
                 sess.is_swapped = False
                 self.stats["kv_bytes_pinned"] += size_bytes
+                
+                logger.info(f"✅ Restored KV for {session_id[:12]}: size={size_bytes/(1024**2):.1f}MB, "
+                           f"type={type(restored_kv).__name__}")
                 
                 return size_bytes
             
             except Exception as e:
-                logger.error(f"Failed to restore session {session_id}: {e}")
+                logger.error(f"[CRITICAL] Failed to restore session {session_id}: {e}", exc_info=True)
                 raise
     
     def _copy_to_host(self, kv_gpu: Any, host_view: torch.Tensor, size_bytes: int) -> int:

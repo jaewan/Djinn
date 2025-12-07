@@ -1,6 +1,11 @@
 {
   "fp16": {
-    "enabled": true
+    "enabled": true,
+    "loss_scale": 0,
+    "loss_scale_window": 1000,
+    "initial_scale_power": 16,
+    "hysteresis": 2,
+    "min_loss_scale": 1
   },
   "zero_optimization": {
     "stage": 1,
@@ -8,6 +13,27 @@
       "device": "cpu"
     }
   },
+  "optimizer": {
+    "type": "Adam",
+    "params": {
+      "lr": 0.001,
+      "betas": [0.9, 0.999],
+      "eps": 1e-8,
+      "weight_decay": 0
+    }
+  },
+  "activation_checkpointing": {
+    "partition_activations": false,
+    "cpu_checkpointing": false,
+    "number_checkpoints": null,
+    "synchronize_checkpoint_boundary": false,
+    "profile": false
+  },
   "steps_per_print": 100,
-  "wall_clock_breakdown": false
+  "wall_clock_breakdown": false,
+  "train_batch_size": 8,
+  "train_micro_batch_size_per_gpu": 1,
+  "gradient_accumulation_steps": 1
 }
+
+

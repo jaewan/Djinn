@@ -91,6 +91,7 @@ class MessageType:
     REGISTER_MODEL = 0x05  # Model registration
     EXECUTE_MODEL = 0x06  # Model execution
     EXECUTE_WITH_BREAKPOINT = 0x07  # Breakpoint execution
+    RESUME_FROM_CHECKPOINT = 0x08  # Resume execution (activation steering)
     ERROR = 0xFF  # Error response
 
 

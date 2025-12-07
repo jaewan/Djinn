@@ -1957,6 +1957,19 @@ class DjinnCoordinator:
                 }
                 metrics_dict.update(metrics)
                 
+                # ✅ When wait_for_resume=False, extract checkpoint_activation from result dict
+                checkpoint_activation = None
+                logger.debug(f"[Activation Debug] wait_for_resume={wait_for_resume}, result_type={type(result)}, result_keys={result.keys() if isinstance(result, dict) else 'N/A'}")
+                if not wait_for_resume and isinstance(result, dict) and 'checkpoint_activation' in result:
+                    checkpoint_activation = result['checkpoint_activation']
+                    metrics_dict['checkpoint_activation'] = checkpoint_activation
+                    logger.info(
+                        f"✅ Extracted checkpoint_activation for steering "
+                        f"(shape={checkpoint_activation.shape if hasattr(checkpoint_activation, 'shape') else 'N/A'})"
+                    )
+                elif not wait_for_resume:
+                    logger.warning(f"[Activation Debug] Expected checkpoint_activation but got: result_type={type(result)}, result_content={result if isinstance(result, dict) else 'not a dict'}")
+                
                 logger.info(
                     f"✅ Breakpoint execution successful:\n"
                     f"   Checkpoint: {checkpoint_time_ms:.1f}ms\n"
@@ -1974,6 +1987,75 @@ class DjinnCoordinator:
             logger.debug(traceback.format_exc())
             raise
     
+    async def resume_from_checkpoint(
+        self,
+        fingerprint: str,
+        session_id: str,
+        modified_activation: torch.Tensor,
+        layer_index: int,
+    ) -> Any:
+        """
+        Resume model execution from a paused checkpoint with modified activations.
+        
+        This enables the "Activation Steering" workflow:
+        1. Pause at layer N with checkpoint_activation
+        2. User modifies checkpoint_activation
+        3. Resume from layer N+1 with modified activation
+        4. Get final output reflecting the modification
+        
+        Args:
+            fingerprint: Model fingerprint associated with the session
+            session_id: Session ID (must match the paused session)
+            modified_activation: Modified activation tensor to resume from
+            layer_index: Layer where we're resuming from
+        
+        Returns:
+            Model output (tensor or dict) reflecting the modified activation
+        """
+        logger.info(
+            f"Resuming from checkpoint for session {session_id} "
+            f"(layer={layer_index}, activation_shape={modified_activation.shape})"
+        )
+        
+        from ..server.transport.protocol import MessageType
+        from .model_execution_serializer import ModelExecutionSerializer
+        
+        server_address = self.config.server_address or 'localhost:5556'
+        
+        try:
+            # Serialize the resume request
+            serialized = ModelExecutionSerializer.serialize_resume_from_checkpoint_request(
+                session_id=session_id,
+                fingerprint=fingerprint,
+                modified_activation=modified_activation,
+                layer_index=layer_index,
+            )
+            
+            # Send request to server
+            logger.debug(f"Sending resume request to {server_address}")
+            response_msg_type, response_data = await self._send_tcp_request(
+                server_address,
+                MessageType.RESUME_FROM_CHECKPOINT,
+                serialized
+            )
+            
+            if response_msg_type == MessageType.ERROR:
+                from .secure_serializer import SecureSerializer
+                error_response = SecureSerializer.deserialize_response(response_data)
+                raise RuntimeError(error_response.get('message', 'Unknown error'))
+            
+            # Deserialize response
+            result, metrics, status, message = ModelExecutionSerializer.deserialize_resume_from_checkpoint_response(response_data)
+            if status != 'success':
+                raise RuntimeError(message or 'Resume from checkpoint failed')
+            
+            logger.info(f"✅ Resume from checkpoint successful for session {session_id}")
+            return result, metrics
+            
+        except Exception as e:
+            logger.error(f"Resume from checkpoint failed: {e}")
+            raise
+
     async def send_signal_phase(self, session_id: str, phase: str, estimated_resume_ms: Optional[int] = None) -> bool:
         """
         Send semantic phase signal to server for proactive KV management.
@@ -1992,7 +2074,7 @@ class DjinnCoordinator:
             True if signal was sent successfully
         """
         try:
-            from .transport.protocol import MessageType
+            from djinn.server.transport.protocol import MessageType
             from .secure_serializer import SecureSerializer
             
             server_address = self.config.server_address or 'localhost:5556'
@@ -2009,18 +2091,26 @@ class DjinnCoordinator:
             
             # Send via TCP (fire-and-forget)
             try:
-                status_code, response_data = await self._send_tcp_request(
+                response_msg_type, response_data = await self._send_tcp_request(
                     server_address,
                     MessageType.SIGNAL_PHASE,
                     request_data
                 )
                 
-                if status_code == 200:
-                    logger.debug(f"Signal {phase} sent for session {session_id[:12]}, "
+                # Check for error response (message type 0x01 = ERROR)
+                if response_msg_type == MessageType.ERROR:
+                    error = SecureSerializer.deserialize_response(response_data)
+                    logger.warning(f"Signal {phase} error: {error.get('message', 'Unknown')}")
+                    return False
+                
+                # Any non-error response indicates success
+                response = SecureSerializer.deserialize_response(response_data)
+                if response.get('status') == 'ok':
+                    logger.info(f"✅ Signal {phase} sent for session {session_id[:12]}, "
                                f"estimated_resume_ms={estimated_resume_ms}")
                     return True
                 else:
-                    logger.warning(f"Signal {phase} failed with status {status_code}")
+                    logger.warning(f"Signal {phase} failed: {response}")
                     return False
             except Exception as e:
                 logger.debug(f"Signal {phase} send error: {e}")

@@ -1,0 +1,37 @@
+experiment:
+  name: "semantic_scheduler_full_comprehensive"
+  description: "Full experiment sweep: N=10,20,40,80 with proactive prefetch"
+  version: "1.0"
+
+workload:
+  model_id: "meta-llama/Llama-2-7b-hf"
+  dtype: "float16"
+  total_agents: 80                      # Final full-scale test (start smaller if needed)
+  arrival_rate: 0.2                     # 1 agent per 5 seconds (sustainable)
+  think_time_min: 10.0
+  think_time_max: 20.0
+  new_tokens: 50
+  iterations: 1
+  context_length: 1024
+
+semantic_scheduler:
+  enabled: true
+  idle_threshold_seconds: 1.0
+  host_swap_pool_gb: 32.0
+  lifo_on_overload: true
+
+server_config:
+  enable_semantic_scheduler: true
+  idle_threshold_seconds: 1.0
+  host_swap_pool_gb: 32.0
+  max_concurrent: 256
+
+expected_results:
+  total_duration_s: 500
+  p99_wake_latency_ms: 5000
+  p99_request_latency_ms: 5000
+  success_rate: 100
+  swaps_gt: 100
+
+
+

@@ -26,6 +26,7 @@ from ..core.coordinator import DjinnCoordinator, CoordinatorConfig
 from .optimizations.optimization_executor import OptimizationExecutor
 from .capability_provider import CapabilityProvider
 from ..core.metadata_types import ResultMetadata, ErrorMetadata, create_result_metadata, create_error_metadata
+from djinn.core.model_execution_serializer import ModelExecutionSerializer
 from ..backend.runtime.unified_vmu import get_vmu
 from .qos import BasicQosScheduler, QoSClass
 from .session_manager import get_session_manager
@@ -137,6 +138,23 @@ class DjinnServer:
         # Only MAX_CONCURRENT_PREFILLS agents can do prefill simultaneously
         # Others queue up while semantic scheduler swaps idle agents to host
         self.MAX_CONCURRENT_PREFILLS = 4  # Configurable, but 4 is safe for Llama-13B
+        prefill_override = os.getenv("GENIE_MAX_CONCURRENT_PREFILLS")
+        if prefill_override:
+            try:
+                override_value = max(1, int(prefill_override))
+                if override_value != self.MAX_CONCURRENT_PREFILLS:
+                    logger.info(
+                        "GENIE_MAX_CONCURRENT_PREFILLS override detected: %s -> %s",
+                        self.MAX_CONCURRENT_PREFILLS,
+                        override_value,
+                    )
+                    self.MAX_CONCURRENT_PREFILLS = override_value
+            except ValueError:
+                logger.warning(
+                    "Invalid GENIE_MAX_CONCURRENT_PREFILLS value: %s. Using default %s.",
+                    prefill_override,
+                    self.MAX_CONCURRENT_PREFILLS,
+                )
         self.prefill_semaphore = asyncio.Semaphore(self.MAX_CONCURRENT_PREFILLS)
         self.prefill_queue_depth = 0
         self._prefill_queue_lock = asyncio.Lock()
@@ -660,7 +678,7 @@ class DjinnServer:
         
         if self._registration_executor:
             logger.info("Shutting down registration thread pool...")
-            self._registration_executor.shutdown(wait=True, timeout=5.0)
+            self._registration_executor.shutdown(wait=True, cancel_futures=True)
             self._registration_executor = None
         
         self._registration_queue = None
@@ -930,13 +948,22 @@ class DjinnServer:
                 
                 logger.info(f"Deserializing request (msg_type=0x{msg_type:02x})...")
                 try:
-                    # ✅ FIRST: Try binary protocol detection (v2.3 execute_model / breakpoint)
-                    # Check if this looks like binary protocol (starts with version byte)
-                    if len(request_bytes) >= 1 and request_bytes[0] == 0x02:  # Protocol version
+                    from djinn.core.model_execution_serializer import ModelExecutionSerializer
+                    if msg_type == MessageType.RESUME_FROM_CHECKPOINT:
+                        logger.info("🔍 Detected resume-from-checkpoint binary request")
+                        session_id, fingerprint, modified_activation, layer_index = ModelExecutionSerializer.deserialize_resume_from_checkpoint_request(request_bytes)
+                        request = {
+                            'session_id': session_id,
+                            'fingerprint': fingerprint,
+                            'modified_activation': modified_activation,
+                            'layer_index': layer_index,
+                            '_binary_protocol': True,
+                        }
+                        self._ensure_request_id(request)
+                        self._last_request = request
+                    elif len(request_bytes) >= 1 and request_bytes[0] == 0x02:  # Protocol version
                         logger.info("🔍 Detected binary protocol message (v2.3)")
                         try:
-                            from djinn.core.model_execution_serializer import ModelExecutionSerializer
-                            
                             # Try to detect if it's a breakpoint request by checking structure
                             # Breakpoint requests have specific metadata with breakpoint_layer_index field
                             is_breakpoint_request = False
@@ -1175,6 +1202,8 @@ class DjinnServer:
                     response = await self._handle_signal_phase(request)
                 elif msg_type == MessageType.EXECUTE_BATCH:
                     response = await self._handle_execute_batch(request)
+                elif msg_type == MessageType.RESUME_FROM_CHECKPOINT:
+                    response = await self._handle_resume_from_checkpoint(request)
                 elif msg_type == MessageType.REGISTER_MODEL_CHUNKED:
                     logger.info(f"Handling REGISTER_MODEL_CHUNKED message...")
                     response = await self._handle_register_model_chunked(request, reader, writer, addr)
@@ -1252,6 +1281,16 @@ class DjinnServer:
                             message=response.get('message', 'Breakpoint execution failed')
                         )
                         logger.warning("⚠️  Using error response with binary protocol (EXECUTE_WITH_BREAKPOINT)")
+                elif msg_type == MessageType.RESUME_FROM_CHECKPOINT:
+                    if '_serialized_response' in response:
+                        response_bytes = response['_serialized_response']
+                        logger.info("✅ Response using pre-serialized binary protocol (RESUME_FROM_CHECKPOINT)")
+                    else:
+                        response_bytes = ModelExecutionSerializer.serialize_resume_from_checkpoint_response(
+                            result=None,
+                            status=response.get('status', 'error'),
+                            message=response.get('message', 'Resume from checkpoint failed')
+                        )
                 else:
                     # Use secure JSON protocol for other message types
                     from djinn.core.secure_serializer import SecureSerializer
@@ -1760,47 +1799,22 @@ class DjinnServer:
             except Exception as e:
                 logger.debug(f"Could not mark signal-managed: {e}")
             
-            if phase == 'IO_WAIT':
-                # Immediate eviction - bypass idle timeout
-                # HARDENED: Add exception callback to fire-and-forget task
-                evict_task = asyncio.create_task(self._semantic_evict(session_id))
-                evict_task.add_done_callback(
-                    lambda t: self._handle_background_task_result(t, f"evict:{session_id[:12]}")
-                )
-                logger.info(f"IO_WAIT signal: scheduling eviction for {session_id[:12]}")
-                
-                # If client provided estimate, schedule proactive pre-fetch
-                if estimated_resume_ms and estimated_resume_ms > 0:
-                    restore_delay_ms = max(0, estimated_resume_ms - 500)  # 500ms safety margin
-                    prefetch_task = asyncio.create_task(
-                        self._schedule_prefetch(session_id, restore_delay_ms)
-                    )
-                    prefetch_task.add_done_callback(
-                        lambda t: self._handle_background_task_result(t, f"prefetch:{session_id[:12]}")
-                    )
-                    logger.debug(f"Prefetch scheduled for {session_id[:12]}: "
-                               f"delay={restore_delay_ms}ms (estimated_resume={estimated_resume_ms}ms)")
+            # Delegate to AgentPhaseHandler
+            from djinn.handlers.agent_handler import AgentPhaseHandler
             
-            elif phase == 'COMPUTE':
-                # HARDENED: Check prefetch status through KVSessionManager method (thread-safe)
-                kv_mgr = get_kv_session_manager()
-                if kv_mgr:
-                    prefetch_status = await kv_mgr.check_prefetch_in_progress(session_id)
-                    if prefetch_status:
-                        logger.info(f"COMPUTE signal: prefetch already in progress for {session_id[:12]}, skipping restore")
-                        return {'status': 'ok', 'phase': phase, 'session_id': session_id[:12], 'note': 'prefetch_in_progress'}
-                
-                # Normal reactive restore with exception handling
-                restore_task = asyncio.create_task(self._semantic_restore(session_id))
-                restore_task.add_done_callback(
-                    lambda t: self._handle_background_task_result(t, f"restore:{session_id[:12]}")
-                )
-                logger.info(f"COMPUTE signal: scheduling restore for {session_id[:12]}")
+            # Lazy-load handler instance
+            if not hasattr(self, '_phase_handler'):
+                self._phase_handler = AgentPhaseHandler()
+                logger.info("Loaded AgentPhaseHandler for semantic scheduling")
             
-            else:
-                return {'status': 'error', 'message': f'Unknown phase: {phase}'}
+            # Build hints dict
+            hints = {}
+            if estimated_resume_ms:
+                hints['estimated_resume_ms'] = estimated_resume_ms
             
-            return {'status': 'ok', 'phase': phase, 'session_id': session_id[:12]}
+            # Delegate to handler
+            response = await self._phase_handler.on_phase_signal(session_id, phase, hints)
+            return response
         
         except Exception as e:
             logger.error(f"Signal phase handler error: {e}")
@@ -1822,84 +1836,6 @@ class DjinnServer:
         except asyncio.InvalidStateError:
             # Task not done yet (shouldn't happen in done callback)
             pass
-    
-    async def _semantic_evict(self, session_id: str) -> None:
-        """Immediate eviction triggered by IO_WAIT signal."""
-        try:
-            import time
-            from .multi_tenant.kv_session_manager import get_kv_session_manager
-            from .memory_metrics import get_metrics
-            
-            start_time = time.perf_counter()
-            kv_manager = get_kv_session_manager()
-            if kv_manager:
-                await kv_manager.evict_kv_to_host(session_id)
-                latency_ms = (time.perf_counter() - start_time) * 1000
-                logger.info(f"✅ Semantic evict: {session_id[:12]} (IO_WAIT signal) in {latency_ms:.1f}ms")
-                
-                # Record metrics
-                metrics = get_metrics()
-                metrics.record_semantic_eviction(latency_ms)
-        except Exception as e:
-            logger.debug(f"Semantic evict error: {e}")
-    
-    async def _semantic_restore(self, session_id: str) -> None:
-        """Background restore triggered by COMPUTE signal."""
-        try:
-            import time
-            from .multi_tenant.kv_session_manager import get_kv_session_manager
-            from .memory_metrics import get_metrics
-            
-            start_time = time.perf_counter()
-            kv_manager = get_kv_session_manager()
-            if kv_manager:
-                await kv_manager.restore_kv_from_host(session_id)
-                latency_ms = (time.perf_counter() - start_time) * 1000
-                logger.info(f"✅ Semantic restore: {session_id[:12]} (COMPUTE signal) in {latency_ms:.1f}ms")
-                
-                # Record metrics
-                metrics = get_metrics()
-                metrics.record_semantic_restore(latency_ms)
-        except Exception as e:
-            logger.debug(f"Semantic restore error: {e}")
-    
-    async def _schedule_prefetch(self, session_id: str, delay_ms: int) -> None:
-        """Schedule proactive KV restore ahead of expected compute resumption."""
-        kv_manager = get_kv_session_manager()
-        
-        try:
-            # HARDENED: Use thread-safe setter for prefetch flag
-            if kv_manager:
-                await kv_manager.set_prefetch_in_progress(session_id, True)
-                logger.debug(f"Prefetch marked as in_progress for {session_id[:12]}")
-            
-            # Wait for the specified delay
-            await asyncio.sleep(delay_ms / 1000.0)
-            
-            # Perform restoration
-            start_time = time.perf_counter()
-            if kv_manager:
-                await kv_manager.restore_kv_from_host(session_id)
-                latency_ms = (time.perf_counter() - start_time) * 1000
-                logger.info(f"✅ Prefetch completed: {session_id[:12]} (scheduled {delay_ms}ms ahead) "
-                           f"restore_latency={latency_ms:.1f}ms")
-                
-                # Record metrics
-                metrics = get_metrics()
-                metrics.record_semantic_prefetch(latency_ms)
-                
-                # HARDENED: Use thread-safe setter to clear flag
-                await kv_manager.set_prefetch_in_progress(session_id, False)
-                logger.debug(f"Prefetch completed and cleared for {session_id[:12]}")
-                
-        except Exception as e:
-            logger.error(f"Scheduled prefetch error for {session_id[:12]}: {e}")
-            # HARDENED: Ensure flag is cleared even on error
-            try:
-                if kv_manager:
-                    await kv_manager.set_prefetch_in_progress(session_id, False)
-            except Exception:
-                pass
     
     async def _handle_execute_batch(self, request: Dict) -> Dict:
         """Handle batch execution request - execute multiple models/inputs in one pass."""
@@ -2343,9 +2279,6 @@ class DjinnServer:
         """Internal implementation of model execution (non-blocking)."""
         executor_start = time.time()
         try:
-            # DEBUG: Verify method is called
-            with open("/tmp/execute_model_called.txt", "a") as f:
-                f.write(f"_execute_model_impl called with phase={request.get('_execution_phase')}\n")
             fingerprint = request.get('fingerprint', '')
             inputs = request.get('inputs', {})
             profile_id = request.get('profile_id')
@@ -2400,6 +2333,7 @@ class DjinnServer:
             phase_alias = (execution_phase or "").lower()
             decode_phases = {'decode', 'llm_decode'}
             prefill_phases = {'prefill', 'llm_prefill'}
+            
             if phase_alias in decode_phases.union(prefill_phases) and session_id_from_client:
                 if session_id_from_client not in session_mgr.sessions:
                     logger.debug(f"Creating session {session_id_from_client[:12]} for phase {execution_phase}")
@@ -2414,18 +2348,62 @@ class DjinnServer:
             
             kv_manager = None
             kv_session = None
+            restore_task = None  # ✅ TIER 3: Start restore task early
             gpu_index = self.capabilities.gpu_indices[0] if (self.capabilities and self.capabilities.gpu_indices) else 0
 
             if phase_alias in prefill_phases.union(decode_phases) and session_id:
                 kv_manager = get_kv_session_manager()
                 kv_session = await kv_manager.get_or_create(session_id, gpu_index)
-                if execution_phase == 'decode' and kv_session.kv_cache is not None:
-                    inputs = dict(inputs)
-                    inputs['past_key_values'] = kv_session.kv_cache
+                if phase_alias in decode_phases:
+                    if kv_session.is_swapped:
+                        logger.debug(
+                            "Decode phase: session %s KV cache swapped out; scheduling async restore",
+                            session_id[:12] if session_id else "unknown",
+                        )
+                        # ✅ TIER 3: Start restore immediately (async), will wait later
+                        restore_task = asyncio.create_task(
+                            kv_manager.restore_kv_from_host(session_id)
+                        )
+                        logger.debug(f"Restore task scheduled (async) for {session_id[:12]}")
 
-            # Get model from cache
+            # Get model from cache (this happens in parallel with restore)
             model_cache = get_model_cache_v23()
             model = model_cache.get_model(fingerprint)
+            
+            # ✅ TIER 3: Wait for restore to complete (if scheduled)
+            if restore_task is not None:
+                try:
+                    bytes_restored = await restore_task
+                    if bytes_restored == 0:
+                        logger.error(
+                            "[CRITICAL] Restore returned 0 bytes for %s - swap may have failed",
+                            session_id[:12] if session_id else "unknown",
+                        )
+                except Exception as restore_exc:
+                    logger.error(
+                        "[CRITICAL] Decode phase: failed to restore KV cache for session %s: %s",
+                        session_id[:12] if session_id else "unknown",
+                        restore_exc,
+                        exc_info=True,
+                    )
+            
+            # Update session with restored KV if decode phase
+            if phase_alias in decode_phases and kv_manager and kv_session:
+                cache_obj = kv_session.kv_cache
+                if cache_obj is None:
+                    logger.error(
+                        "[CRITICAL] Decode phase: session %s has no KV cache after restore attempt (swapped=%s)",
+                        session_id[:12] if session_id else "unknown",
+                        kv_session.is_swapped,
+                    )
+                else:
+                    logger.debug(
+                        "Decode phase: session %s KV cache type=%s",
+                        session_id[:12] if session_id else "unknown",
+                        type(cache_obj).__name__,
+                    )
+                    inputs = dict(inputs)
+                    inputs['past_key_values'] = cache_obj
             
             if model is None:
                 return {
@@ -2464,10 +2442,26 @@ class DjinnServer:
             # Others queue up while semantic scheduler swaps idle agents to host
             is_prefill = (execution_phase or "").lower() in {'prefill', 'llm_prefill'}
             if is_prefill:
-                async with self.prefill_semaphore:
-                    async with self._prefill_queue_lock:
-                        self.prefill_queue_depth = self.prefill_semaphore._value
-                    logger.info(f"🔒 PREFILL ACQUIRED (queue_depth={self.prefill_queue_depth})")
+                wait_start = time.perf_counter()
+                async with self._prefill_queue_lock:
+                    queued_before = max(
+                        0, self.MAX_CONCURRENT_PREFILLS - self.prefill_semaphore._value
+                    )
+                    self.prefill_queue_depth = max(self.prefill_queue_depth, queued_before)
+                await self.prefill_semaphore.acquire()
+                wait_ms = (time.perf_counter() - wait_start) * 1000.0
+                inflight_prefill = max(
+                    0, self.MAX_CONCURRENT_PREFILLS - self.prefill_semaphore._value
+                )
+                metrics = get_metrics()
+                metrics.record_prefill_admission(wait_ms, queued_before, inflight_prefill)
+                logger.info(
+                    "🔒 PREFILL ACQUIRED (queue_depth=%s, wait=%.1fms, inflight=%s)",
+                    queued_before,
+                    wait_ms,
+                    inflight_prefill,
+                )
+                try:
                     execution_result, execution_metrics = await executor.execute_with_lazy_outputs(
                         model=model,
                         inputs=inputs,
@@ -2475,6 +2469,8 @@ class DjinnServer:
                         return_lazy=False,  # Return concrete tensors over network
                         execution_phase=execution_phase
                     )
+                finally:
+                    self.prefill_semaphore.release()
             else:
                 # Decode can run concurrently without admission control
                 execution_result, execution_metrics = await executor.execute_with_lazy_outputs(
@@ -2499,22 +2495,12 @@ class DjinnServer:
             # ✅ CRITICAL FIX: Register activity REGARDLESS of KV extraction success
             # Activity tracking (idle detection) is orthogonal to KV caching
             # Sessions must be registered even if KV extraction failed
-            try:
-                with open("/tmp/activity_tracker_debug.txt", "a") as f:
-                    f.write(f"Check: tracker={activity_tracker_temp is not None}, session={session_id_from_client is not None}, phase={execution_phase}\n")
-            except:
-                pass
-            
             if activity_tracker_temp and session_id_from_client and execution_phase:
                 try:
                     activity_tracker_temp.register_session(session_id_from_client)
                     activity_tracker_temp.record_operation(session_id_from_client)
-                    with open("/tmp/activity_tracker_debug.txt", "a") as f:
-                        f.write(f"REGISTERED: {session_id_from_client[:12]} phase={execution_phase}\n")
                     logger.info(f"✅ Session {session_id_from_client[:12]} registered for idle tracking (phase={execution_phase})")
                 except Exception as e:
-                    with open("/tmp/activity_tracker_debug.txt", "a") as f:
-                        f.write(f"ERROR: {e}\n")
                     logger.debug(f"Activity tracker registration error: {e}")
             
             executor_time = (time.time() - executor_start) * 1000.0
@@ -2679,7 +2665,6 @@ class DjinnServer:
             from .breakpoint_executor import get_breakpoint_executor
             from .model_cache_v23 import get_model_cache_v23
             from .session_manager import get_session_manager
-            from djinn.core.model_execution_serializer import ModelExecutionSerializer
             
             # Extract breakpoint-specific fields from request
             fingerprint = request.get('fingerprint')
@@ -2690,6 +2675,8 @@ class DjinnServer:
             wait_for_resume = request.get('wait_for_resume', True)
             inputs = request.get('inputs', {})
             session_id_provided = request.get('session_id')
+            
+            logger.info(f"[Breakpoint RPC] wait_for_resume={wait_for_resume} (type={type(wait_for_resume).__name__})")
             
             # Create/reuse session
             session_mgr = get_session_manager()
@@ -2713,7 +2700,7 @@ class DjinnServer:
             executor = get_breakpoint_executor()
             
             logger.info(
-                f"[{session_id}] Executing model with breakpoint at layer {breakpoint_layer_index}..."
+                f"[{session_id}] Executing model with breakpoint at layer {breakpoint_layer_index} (wait_for_resume={wait_for_resume})..."
             )
             
             # Execute with breakpoint
@@ -2737,6 +2724,14 @@ class DjinnServer:
                 if k != 'model_output' and isinstance(v, (int, float, str, bool, type(None)))
             }
 
+            logger.debug(f"[{session_id}] Serializing breakpoint response:")
+            logger.debug(f"  model_output type: {type(model_output).__name__}")
+            if isinstance(model_output, dict):
+                logger.debug(f"  model_output keys: {list(model_output.keys())}")
+                for k, v in model_output.items():
+                    logger.debug(f"    {k}: {type(v).__name__}, shape={getattr(v, 'shape', 'N/A')}")
+            logger.debug(f"  serializable_metrics: {list(serializable_metrics.keys())}")
+
             response_data = ModelExecutionSerializer.serialize_execute_with_breakpoint_response(
                 result=model_output,
                 checkpoint_time_ms=checkpoint_time_ms,
@@ -2746,6 +2741,7 @@ class DjinnServer:
                 metrics=serializable_metrics,
                 status='success',
             )
+            logger.info(f"[{session_id}] Serialized response ({len(response_data)} bytes)")
             
             logger.info(
                 f"✅ Breakpoint execution complete for {session_id}:\n"
@@ -2765,6 +2761,74 @@ class DjinnServer:
             return {
                 'status': 'error',
                 'message': str(e)
+            }
+
+    async def _handle_resume_from_checkpoint(self, request: Dict) -> Dict:
+        """Handle resume-from-checkpoint requests for activation steering."""
+        try:
+            from .breakpoint_executor import get_breakpoint_executor
+            from .model_cache_v23 import get_model_cache_v23
+            from .session_manager import get_session_manager
+
+            session_id = request.get('session_id')
+            fingerprint = request.get('fingerprint')
+            layer_index = request.get('layer_index')
+            modified_activation = request.get('modified_activation')
+
+            if not session_id or not fingerprint:
+                return {'status': 'error', 'message': 'session_id and fingerprint required'}
+            if layer_index is None:
+                return {'status': 'error', 'message': 'layer_index required'}
+            if modified_activation is None:
+                return {'status': 'error', 'message': 'modified_activation tensor required'}
+
+            # Ensure session exists
+            session_mgr = get_session_manager()
+            if session_id not in session_mgr.sessions:
+                return {'status': 'error', 'message': f'session {session_id} not found'}
+
+            # Fetch model
+            model_cache = get_model_cache_v23()
+            model = model_cache.get_model(fingerprint)
+            if model is None:
+                return {'status': 'error', 'message': f'Model {fingerprint} not found in cache'}
+
+            executor = get_breakpoint_executor()
+
+            logger.info(
+                f"[{session_id}] Resuming from checkpoint via RPC "
+                f"(layer={layer_index}, activation_shape={tuple(modified_activation.shape)})"
+            )
+
+            model_output, metrics = executor.resume_from_modified_activation(
+                session_id=session_id,
+                model=model,
+                layer_index=layer_index,
+                modified_activation=modified_activation,
+            )
+
+            serialized = ModelExecutionSerializer.serialize_resume_from_checkpoint_response(
+                result=model_output,
+                metrics=metrics,
+                status='success',
+            )
+
+            return {
+                'status': 'success',
+                '_serialized_response': serialized,
+            }
+
+        except Exception as e:
+            logger.error(f"❌ Resume-from-checkpoint handler failed: {e}", exc_info=True)
+            serialized = ModelExecutionSerializer.serialize_resume_from_checkpoint_response(
+                result=None,
+                status='error',
+                message=str(e),
+            )
+            return {
+                'status': 'error',
+                'message': str(e),
+                '_serialized_response': serialized,
             }
 
     async def _handle_execute_stage(self, request: Dict) -> Dict:
@@ -3350,6 +3414,18 @@ class DjinnServer:
                 snapshot["semantic_scheduler"] = semantic_metrics
             except Exception as e:
                 logger.debug(f"Could not collect semantic scheduler metrics: {e}")
+            
+            # ✅ Add QoS scheduler stats
+            try:
+                if self.qos_scheduler:
+                    snapshot["scheduler"] = {
+                        "lifo_switches": self.qos_scheduler.stats.get("lifo_switches", 0),
+                        "lifo_scheduled": self.qos_scheduler.stats.get("lifo_scheduled", 0),
+                        "fifo_scheduled": self.qos_scheduler.stats.get("fifo_scheduled", 0),
+                        "max_concurrency": self.qos_scheduler._max_concurrency,
+                    }
+            except Exception as e:
+                logger.debug(f"Could not collect QoS scheduler metrics: {e}")
         except Exception as exc:  # pragma: no cover - defensive
             snapshot["status"] = "error"
             snapshot["error"] = str(exc)

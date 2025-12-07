@@ -204,6 +204,7 @@ class BreakpointHookManager:
         ✅ OPTIMIZED: Avoids GPU blocking inside forward hook
         - Returns GPU tensors (detached only)
         - Actual H2D transfer happens in ActivationCheckpointer with async stream
+        - CRITICAL: Explicitly saves attention_mask for transformer continuation
         
         Args:
             module: The layer module
@@ -228,6 +229,13 @@ class BreakpointHookManager:
             for i, tensor in enumerate(input):
                 if isinstance(tensor, torch.Tensor):
                     activations[f"input_{i}"] = tensor.detach()
+        
+        # ✅ CRITICAL: Explicitly save attention_mask from inputs
+        # For transformer layers (GPT-2, etc.), input[1] is attention_mask
+        # This is needed for _continue_from_layer to pass correct context to subsequent layers
+        if "input_1" in activations:
+            activations["attention_mask"] = activations["input_1"]
+            logger.debug(f"[{self.session_id}] Saved attention_mask from input_1")
         
         # Include module buffers (hidden states, attention scores, etc.)
         for name, buffer in module.named_buffers():

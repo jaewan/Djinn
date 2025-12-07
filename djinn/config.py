@@ -252,7 +252,7 @@ class ServerConfig:
             enable_load_balancing=os.getenv('GENIE_LOAD_BALANCING', 'true').lower() == 'true',
             load_balance_threshold=float(os.getenv('GENIE_LOAD_THRESHOLD', 0.7)),
             enable_qos=os.getenv('GENIE_ENABLE_QOS', 'true').lower() == 'true',
-            qos_max_concurrency=int(os.getenv('GENIE_QOS_MAX_CONCURRENCY', 4)),
+            qos_max_concurrency=int(os.getenv('GENIE_QOS_MAX_CONCURRENCY', 64)),
             qos_class_shares=shares_override or dict(DEFAULT_QOS_SHARES),
             qos_default_class=os.getenv('GENIE_QOS_DEFAULT_CLASS', 'interactive').lower(),
             qos_escalation_delay_ms=float(os.getenv('GENIE_QOS_ESCALATION_DELAY_MS', 800.0))

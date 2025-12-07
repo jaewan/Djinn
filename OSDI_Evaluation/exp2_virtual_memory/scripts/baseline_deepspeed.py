@@ -1,417 +1,219 @@
 #!/usr/bin/env python3
 """
-DeepSpeed-Inference Baseline: Speed of Light Reference
+DeepSpeed Inference Baseline: Optimized C++ Runtime
 
-Baseline using DeepSpeed's ZeRO-Inference with NVMe offloading.
-This represents the "theoretical maximum" bandwidth achievable via PCIe.
+Baseline using DeepSpeed's inference engine with kernel injection
+for optimized performance.
 
 Expected performance:
-- Bandwidth: ~23 GB/s (PCIe Gen4 saturation on L4)
-- TTFT: ~6-8s for 70B model on L4
+- Bandwidth: 15-23 GB/s (specialized C++ with kernel fusions)
+- TTFT: ~2-5s for 70B model on L4
 
-DeepSpeed uses low-level optimizations (C++ kernels, NVMe transfers) to
-approach theoretical PCIe bandwidth limits.
+This is the "speed of light" baseline that shows what's possible with
+purpose-built inference engines.
 
 Usage:
     python baseline_deepspeed.py \
-        --model meta-llama/Llama-2-70b-hf \
-        --runs 5 \
+        --model meta-llama/Llama-2-13b-hf \
+        --runs 3 \
         --output results/deepspeed.json
-
-Note: Requires DeepSpeed installation:
-    pip install deepspeed
 """
 
 import argparse
 import json
 import logging
-import os
 import time
-import tempfile
-import shutil
-from pathlib import Path
-from typing import Dict, Any, Tuple, Optional
-import gc
-import statistics
-
 import torch
+from pathlib import Path
+from typing import Dict, Any
+
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
-def get_model_size_bytes(model, dtype: str = None) -> int:
-    """Calculate model size in bytes.
-    
-    Args:
-        model: PyTorch model
-        dtype: Dtype string ("float16", "float32", etc.) or None to infer from model
-    
-    Returns:
-        Total size in bytes
-    """
-    # Infer dtype from first parameter if not provided
-    if dtype is None:
-        first_param = next(model.parameters(), None)
-        if first_param is not None:
-            if first_param.dtype == torch.float16:
-                dtype = "float16"
-            elif first_param.dtype == torch.bfloat16:
-                dtype = "bfloat16"
-            else:
-                dtype = "float32"
-        else:
-            dtype = "float32"
-    
-    # Map dtype to bytes per parameter
-    dtype_to_bytes = {
-        "float16": 2,
-        "bfloat16": 2,
-        "float32": 4,
-        "float64": 8,
-    }
-    bytes_per_param = dtype_to_bytes.get(dtype, 4)
-    
-    num_params = sum(p.numel() for p in model.parameters())
-    return num_params * bytes_per_param
+def get_model_size_bytes(model) -> int:
+    """Calculate model size in bytes."""
+    total_params = sum(p.numel() for p in model.parameters())
+    return total_params * 2  # float16
 
 
-def load_model_with_deepspeed(
-    model_id: str,
-    device_id: int = 0,
-    dtype: str = "float16",
-    ds_config_path: Optional[str] = None
-) -> Tuple[Any, Any]:
-    """
-    Load model with DeepSpeed ZeRO-Inference for memory-constrained inference.
+def run_inference(model, tokenizer, prompt: str, max_new_tokens: int = 50) -> float:
+    """Run inference and measure time."""
+    input_ids = tokenizer.encode(prompt, return_tensors="pt")
     
-    Uses DeepSpeed's init_inference() for optimized inference with kernel injection.
-    For true NVMe offloading, requires distributed launch with ds config.
-    """
-    logger.info(f"Loading {model_id} with DeepSpeed")
+    if input_ids.shape[1] > 512:
+        input_ids = input_ids[:, :512]
     
+    device = next(model.parameters()).device
+    input_ids = input_ids.to(device)
+    
+    # Measure time
+    start = time.time()
+    
+    with torch.no_grad():
+        outputs = model.generate(
+            input_ids,
+            max_new_tokens=min(max_new_tokens, 50),
+            do_sample=False,
+        )
+    
+    elapsed = time.time() - start
+    return elapsed
+
+
+def load_model_with_deepspeed(model_id: str):
+    """Load model with DeepSpeed optimization if available."""
     try:
         import deepspeed
-    except ImportError:
-        logger.error("❌ DeepSpeed not installed. Install with: pip install deepspeed")
-        raise
-    
-    # Determine dtype
-    torch_dtype = torch.float16 if dtype == "float16" else torch.float32
-    
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    
-    logger.info("Loading model (this may take several minutes for 70B)...")
-    start = time.perf_counter()
-    
-    try:
-        # Step 1: Load model to CPU with low memory usage
+        logger.info(f"Loading {model_id} with DeepSpeed...")
+        
+        # Determine dtype
+        torch_dtype = torch.float16
+        
+        # Load model to CPU first
         logger.info("  Step 1/3: Loading model checkpoint to CPU...")
+        logger.info("  (Using local cache only - model must be cached)")
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
             torch_dtype=torch_dtype,
             low_cpu_mem_usage=True,
+            local_files_only=False,  # Try to use cache first, download if needed with resume
+            resume_download=True,
         )
         
-        logger.info("  Step 2/3: Initializing DeepSpeed Inference engine...")
+        logger.info("  Step 2/3: Initializing DeepSpeed inference engine...")
         
-        # Step 2: Wrap with DeepSpeed Inference for kernel injection and optimization
-        # This uses DeepSpeed's optimized kernels for attention, MLP, etc.
+        # Wrap with DeepSpeed for kernel injection
         model = deepspeed.init_inference(
             model,
-            mp_size=1,                          # Single GPU
+            mp_size=1,
             dtype=torch_dtype,
-            replace_with_kernel_inject=True,   # Use optimized kernels (critical for speed)
-            enable_cuda_graph=False,            # Disable for inference (can cause issues)
+            replace_with_kernel_inject=True,
+            enable_cuda_graph=False,
         )
         
-        # Extract module from DeepSpeed wrapper
+        # Extract module if wrapped
         model = model.module if hasattr(model, 'module') else model
         
-        load_time = time.perf_counter() - start
-        logger.info(f"  Step 3/3: Model ready")
-        logger.info(f"✅ Model initialized with DeepSpeed Inference in {load_time:.1f}s")
+        logger.info("  Step 3/3: Model ready")
+        return model, True
         
+    except ImportError:
+        logger.warning("DeepSpeed not available, falling back to standard inference")
+        logger.info(f"Loading {model_id} with standard PyTorch...")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype=torch.float16,
+            device_map="auto",
+            local_files_only=False,
+            resume_download=True,
+        )
+        return model, False
     except Exception as e:
-        logger.error(f"❌ Failed to load model with DeepSpeed: {e}")
-        logger.info("   Falling back to standard inference (slower)...")
-        
-        # Fallback: Try loading without DeepSpeed
-        try:
-            model = AutoModelForCausalLM.from_pretrained(
-                model_id,
-                torch_dtype=torch_dtype,
-                device_map="auto",
-                low_cpu_mem_usage=True,
-            )
-            logger.warning("⚠️  Using standard inference (not optimized)")
-        except Exception as e2:
-            logger.error(f"❌ Failed to load model: {e2}")
-            raise
-    
-    return model, tokenizer
-
-
-def run_inference(
-    model,
-    tokenizer,
-    prompt: str,
-    device: torch.device,
-    num_iterations: int = 1,
-    enable_generation: bool = False,
-    generation_length: int = 50
-) -> Dict[str, Any]:
-    """
-    Run inference and measure latency.
-    
-    Args:
-        enable_generation: If True, use model.generate() for TTFT measurement.
-                          If False, use forward pass only.
-        generation_length: Number of tokens to generate
-    
-    Returns:
-        Dict with: latency_ms, bandwidth_gbps, peak_vram_mb, ttft_ms (if generation)
-    """
-    model.eval()
-    
-    # Prepare input
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
-    input_ids = inputs["input_ids"]
-    
-    # Reset memory stats
-    torch.cuda.reset_peak_memory_stats()
-    torch.cuda.synchronize()
-    
-    # Measure inference
-    times = []
-    ttfts = []
-    
-    for _ in range(num_iterations):
-        if enable_generation:
-            # Use generate() for token-by-token generation
-            start = time.perf_counter()
-            
-            with torch.no_grad():
-                generated_ids = model.generate(
-                    input_ids,
-                    max_new_tokens=generation_length,
-                    do_sample=False,
-                    pad_token_id=tokenizer.eos_token_id,
-                )
-            
-            torch.cuda.synchronize()
-            elapsed = time.perf_counter() - start
-            times.append(elapsed * 1000)  # Convert to ms
-            
-            # Estimate TTFT: first token latency
-            num_generated = generated_ids.shape[-1] - input_ids.shape[-1]
-            if num_generated > 0:
-                ttfts.append((elapsed / num_generated) * 1000)  # Estimate: first token
-        else:
-            # Use forward pass only
-            start = time.perf_counter()
-            
-            with torch.no_grad():
-                outputs = model(input_ids, use_cache=False)
-            
-            torch.cuda.synchronize()
-            elapsed = time.perf_counter() - start
-            times.append(elapsed * 1000)  # Convert to ms
-    
-    # Get memory stats
-    peak_vram = torch.cuda.max_memory_allocated() / 1024**2  # MB
-    
-    # Calculate bandwidth (dtype is inferred from model)
-    model_size_bytes = get_model_size_bytes(model)
-    avg_time_s = (sum(times) / len(times)) / 1000  # Convert back to seconds
-    bandwidth_gbps = (model_size_bytes / avg_time_s) / (1024**3)
-    
-    result = {
-        "latency_ms": sum(times) / len(times),
-        "bandwidth_gbps": bandwidth_gbps,
-        "peak_vram_mb": peak_vram,
-    }
-    
-    # Add TTFT if generation was used
-    if ttfts:
-        result["ttft_ms"] = sum(ttfts) / len(ttfts)
-    
-    return result
+        logger.warning(f"DeepSpeed initialization failed: {e}")
+        logger.info(f"Loading {model_id} with standard PyTorch...")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype=torch.float16,
+            device_map="auto",
+            local_files_only=False,
+            resume_download=True,
+        )
+        return model, False
 
 
 def main():
-    parser = argparse.ArgumentParser(description="DeepSpeed-Inference Baseline")
-    parser.add_argument("--model", type=str, default="meta-llama/Llama-2-13b-hf",
-                       help="Model ID from HuggingFace")
-    parser.add_argument("--device", type=int, default=0, help="CUDA device ID")
-    parser.add_argument("--runs", type=int, default=5, help="Number of runs")
-    parser.add_argument("--output", type=str, default="results/deepspeed.json",
-                       help="Output JSON file")
-    parser.add_argument("--skip-if-unavailable", action="store_true",
-                       help="Skip if DeepSpeed not available instead of failing")
-    parser.add_argument("--ttft-enabled", action="store_true",
-                       help="Enable TTFT measurement using generate()")
-    parser.add_argument("--generation-length", type=int, default=50,
-                       help="Number of tokens to generate")
-    
+    parser = argparse.ArgumentParser(description="DeepSpeed Baseline")
+    parser.add_argument("--model", default="meta-llama/Llama-2-13b-hf", help="Model ID")
+    parser.add_argument("--runs", type=int, default=3, help="Number of runs")
+    parser.add_argument("--output", default="deepspeed.json", help="Output JSON file")
+    parser.add_argument("--ttft-enabled", action="store_true", help="Measure TTFT")
     args = parser.parse_args()
     
-    if not torch.cuda.is_available():
-        logger.error("❌ CUDA not available")
-        return False
-    
-    device = torch.device(f"cuda:{args.device}")
-    
-    logger.info("=" * 80)
-    logger.info("DeepSpeed-Inference Baseline")
-    logger.info("=" * 80)
+    logger.info("=" * 70)
+    logger.info("DeepSpeed Inference Baseline")
+    logger.info("=" * 70)
     logger.info(f"Model: {args.model}")
-    logger.info(f"Device: {device}")
+    logger.info(f"Device: cuda:0")
     logger.info(f"Runs: {args.runs}")
     logger.info("")
     
-    # Check if DeepSpeed is available
-    try:
-        import deepspeed
-        logger.info(f"✅ DeepSpeed version: {deepspeed.__version__}")
-    except ImportError:
-        if args.skip_if_unavailable:
-            logger.warning("⚠️  DeepSpeed not available, skipping baseline")
-            return True
-        else:
-            logger.error("❌ DeepSpeed not available. Install with: pip install deepspeed")
-            return False
+    # Load tokenizer
+    logger.info(f"Loading tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=False, resume_download=True)
     
+    # Load model with DeepSpeed
+    model, deepspeed_enabled = load_model_with_deepspeed(args.model)
+    
+    model_size_gb = get_model_size_bytes(model) / (1024**3)
+    logger.info(f"✅ Model loaded (DeepSpeed: {deepspeed_enabled})")
+    logger.info(f"Model size: {model_size_gb:.1f}GB")
     logger.info("")
     
-    # Load model
-    try:
-        model, tokenizer = load_model_with_deepspeed(
-            args.model,
-            device_id=args.device,
-            dtype="float16"
-        )
-        model_size_gb = get_model_size_bytes(model) / (1024**3)  # Dtype inferred from model
-        logger.info(f"Model size: {model_size_gb:.1f}GB\n")
-    except Exception as e:
-        logger.error(f"Failed to load model: {e}")
-        if args.skip_if_unavailable:
-            return True
-        return False
-    
-    # Run warmup
+    # Warmup
     logger.info("Running warmup (2 iterations)...")
-    try:
-        _ = run_inference(
-            model, tokenizer, "The future of AI is", device,
-            num_iterations=2,
-            enable_generation=args.ttft_enabled,
-            generation_length=args.generation_length
-        )
-        logger.info("✅ Warmup complete\n")
-    except Exception as e:
-        logger.error(f"Warmup failed: {e}")
-        if args.skip_if_unavailable:
-            return True
-        return False
+    prompt = "The answer to life, the universe, and everything is"
+    for _ in range(2):
+        run_inference(model, tokenizer, prompt, max_new_tokens=10)
+    logger.info("✅ Warmup complete")
+    logger.info("")
     
-    # Run measurements
-    logger.info(f"Running {args.runs} measurement iterations...\n")
-    results = []
-    
-    for run_id in range(args.runs):
-        try:
-            gc.collect()
-            torch.cuda.empty_cache()
-            
-            metrics = run_inference(
-                model, tokenizer,
-                "The future of artificial intelligence is",
-                device,
-                num_iterations=1,
-                enable_generation=args.ttft_enabled,
-                generation_length=args.generation_length
-            )
-            
-            results.append({
-                "run_id": run_id,
-                **metrics
-            })
-            
-            logger.info(
-                f"Run {run_id}: latency {metrics['latency_ms']:.1f}ms, "
-                f"bandwidth {metrics['bandwidth_gbps']:.1f}GB/s, "
-                f"memory {metrics['peak_vram_mb']:.0f}MB"
-            )
-        except Exception as e:
-            logger.error(f"Run {run_id} failed: {e}")
-            if args.skip_if_unavailable:
-                break
-            return False
-    
-    if not results:
-        logger.warning("⚠️  No successful runs, skipping results")
-        return True
-    
-    # Compute summary
-    latencies = [r["latency_ms"] for r in results]
-    bandwidths = [r["bandwidth_gbps"] for r in results]
-    ttfts = [r.get("ttft_ms") for r in results if "ttft_ms" in r]
-    
-    summary = {
-        "avg_latency_ms": sum(latencies) / len(latencies),
-        "median_latency_ms": sorted(latencies)[len(latencies)//2],
-        "stdev_latency_ms": statistics.stdev(latencies) if len(latencies) > 1 else 0,
-        "min_latency_ms": min(latencies),
-        "max_latency_ms": max(latencies),
-        "avg_bandwidth_gbps": sum(bandwidths) / len(bandwidths),
-        "median_bandwidth_gbps": sorted(bandwidths)[len(bandwidths)//2],
-        "stdev_bandwidth_gbps": statistics.stdev(bandwidths) if len(bandwidths) > 1 else 0,
-        "min_bandwidth_gbps": min(bandwidths),
-        "max_bandwidth_gbps": max(bandwidths),
+    # Measurement runs
+    logger.info(f"Running {args.runs} measurement iterations...")
+    results = {
+        "model": args.model,
+        "baseline": "deepspeed",
+        "device": "cuda:0",
+        "model_size_gb": model_size_gb,
+        "deepspeed_enabled": deepspeed_enabled,
+        "runs": [],
+        "summary": {}
     }
     
-    # Add TTFT statistics if available
-    if ttfts:
-        summary["avg_ttft_ms"] = sum(ttfts) / len(ttfts)
-        summary["median_ttft_ms"] = sorted(ttfts)[len(ttfts)//2]
-        summary["stdev_ttft_ms"] = statistics.stdev(ttfts) if len(ttfts) > 1 else 0,
-        summary["min_ttft_ms"] = min(ttfts)
-        summary["max_ttft_ms"] = max(ttfts)
+    latencies = []
+    
+    for i in range(args.runs):
+        logger.info(f"  Run {i+1}/{args.runs}...")
+        latency = run_inference(model, tokenizer, prompt, max_new_tokens=50)
+        latencies.append(latency)
+        results["runs"].append({
+            "run": i+1,
+            "latency_ms": latency * 1000,
+        })
+    
+    # Compute statistics
+    avg_latency = sum(latencies) / len(latencies)
+    min_latency = min(latencies)
+    max_latency = max(latencies)
+    
+    results["summary"] = {
+        "avg_latency_ms": avg_latency * 1000,
+        "min_latency_ms": min_latency * 1000,
+        "max_latency_ms": max_latency * 1000,
+        "effective_bandwidth_gbps": model_size_gb / avg_latency,
+    }
+    
+    logger.info("")
+    logger.info("Results:")
+    logger.info(f"  Avg latency: {avg_latency*1000:.1f}ms")
+    logger.info(f"  Min latency: {min_latency*1000:.1f}ms")
+    logger.info(f"  Max latency: {max_latency*1000:.1f}ms")
+    logger.info(f"  Effective bandwidth: {model_size_gb/avg_latency:.2f} GB/s")
     
     # Save results
-    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-    output = {
-        "baseline": "deepspeed",
-        "model": args.model,
-        "model_size_gb": model_size_gb,
-        "runs": results,
-        "summary": summary,
-        "timestamp": time.time(),
-    }
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     
-    with open(args.output, 'w') as f:
-        json.dump(output, f, indent=2)
+    with open(output_path, "w") as f:
+        json.dump(results, f, indent=2)
     
-    # Print summary
-    logger.info("\n" + "=" * 80)
-    logger.info("SUMMARY")
-    logger.info("=" * 80)
-    logger.info(f"Average latency: {summary['avg_latency_ms']:.1f}ms")
-    logger.info(f"Average bandwidth: {summary['avg_bandwidth_gbps']:.1f}GB/s")
-    if "avg_ttft_ms" in summary:
-        logger.info(f"Average TTFT: {summary['avg_ttft_ms']:.1f}ms")
-    logger.info(f"Target: ~23 GB/s (PCIe Gen4 saturation)")
-    logger.info(f"Results saved to: {args.output}")
-    
-    return True
+    logger.info("")
+    logger.info(f"✅ Results saved to: {output_path}")
 
 
 if __name__ == "__main__":
-    success = main()
-    exit(0 if success else 1)
+    main()
+
 
