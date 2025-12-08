@@ -66,7 +66,7 @@ def check_gpu_memory() -> Dict[str, float]:
 
 def run_pytorch_eager_baseline(
     model_name: str = "meta-llama/Llama-2-13b-hf",
-    input_length: int = 512,
+    input_length: int = 2048,
     pause_duration_seconds: int = 10,
     breakpoint_layer: int = 20,
     output_dir: Path = Path("/tmp/exp3_osdi_results"),
@@ -74,10 +74,13 @@ def run_pytorch_eager_baseline(
     """
     Run PyTorch Eager baseline demonstrating VRAM holding during pause.
     
+    Scientific Goal: Show that standard PyTorch inference CANNOT release VRAM during
+    pause/think-time, preventing GPU sharing. Djinn releases VRAM by swapping to host.
+    
     Args:
         model_name: HuggingFace model ID
-        input_length: Input sequence length
-        pause_duration_seconds: How long to "pause"
+        input_length: Input sequence length (long context to make KV cache meaningful)
+        pause_duration_seconds: How long to "pause" (simulating think time)
         breakpoint_layer: Layer index to pause at
         output_dir: Output directory for logs
     
@@ -91,8 +94,9 @@ def run_pytorch_eager_baseline(
     logger.info("="*80)
     logger.info(f"Model: {model_name}")
     logger.info(f"Breakpoint Layer: {breakpoint_layer}")
-    logger.info(f"Input Length: {input_length}")
-    logger.info(f"Pause Duration: {pause_duration_seconds}s\n")
+    logger.info(f"Input Length: {input_length} (long context for meaningful KV cache)")
+    logger.info(f"Pause Duration: {pause_duration_seconds}s")
+    logger.info("Scientific Goal: Prove PyTorch cannot share GPU during pause\n")
     
     try:
         # Check initial GPU state
@@ -107,6 +111,11 @@ def run_pytorch_eager_baseline(
             device_map="cuda:0",
         )
         tokenizer = AutoTokenizer.from_pretrained(model_name)
+        
+        # CRITICAL FIX: Ensure pad_token is set (required for batched inference)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+            logger.info("Set tokenizer.pad_token to eos_token")
         
         mem_after_model = check_gpu_memory()
         model_vram_gb = mem_after_model['allocated_gb'] - mem_before['allocated_gb']

@@ -1,0 +1,45 @@
+# Experiment 3: OSDI-Quality White-Box Interactivity Evaluation
+# Scientific evaluation with Llama-3-8B to demonstrate memory management under pressure
+
+model:
+  name: "meta-llama/Llama-2-13b-hf"
+  num_layers: 40
+  source: "transformers"
+  
+experiment:
+  num_trials: 3
+  
+  breakpoints:
+    enabled: true
+    # Test early, mid, and late layers to show scalability across model depth
+    # For 40-layer Llama-2-13B: layers [10, 20, 30] = [25%, 50%, 75%] through model
+    layers: [10, 20, 30]
+  
+  inference:
+    input_length: 2048        # Long context for meaningful KV cache size (~1GB)
+    context_tokens: 2048
+    token_accuracy_threshold: 95.0
+    
+  activation_steering:
+    enabled: true             # Steering demo proves write-back capability
+    modification_type: "scale"
+    modification_factor: 0.9  # Scale activation by 0.9 (10% reduction)
+    steering_layer: 20        # Mid-point layer (50%) for maximum effect visibility
+    
+  concurrent_demo:
+    enabled: true
+    request_b_during_pause: true
+    pause_duration_seconds: 10
+    
+  memory_pressure_test:
+    enabled: true
+    num_sessions: 6           # 6 sessions × ~27GB per session = 162GB (exceeds 80GB H100)
+    session_pause_layer: 20   # Pause at mid-layer for consistent state
+    
+validation:
+  require_output_equivalence: true      # 100% token accuracy
+  require_steering_effect: true         # 0.39%+ output divergence
+  require_memory_pressure_success: true # Djinn swaps sessions, PyTorch OOMs
+  
+duration: 300  # minutes (estimated for full evaluation with Llama-3-8B)
+output_dir: "/tmp/exp3_osdi_llama_results"
