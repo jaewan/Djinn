@@ -161,6 +161,19 @@ class DjinnCoordinator:
         # ✅ Register as global instance
         set_coordinator(self)
 
+    def _get_server_address(self) -> str:
+        """Get server address from config, handling both old and new config formats."""
+        # Check if config has server_address and it's a string
+        if hasattr(self.config, 'server_address') and isinstance(self.config.server_address, str):
+            return self.config.server_address or 'localhost:5556'
+        # Check for new config format (DjinnConfig object)
+        elif hasattr(self._central_config, 'network') and hasattr(self._central_config.network, 'remote_server_address'):
+            addr = self._central_config.network.remote_server_address
+            if addr and isinstance(addr, str):
+                return addr
+        # Default fallback
+        return 'localhost:5556'
+    
     def _init_global_coordinator(self):
         """Initialize global fleet coordinator if enabled."""
         fleet_config = self._central_config.fleet
@@ -1506,7 +1519,7 @@ class DjinnCoordinator:
             }
             if hf_token:
                 request['hf_access_token'] = hf_token
-            server_address = self.config.server_address or 'localhost:5556'
+            server_address = self._get_server_address()
             try:
                 serialize_start = time.perf_counter()
                 serialized = SecureSerializer.serialize_request(request)
@@ -1585,7 +1598,7 @@ class DjinnCoordinator:
             '_request_id': str(uuid.uuid4()),
         }
         
-        server_address = self.config.server_address or 'localhost:5556'
+        server_address = self._get_server_address()
         
         try:
             # Serialize request
@@ -1630,7 +1643,7 @@ class DjinnCoordinator:
         from ..server.transport.protocol import MessageType
         from ..core.secure_serializer import SecureSerializer
         
-        server_address = self.config.server_address or 'localhost:5556'
+        server_address = self._get_server_address()
         request = {'type': 'WARMUP_GPU'}
         
         logger.debug("Requesting remote GPU warmup...")
@@ -1671,7 +1684,7 @@ class DjinnCoordinator:
         import pickle
         from ..core.secure_serializer import SecureSerializer
         
-        server_address = self.config.server_address or 'localhost:5556'
+        server_address = self._get_server_address()
         
         try:
             request = {'batch': batch_requests}
@@ -1717,7 +1730,7 @@ class DjinnCoordinator:
         from ..core.secure_serializer import SecureSerializer
         from .model_execution_serializer import ModelExecutionSerializer
 
-        server_address = self.config.server_address or 'localhost:5556'
+        server_address = self._get_server_address()
         extra_metadata: Dict[str, Any] = {'stage': stage}
         if session_id:
             extra_metadata['session_id'] = session_id
@@ -1779,7 +1792,7 @@ class DjinnCoordinator:
         }
         
         # Get server address
-        server_address = self.config.server_address or 'localhost:5556'
+        server_address = self._get_server_address()
         
         try:
             # Use binary protocol (2-3x faster than pickle)
@@ -1907,9 +1920,9 @@ class DjinnCoordinator:
         
         from ..server.transport.protocol import MessageType
         from .model_execution_serializer import ModelExecutionSerializer
-        
+
         # Get server address
-        server_address = self.config.server_address or 'localhost:5556'
+        server_address = self._get_server_address()
         
         try:
             # Serialize request
@@ -2020,7 +2033,7 @@ class DjinnCoordinator:
         from ..server.transport.protocol import MessageType
         from .model_execution_serializer import ModelExecutionSerializer
         
-        server_address = self.config.server_address or 'localhost:5556'
+        server_address = self._get_server_address()
         
         try:
             # Serialize the resume request
@@ -2077,7 +2090,7 @@ class DjinnCoordinator:
             from djinn.server.transport.protocol import MessageType
             from .secure_serializer import SecureSerializer
             
-            server_address = self.config.server_address or 'localhost:5556'
+            server_address = self._get_server_address()
             
             # Prepare signal request
             request = {
