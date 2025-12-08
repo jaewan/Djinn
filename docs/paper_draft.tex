@@ -14,15 +14,15 @@ Conversely, cluster schedulers like Ray~\cite{ray} or Kubernetes~\cite{kubernete
 This leads to the "parking lot" problem, where expensive accelerators sit idle while users think and type, resulting in average cluster utilization of 55--60\%~\cite{gao2024empirical}.
 
 Enabling interactive exploration on shared accelerators requires more than simply disaggregating resources.
-Existing disaggregation approaches~\cite{rcuda,dxpu,bitfusion} fail due to a fundamental architectural mismatch we term the semantic translation gap. 
+Existing disaggregation approaches~\cite{rcuda,dxpu,bitfusion} fail because they perform physical rather than logical virtualization.
 As computation descends the software stack—from the deep learning framework, through the runtime, down to the driver and hardware—crucial semantic intent is stripped away~\cite{hong2025lost}.
-A PyTorch program understands that model weights are immutable and shared, while a KV-cache is session-private state. It knows when an operation is part of a long-lived prefill versus a short decode step. By the time these operations reach the driver, however, they have been flattened into opaque buffers and kernel launches. This semantic blindness forces lower layers into pathological behaviors, such as holding persistent state for idle sessions or repeatedly re-transferring static weights.
-
+Consequently, when a user pauses to "think," the remote GPU remains locked to hold their memory, solving nothing.
+A PyTorch program understands that model weights are immutable and shared, while a KV-cache is session-private state. It knows when an operation is part of a long-lived prefill versus a short decode step. By the time these operations reach the driver, however, they have been flattened into opaque buffers and kernel launches. 
+Lacking the high-level distinction between 'active computation' and 'interactive think-time', the driver is forced into a conservative posture: it must pin gigabytes of KV-cache in VRAM during minutes of user inactivity simply because the memory handle remains open. Similarly, without knowledge of model identity, it redundantly transfers identical weights for different users, unable to implement the shared-memory deduplication standard in modern OSes.
 
 We argue that enabling efficient interactivity on shared accelerators requires a new abstraction: the \textbf{Tensor Process}.
 Just as a Unix process virtualizes the CPU and RAM via Code, Heap, and Stack segments, a Tensor Process must virtualize the distinct semantic components of Deep Learning—Model Weights (Text), KV Caches (Data), and Activations (Stack).
 This abstraction allows the system to manage memory lifecycles independently, enabling multiple sessions to time-share a single accelerator without thrashing.
-
 
 We present \sys, a framework-level Tensor Operating System designed for this abstraction.
 \sys bridges the semantic gap by interposing at the PyTorch dispatch layer, treating tensor operations as system calls.
@@ -38,50 +38,22 @@ The heavy lifting of graph capture, serialization, and remote execution is handl
 
 
 Second, memory segmentation via \textit{Unified Virtual Memory Unit (VMU)}.
-To realize Tensor Process, \sys partitions GPU memory into semantic segments.
+To realize Tensor Process, \sys partitions GPU memory into semantic segments defined by their lifecycle, mirroring Unix memory model.
 Guided by the SRG, it maps immutable weights to a shared \textit{Text Segment}, session-private KV caches to a swappable \textit{Data Segment}, and ephemeral activations to a volatile \textit{Stack Segment}. 
 Crucially, the Stack Segment employs a watermark-based reset, guaranteeing zero external fragmentation for intermediate computations.
 This allows \sys to context-switch at the granularity of individual operations, solving the "parking lot" problem: users retain logical session state without locking physical compute.
 
 Third, Latency-hiding Virtualization via \textit{Ghost Loading}. 
-To virtualize access to massive models, \sys implements Ghost Loading. Clients instantiate zero-memory "ghost" modules; the server maps physical weights into the shared Text Segment. Unlike naive demand paging which stalls execution, \sys leverages the SRG to pipeline memory transfers with computation. By treating the Text Segment as a streaming ring buffer, \sys prefetches future layers over PCIe while the GPU computes the current layer, effectively hiding virtualization latency and saturating host-to-device bandwidth.
+To virtualize access to massive models, \sys implements Ghost Loading. 
+Clients instantiate zero-memory "ghost" modules; 
+the server maps physical weights into the shared Text Segment.
+Unlike general-purpose demand paging which reacts to page faults or relies on spatial locality heuristics, \sys leverages the SRG's deterministic lookahead to perfectly pipeline memory transfers with computation.
+By treating the Text Segment as a streaming ring buffer, \sys prefetches future layers over PCIe synchronously while the GPU computes the current layer, effectively hiding virtualization latency."
 
 
 Our evaluation shows that \sys enables new regimes of interactivity and efficiency. For reasoning agents, \sys eliminates the "parking lot" effect, scaling concurrent sessions by ×× over batch schedulers by transparently swapping state during tool execution. 
 For heterogeneous pipelines, \sys runs multi-model workflows (e.g., Audio-LLM-Vision) on a single GPU that would otherwise OOM, by dynamically paging "Text Segments." \sys demonstrates that by lifting OS primitives into the framework layer, we can transform the GPU cluster from a rigid batch processor into a flexible interactive utility.
 
-\section{The Case for Framework-Level Disaggregation}
-\label{sec:motivation}
-
-Efficient disaggregation requires answering three fundamental resource management questions for every operation:
-\begin{enumerate}
-    \item \textbf{Life Cycle \& Residency:} Is this tensor ephemeral (activations), session-scoped (KV-cache), or globally shared (weights)?
-    \item \textbf{Locality:} Should the computation move to the data (e.g., near a KV-cache), or should the data move to the computation?
-    \item \textbf{Scheduling:} Does the dataflow allow for latency masking via pipelining or prefetching?
-\end{enumerate}
-
-These are not merely optimization flags; they are semantic properties inherent to the workload. In this section, we demonstrate that the \textit{semantic translation gap} prevents lower layers from answering these questions, identifying the framework layer as the unique "narrow waist" capable of driving a Tensor Operating System.
-
-\subsection{The Challenges of Temporal Sparsity}
-\label{sec:interactive_crisis}
-
-AI workloads are bifurcating. While training and bulk serving maximize compute density, interactive workloads exhibit extreme \emph{temporal sparsity}: distinct periods of high-intensity compute interspersed with long periods of idleness ("think time").
-Existing infrastructure handles this pathology poorly where a user must reserve a physical accelerator for the entire duration of a session, regardless of actual utilization resulting in a duty cycle of $<1\%$.  
-This sparsity originates from two structural shifts in the workloads that break the assumptions of traditional batch schedulers.
-
-\paragraph{Human-in-the-Loop: The Notebook Granularity Mismatch.}
-The Jupyter notebook, the de facto interface for AI research, interacts inefficiently with monolithic schedulers. A researcher debugging Llama-3-70B requires exclusive allocation of two NVIDIA H100-80GB GPUs to satisfy the model's memory footprint.
-However, the execution model is fragmented: computation occurs in cells—small, sporadic graph fragments—while the Python kernel maintains persistent state for hours.
-Because the scheduler cannot distinguish between "holding state" and "computing," the researcher is forced to lock 140GB of HBM and 4,000 TFLOPS of compute during minutes of code modification.
-This "parking lot" behavior prevents the cluster from reclaiming the accelerator's compute units for other pending jobs, artificially inflating the scarcity of high-end hardware.
-
-\paragraph{Machine-in-the-Loop: Agentic Workflows.}
-Emerging \textit{Reasoning Agents} accelerate this pattern: they interleave bursty GPU generation with I/O-bound tool execution in rapid loops.
-Agents execute stateful loops: \textit{Reason(GPU) → Act(Tool/IO) → Observe(GPU)}.
-During the I/O-bound "Act" phase (e.g., querying a database), the GPU execution units are idle.
-However, standard serverless abstractions (e.g., K-Serve) fail here because they conflate idleness with termination. Releasing the GPU during the "Act" phase forces a full flush of the session's KV-cache (State).
-When the agent returns to "Observe," the system must pay a prohibitive Cold Start Tax: reloading weights and re-computing the entire history.
-This forces architects into a false choice: reserve the GPU (wasting compute) or recompute state (wasting latency).
 
 %Emerging \textit{AI Agents} exhibit identical structural sparsity but at higher frequency. Unlike stateless HTTP inference requests, Agents execute stateful loops: \textit{Reason → Act → Observe}.
 %An agent might generate a plan on the GPU (Reason), execute a remote tool or database query (Act), and wait for the result (Observe).
@@ -171,73 +143,100 @@ Existing systems fail at least two of these. \sys satisfies all five.
 \section{Evaluation}
 \label{sec:evaluation}
 
-We evaluate \sys's semantic memory virtualization through a controlled multi-agent experiment designed to prove three hypotheses: (1) semantic phase signals enable proactive memory management, (2) this mechanism allows systems to exceed physical GPU memory capacity, and (3) the resulting system maintains bounded latency for interactive workloads.
+We evaluate \sys's ability to virtualize GPU memory through a controlled oversubscription experiment. Our goal is to verify that semantic phase signaling enables the system to support concurrent interactive workloads that exceed physical device capacity, a regime where reactive baselines fail.
 
-\subsection{Experimental Design}
+\subsection{Memory Oversubscription and Agent Density}
+\label{ssec:eval_density}
+\jw{main finished, ready for review. Will add another line of Djinn real remote. Current plot runs Djinn in local cilent -> server via local network for apple to apple comparison with vLLM running locally. will add my personal laptop -> server (real Djinn model). }
 
-\subsubsection{Workload Configuration}
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\columnwidth]{Figures/cliff.pdf}
+    \caption{\textbf{The Scalability Cliff.} vLLM (red) crashes when aggregate KV demand exceeds physical memory ($N \approx 48$). \sys (blue) successfully virtualizes memory, maintaining linear queueing latency well into the oversubscription regime ($N=80$, demand=106GB), demonstrating effective use of host DRAM for active state.\jw{need to rerun vLLM, it is worse than shown}}
+    \label{fig:cliff}
+\end{figure}
 
-Our primary experiment instantiates a realistic interactive workload: multiple concurrent agents executing a \textit{Reason → Act → Reflect} loop. Each agent processes a 2,048-token context through Llama-2-13B (26 GB weights in float16), generating 50 tokens per inference. Agents arrive according to a Poisson process ($\lambda = 0.2$ agents/second) to model realistic asynchronous interactive load, rather than synchronized batch arrivals. During the "Act" phase (tool execution), agents sleep for $10$–$20$ seconds, simulating I/O-bound operations (database queries, API calls, etc.). During this sleep, the agent explicitly signals \texttt{IO\_WAIT} to \sys, allowing semantic proactive eviction. Upon resuming, the agent signals \texttt{COMPUTE}, triggering restoration of its KV cache from host memory.
+To test the limits of virtualization, we instantiate a multi-agent workload designed to force paging. We spawn $N=80$ concurrent agents executing a \textit{Reason $\to$ Act $\to$ Reflect} loop driven by a Poisson arrival process ($\lambda=0.2$ agents/s) to model asynchronous interactivity. Each agent manages a 2,048-token context using Llama-2-13B (26 GB weights in FP16).
 
-\subsubsection{Memory Demand vs. Physical Capacity}
+The aggregate memory demand of this workload is 106 GB ($80$ agents $\times$ $1$ GB KV + $26$ GB weights), which exceeds the 80 GB capacity of our NVIDIA H100 testbed. Consequently, successful execution is not merely a performance optimization but a proof of virtualization: without active swapping to host memory, the workload cannot reside in physical memory.
 
-The experiment is designed to exceed physical GPU memory as a proof of virtualization. With $N = 80$ agents:
+We compare \sys against vLLM, configured with its native PagedAttention swapping enabled. As shown in Figure~\ref{fig:cliff}, vLLM handles concurrency effectively until $N \approx 48$. Beyond this point, its reactive policy fails to reclaim memory fast enough during bursty arrivals, resulting in cascading OOM failures and a $0\%$ success rate for $N \ge 50$. vLLM holds inactive KV caches in VRAM until memory pressure is critical; by the time it evicts, the allocation overhead of new agents has already triggered exhaustion.
+
+In contrast, \sys leverages semantic signals (\texttt{IO\_WAIT}) emitted during the agent's ``Act'' phase. 
+While we explicitly inject these system calls in our experiment to isolate scheduler performance, \sys provides library-level wrappers (e.g., for LangChain Tool classes) that automatically emit these signals upon entering I/O-bound blocks, rendering the mechanism transparent to the end user.
+Modeled as 10--20s of I/O dormancy, these phases expose idle intervale that \sys exploits for proactive eviction. By moving the session's data segment immediately to the server's pinned host DRAM pool (provisioned from 512 GB system RAM), \sys successfully interleaves all 80 agents with a $100\%$ completion rate. This represents a $1.67\times$ improvement in feasible agent density over the reactive baseline, directly converting host RAM capacity into GPU concurrency.
+
+\subsection{Latency and Overhead Decomposition}
+\jw{Used to achieve 9 seconds p99. Will try to revert it by the deadline.}
+While \sys enables higher density, we must characterize the latency cost of this virtualization. At $N=80$, the P99 request latency is 23.9 seconds. Decomposing this figure reveals that the system overhead is negligible compared to the queuing delay inherent to high utilization:
+
 \begin{equation}
-\text{Total Demand} = (80 \text{ agents} \times 1 \text{ GB KV per agent}) + 26 \text{ GB weights} = 106 \text{ GB}
+\label{eq:latency}
+T_{total} (23.9\text{s}) = T_{queue} (22.2\text{s}) + T_{transfer} (0.05\text{s}) + T_{compute} (1.7\text{s})
 \end{equation}
 
-The testbed provides an NVIDIA H100 80GB GPU. Thus $106 \text{ GB} > 80 \text{ GB}$ physical capacity, making memory virtualization (swapping to host RAM) a \textit{logical necessity}, not a performance optimization. Without active paging to pinned host memory, the workload cannot complete.
+The semantic swap-in mechanism ($T_{transfer}$) accounts for only $0.2\%$ of the total latency ($\sim 50$ms), saturating the PCIe Gen4 bus at $\sim 24$ GB/s. The dominant component ($92.7\%$) is $T_{queue}$, the time requests spend waiting for a compute slot. This queueing is an expected artifact of fair scheduling: with 80 active sessions time-sharing a single accelerator, the GPU maintains near-100\% utilization, processing 3--4 agents simultaneously while others wait.
 
-\subsubsection{Baseline: Reactive vs. Proactive Memory Management}
+Crucially, this latency profile confirms that the \sys runtime is not the bottleneck. The system effectively virtualizes the memory hierarchy, trading latency (queue wait) for capacity (density) without introducing significant virtualization overhead. Unlike sequential baselines which would serialize 80 agents, forcing the 80th user to endure a $\sim$112s Time-to-First-Token latency ($80 \times 1.4$s per inference), \sys provides fair, concurrent progress for all users, maintaining the illusion of a dedicated (albeit slower) device for workloads that physically exceed the hardware.
 
-We compare \sys against vLLM's reactive LRU-based paging. vLLM manages KV caches reactively: as new agents arrive and fill GPU memory, older KV entries are evicted when the GPU's free memory drops below a threshold. This reactive strategy has a critical vulnerability: it does not predict idleness. When an agent enters I/O-bound "Act" phase while its KV cache still occupies GPU VRAM, vLLM cannot distinguish between "idle" and "active"—it holds the cache resident until memory exhausts, at which point it evicts reactively. Under high concurrency (agent arrivals every $\sim 5$ seconds), the reactive eviction lag causes cascading OOM failures at approximately $N = 48$ agents, well before $N = 80$.
+\subsection{Memory Virtualization and Fractional Residency}
+\label{sec:eval_virt}
 
-\sys, by contrast, performs \textit{proactive} eviction: upon receiving the \texttt{IO\_WAIT} signal, it immediately swaps the agent's KV cache to pinned host memory via asynchronous DMA. This frees GPU VRAM in advance of memory pressure, allowing subsequent agents to load without triggering OOM.
+While \S\ref{ssec:eval_density} demonstrated \sys's ability to virtualize memory for many small workloads, Experiment 2 evaluates the complementary challenge: virtualizing a single massive workload that exceeds physical device capacity. This scenario is critical for commodity "Edge AI" clusters where model size often outstrips the VRAM of affordable accelerators (e.g., NVIDIA L4).
 
-\subsection{Results}
+We test the hypothesis that \sys's architectural support for Fractional Residency—keeping a maximal working set resident while streaming only the non-resident delta—fundamentally outperforms the Binary Offloading (all-GPU or all-CPU) policies employed by state-of-the-art serving systems.
 
-\subsubsection{Scaling and Success Rate}
-
-\sys successfully completes all $80$ agents over $370.9$ seconds, executing $160$ inference operations ($2$ per agent) with $100\%$ success rate. vLLM crashes with out-of-memory errors at $N \approx 48$, achieving $0\%$ success for $N \geq 50$. This difference is not marginal: the ability to support $80$ concurrent sessions vs. $48$ represents a $1.67\times$ improvement in agent density—the primary economic metric for multi-tenant GPU sharing.
-
-\subsubsection{Memory Virtualization: The Core Proof}
-
-\sys performed exactly $80$ KV-cache swaps and $80$ restores over the experiment duration. Each swap transfers $\sim 0.5$–$1.0$ GB of KV data to host pinned memory ($\sim 50$ ms latency at PCIe Gen4 bandwidth). The fact that the system sustains $N = 80$ agents \textit{despite} a $26$ GB memory deficit (106 GB demand vs. 80 GB supply) conclusively demonstrates that semantic proactive eviction is both functional and necessary. Without virtualization, the system would OOM at approximately $N = 54$ (accounting for $\approx 27$ GB usable GPU memory after kernel overheads).
-
-\subsubsection{Latency Decomposition}
-
-P99 request latency is $23,941$ ms, decomposed as:
-\begin{align}
-P99 \text{ Total} &= \text{Queue Wait} + \text{KV Restore} + \text{Inference}\\
-23,941 \text{ ms} &= 22,191 \text{ ms} + 50 \text{ ms} + 1,700 \text{ ms}\\
-&= 92.7\% + 0.2\% + 7.1\%
-\end{align}
-
-The dominant queue time (92.7\%) reflects high GPU utilization. With 80 agents competing for a single GPU, an average of 3–4 agents are actively executing at any instant. Queue wait time represents the time an agent spends idle, awaiting GPU processing—a direct consequence of load balancing across many concurrent sessions. This is the \textit{expected cost of fairness} in multi-tenant systems, not a software inefficiency. In a single-agent baseline, queue time approaches zero but utilization drops to $1$–$5\%$.
-
-The KV restore overhead ($50$ ms) is negligible ($0.2\%$ of total latency), demonstrating that PCIe bandwidth is saturated ($\approx 24$ GB/s) and the restore operation is not a bottleneck. Inference time ($1,700$ ms) is constant across all agents and matches the single-agent baseline, confirming that the semantic scheduler does not degrade per-request quality.
-
-\subsubsection{Throughput and Fairness}
-
-Sustained throughput over the $370.9$-second experiment was $0.216$ operations per second (160 ops $\div$ 370.9 s). This is lower than a sequential baseline ($0.71$ ops/sec), but this comparison is misleading: the sequential baseline is incompatible with interactive use. A user waiting for 80 other sequential requests would experience $\sim 112$ seconds of cumulative latency before their session even begins. \sys's design trades single-request speed for \textit{fairness}: all 80 users experience similar bounded latency ($\sim 24$ s P99) simultaneously.
-
-\subsection{Interpretation}
-
-\subsubsection{Why This Matters for Interactive GPU Sharing}
-
-Current systems force a false dichotomy:
+We conduct a controlled oversubscription experiment using a single NVIDIA L4 GPU (24 GB VRAM).
 \begin{itemize}
-    \item \textbf{Batch Schedulers} (e.g., Slurm, Ray): Support multiple users but require exclusive GPU allocation, resulting in $\sim 50\%$ utilization due to idle think-time.
-    \item \textbf{Reactive Serving} (e.g., vLLM): Maximize throughput on a single model but crash under concurrent interactive load ($N > 48$).
+    \item \textbf{Workload:} We execute inference on Llama-2-13B (FP16), which requires 26 GB for parameters. This exceeds the L4's capacity by 2 GB ($1.08\times$ oversubscription), forcing the system to virtualize memory.
+    \item \textbf{Baseline:} We compare against DeepSpeed-Inference \cite{deepspeed} configured with ZeRO-Offload. DeepSpeed represents the industry standard for offloading; when VRAM is exhausted, it manages execution by swapping parameters from host RAM.
+    \item \textbf{Configuration:} To ensure a fair comparison, both systems execute the same cuBLAS compute kernels. The divergence lies strictly in I/O architecture: DeepSpeed employs synchronous, blocking transfers, whereas \sys employs a Ring Buffer with async pipelining.
 \end{itemize}
 
-\sys breaks this dichotomy by enabling \textit{semantic time-multiplexing}: the GPU remains logically shared among 80 users while physically processing 3–4 at a time. Session state (KV caches) is virtualized to host memory, decoupling compute from memory residency.
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\columnwidth]{Figures/exp2_memory.pdf}
+    \caption{\textbf{Time-to-First-Token (TTFT) Latency Breakdown.} 
+    \textbf{Left (Baseline):} DeepSpeed employs a binary offloading policy. Because the 26~GB model exceeds the 24~GB VRAM, it synchronously reloads the full model checkpoint from host RAM, blocking execution for 35.5s (red hatched).
+    \textbf{Right (\sys):} \sys employs fractional residency via the Ring Buffer. It pins 20~GB in VRAM and streams only the 6~GB non-resident delta. By reducing data movement by $4\times$ and pipelining the transfer behind computation (cyan dotted), \sys reduces prefill latency by \textbf{31.4$\times$} (36.2s $\to$ 1.1s). Note the broken y-axis used to visualize the magnitude of the baseline's stall.}
+    \label{fig:virt_speedup}
+\end{figure}
 
-\subsubsection{The Irreducible Evidence: 106 GB > 80 GB}
+Figure~\ref{fig:virt_speedup} presents the latency breakdown for the prefill phase (Time-to-First-Token, TTFT). \sys reduces TTFT from 36.2 seconds to 1.1 seconds—a 31.4$\times$ speedup.
 
-The core contribution is the memory virtualization proof. Unlike prior work that optimizes fragmentation or scheduling within the physical memory envelope, \sys enables workloads that \textit{mathematically cannot fit} to succeed with $100\%$ completion rate. This is the definition of virtualization. The 80-agent experiment with 106 GB demand on 80 GB hardware makes this impossibility impossible to ignore.
+This performance gap is architectural. DeepSpeed's execution model enforces a binary choice: because the 26 GB model does not fit entirely in VRAM, the allocator defaults to a swap-based strategy that reloads the full model checkpoint for every inference request. This incurs a blocking transfer of 24.2 GB, idling the GPU for 35.5 seconds before computation can begin.
+DeepSpeed's high latency reflects not just PCIe transfer time, but the overhead of CPU-side tensor copy, pinned memory allocation, and serialization inherent to its offloading implementation, which is not optimized for the 'fractional' regime.
 
-\subsubsection{Generalization}
+In contrast, \sys's Ring Buffer maintains \textit{Fractional Residency}. It pins 20 GB of the model (77\%) in VRAM and identifies only the 6 GB non-resident delta. During the prefill phase, \sys streams this 6 GB delta at the limit of the PCIe Gen4 x16 bus ($\sim$15 GB/s effective).
+While the initial fill of the ring buffer prevents perfect overlap, the virtualization cost is reduced from the time required to load the \textit{entire model} ($T_{load} \approx 36\text{s}$) to the time required to stream the \textit{delta} ($T_{stream} \approx 0.4\text{s}$). When combined with the 0.7s compute time, this yields a total TTFT of 1.1s.
 
-While this evaluation focuses on LLM inference, the semantic signaling protocol generalizes. Any interactive workload exhibiting temporal sparsity—vision inference with pauses for I/O, multi-model heterogeneous pipelines, or research code with debugger breakpoints—can emit \texttt{IO\_WAIT} and \texttt{COMPUTE} signals. The VMU agnostically swaps any session-private tensor to host memory. This generality, combined with the zero-copy virtualization property, positions \sys as a foundational OS primitive for interactive GPU computing.
->>>>>>> origin/main
+\subsubsection{The Physics of Decoding}
+While \sys dominates the prefill phase, our evaluation reveals the physical limits of virtualization during the autoregressive decode phase.
+As shown in Table~\ref{tab:virt_metrics}, both DeepSpeed and \sys converge to a per-token generation latency of $\sim$704ms.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lrr}
+\toprule
+\textbf{Metric} & \textbf{DeepSpeed} & \textbf{\sys (Ours)} \\
+\midrule
+Time-to-First-Token (TTFT) & 36.2 s & \textbf{1.1 s} \\
+Decode Latency (per token) & 704 ms & 705 ms \\
+End-to-End (50 tokens) & 71.4 s & \textbf{36.4 s} \\
+\midrule
+Data Moved (per inference) & 24.2 GB & \textbf{6.0 GB} \\
+I/O Model & Blocking & \textbf{Pipelined} \\
+\bottomrule
+\end{tabular}
+\caption{\textbf{Virtualization Microbenchmarks.} \sys achieves a 31$\times$ improvement in responsiveness (TTFT) by moving $4\times$ less data. Decode latency is identical between systems, as throughput is strictly limited by the PCIe bandwidth required to stream the non-resident weights per token.}
+\label{tab:virt_metrics}
+\end{table}
+
+This parity is expected. During decoding, computation is memory-bound and sequential. To generate a single token, the system must process the non-resident 6 GB of weights. Given the PCIe bandwidth limit of 15 GB/s, the theoretical minimum transfer time is $6 \text{ GB} / 15 \text{ GB/s} = 400 \text{ ms}$.
+The measured 704ms latency implies roughly 300ms of compute/kernel overhead, consistent with the 700ms compute time observed in the prefill phase.
+Combined with kernel overhead ($\sim$300ms), the physical floor is $\sim$700ms. Neither system can bypass this hardware bottleneck.
+
+The significance of \sys is not that it makes the hardware faster, but that it makes the hardware \textit{usable}.
+DeepSpeed's 36-second startup latency renders the L4 GPU unusable for interactive applications; users perceive the system as frozen. \sys's 1.1-second TTFT falls within the interactive response threshold.
+By converting a hard capacity wall into a linear bandwidth cost, \sys's Ring Buffer transforms commodity GPUs from batch-only processors into viable interactive agents, achieving a 2.0$\times$ end-to-end speedup for short sequences while reducing aggregate PCIe traffic by 4$\times$.
