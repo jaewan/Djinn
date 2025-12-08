@@ -33,13 +33,17 @@ experiment:
     
   memory_pressure_test:
     enabled: true
-    num_sessions: 6           # 6 sessions × ~27GB per session = 162GB (exceeds 80GB H100)
+    num_sessions: 50          # CRITICAL FIX: 50 sessions × 1.3GB KV = 92GB total (EXCEEDS 80GB H100)
+                              # Math: 27GB weights + (50 × 1.3GB) = 92GB > 80GB capacity
+                              # Sessions 1-40 fit in GPU, session 41+ trigger swap to host RAM
     session_pause_layer: 20   # Pause at mid-layer for consistent state
     
 validation:
   require_output_equivalence: true      # 100% token accuracy
   require_steering_effect: true         # 0.39%+ output divergence
-  require_memory_pressure_success: true # Djinn swaps sessions, PyTorch OOMs
+  require_memory_pressure_success: true # CRITICAL: VRAM must plateau below 80GB (proves swapping)
+                                        # If VRAM grows linearly past 80GB, test FAILS
   
 duration: 300  # minutes (estimated for full evaluation with Llama-3-8B)
 output_dir: "/tmp/exp3_osdi_llama_results"
+

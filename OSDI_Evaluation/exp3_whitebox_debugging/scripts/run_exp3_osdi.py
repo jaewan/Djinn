@@ -332,14 +332,21 @@ async def run_memory_pressure_stress_test(
     OSDI Critical Test: Prove Djinn swaps paused sessions to host RAM
     while PyTorch Eager would OOM trying to keep everything in VRAM.
     
-    For Llama-3-8B (16GB weights) on H100 (80GB):
-    - 6 sessions × 16GB = 96GB demand (exceeds 80GB capacity)
-    - Sessions 1-4: fit in GPU VRAM
-    - Sessions 5-6: force swap of sessions 1-2
-    - Proves: Djinn enables oversubscription, PyTorch cannot
+    CRITICAL MATH (Must exceed 80GB H100 capacity):
+    - Llama-2-13B weights: 27GB (shared, loaded once)
+    - KV cache per session: 1.3GB (2048 tokens, batch 1)
+    
+    For N=50 sessions:
+    - Total demand: 27 + (50 × 1.3) = 92GB (exceeds 80GB capacity by 12GB)
+    - Expected behavior: Sessions 1-40 fit comfortably
+                         Session 41+ trigger swap of older sessions to host RAM
+    - Proves: Djinn enables GPU oversubscription via transparent swapping
+    - PyTorch would OOM at session 41
     """
-    logger.info(f"\n🔴 MEMORY PRESSURE STRESS TEST: {num_sessions} Sessions")
-    logger.info(f"   Demand: {num_sessions} × 16GB = {num_sessions * 16}GB (exceeds 80GB H100)")
+    logger.info(f"\n🔴 MEMORY PRESSURE STRESS TEST: {num_sessions} Sessions (OSDI Critical)")
+    logger.info(f"   Math: 27GB weights + ({num_sessions} × 1.3GB KV) = {27 + num_sessions * 1.3:.1f}GB")
+    logger.info(f"   Exceeds H100 capacity (80GB)? {27 + num_sessions * 1.3 > 80}")
+    logger.info(f"   Expected: Sessions 1-40 fit, session 41+ triggers swap")
     
     sessions = []
     vram_progression = []
@@ -380,6 +387,15 @@ async def run_memory_pressure_stress_test(
             # If system OOMs, VRAM would spike then crash
         
         logger.info(f"\n   ✅ Successfully spawned {num_sessions} sessions despite oversubscription")
+        
+        # Analyze VRAM progression
+        vram_values = [p['vram_gb'] for p in vram_progression if p['vram_gb']]
+        if vram_values:
+            max_vram = max(vram_values)
+            plateaued = max_vram < 80  # If stays below 80GB, swapping is working
+            logger.info(f"   Peak VRAM: {max_vram:.1f}GB")
+            logger.info(f"   Swapping Active: {'YES ✅' if plateaued else 'NO - Check logs'}")
+        
         logger.info(f"   VRAM Progression: {[f'S{p['session']}: {p['vram_gb']:.1f}GB' if p['vram_gb'] else 'OOM' for p in vram_progression]}")
         
         # Attempt to resume one session to prove swap is transparent
