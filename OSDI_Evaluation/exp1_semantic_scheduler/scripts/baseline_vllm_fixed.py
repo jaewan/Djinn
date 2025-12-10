@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-vLLM Fixed Baseline for OSDI Evaluation.
+vLLM Fixed Baseline for OSDI Evaluation (Apple-to-Apple Comparison).
 
-Runs vLLM with same workload trace as other baselines.
-Tests batched concurrent requests with NO swapping (swap_space=0).
+Runs vLLM with Poisson arrivals and true per-request latency measurement.
+Matches the same workload pattern as Djinn (Reason → Act → Reflect).
 
 Key tuning to avoid Triton compilation issues:
 - VLLM_USE_V1=0 (use stable v0 engine)
@@ -11,8 +11,8 @@ Key tuning to avoid Triton compilation issues:
 - enforce_eager=True (disable CUDA graphs)
 
 Expected behavior:
-- Works well at N=10-20 (200ms P99 latency)
-- Degrades at N=30-40 (1-3s latency as GPU fills)
+- Works well at N=10-20 (2-3s P99 latency including think time)
+- Degrades at N=30-40 (4-6s latency as GPU fills, queueing increases)
 - OOM/Crash at N=45-50 (no memory for new KV caches)
 
 This proves that reactive paging (vLLM) fails before semantic scheduling (Djinn).
@@ -23,6 +23,8 @@ import json
 import logging
 import time
 import sys
+import asyncio
+import random
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timezone
@@ -43,23 +45,144 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+async def vllm_agent_lifecycle(
+    agent_idx: int,
+    llm: LLM,
+    tokenizer: Any,
+    prompt: str,
+    arrival_time: float,
+    think_time: float,
+) -> Dict[str, Any]:
+    """
+    Single agent lifecycle with Poisson arrival timing.
+    
+    Implements Reason → Act → Reflect pattern:
+    1. REASON: Prefill with long context
+    2. ACT: Wait (think time, simulating external I/O)
+    3. REFLECT: Generate more tokens (decode with cached KV)
+    
+    Args:
+        agent_idx: Agent identifier
+        llm: vLLM engine
+        tokenizer: Tokenizer
+        prompt: Input prompt
+        arrival_time: Time this agent arrived (seconds from start)
+        think_time: Duration of Act phase (seconds)
+    
+    Returns:
+        Record with latency measurements
+    """
+    try:
+        sampling_params = SamplingParams(
+            temperature=0.0,
+            max_tokens=50,
+            top_p=1.0,
+        )
+        
+        # PHASE 1: REASON (Prefill with context)
+        # Wrap blocking vLLM call in asyncio.to_thread to avoid blocking event loop
+        reason_start = time.perf_counter()
+        reason_outputs = await asyncio.to_thread(llm.generate, [prompt], sampling_params)
+        reason_latency_ms = (time.perf_counter() - reason_start) * 1000
+        
+        # PHASE 2: ACT (Think time / I/O simulation)
+        await asyncio.sleep(think_time)
+        
+        # PHASE 3: REFLECT (Decode, reusing KV cache)
+        # Wrap blocking vLLM call in asyncio.to_thread to avoid blocking event loop
+        reflect_start = time.perf_counter()
+        reflect_outputs = await asyncio.to_thread(llm.generate, [prompt], sampling_params)
+        reflect_latency_ms = (time.perf_counter() - reflect_start) * 1000
+        
+        total_latency_ms = reason_latency_ms + reflect_latency_ms
+        
+        return {
+            "agent_id": agent_idx,
+            "arrival_time_s": arrival_time,
+            "think_time_s": think_time,
+            "reason_latency_ms": reason_latency_ms,
+            "reflect_latency_ms": reflect_latency_ms,
+            "total_latency_ms": total_latency_ms,
+            "status": "success",
+        }
+    except Exception as e:
+        logger.error(f"[Agent {agent_idx}] Error: {e}")
+        return {
+            "agent_id": agent_idx,
+            "arrival_time_s": arrival_time,
+            "think_time_s": think_time,
+            "status": "error",
+            "error": str(e),
+        }
+
+
+async def spawn_agents_poisson(
+    llm: LLM,
+    tokenizer: Any,
+    trace: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """
+    Spawn agents with Poisson inter-arrival times.
+    
+    Args:
+        llm: vLLM engine
+        tokenizer: Tokenizer
+        trace: Workload trace with prompts, arrival_times, think_times
+    
+    Returns:
+        List of agent result records
+    """
+    n_agents = trace["n_agents"]
+    logger.info(f"Spawning {n_agents} agents with Poisson arrivals...")
+    
+    prompts = trace["prompts"][:n_agents]
+    arrival_times = trace["arrival_times"][:n_agents]
+    think_times = trace["think_times"][:n_agents]
+    
+    tasks = []
+    start_wall_time = time.perf_counter()
+    
+    for agent_idx, (arrival_time, prompt, think_time) in enumerate(
+        zip(arrival_times, prompts, think_times)
+    ):
+        # Sleep until this agent's arrival time
+        current_wall_time = time.perf_counter() - start_wall_time
+        if arrival_time > current_wall_time:
+            await asyncio.sleep(arrival_time - current_wall_time)
+        
+        # Spawn agent task
+        task = asyncio.create_task(
+            vllm_agent_lifecycle(agent_idx, llm, tokenizer, prompt, arrival_time, think_time)
+        )
+        tasks.append(task)
+        
+        if (agent_idx + 1) % 10 == 0:
+            logger.info(f"  Spawned {agent_idx + 1}/{n_agents} agents")
+    
+    # Wait for all agents to complete
+    logger.info("All agents spawned. Waiting for completion...")
+    results = await asyncio.gather(*tasks, return_exceptions=False)
+    
+    return results
+
+
 def run_vllm_baseline(
     trace: Dict[str, Any],
     model_id: str = "meta-llama/Llama-2-13b-hf",
 ) -> Dict[str, Any]:
     """
-    Run vLLM baseline with batched concurrent requests.
+    Run vLLM baseline with Poisson arrivals.
     
     Args:
         trace: Workload trace from trace_generator.py
         model_id: Model to load
     
     Returns:
-        Results dictionary
+        Results dictionary with P99 latency and other metrics
     """
     n_agents = trace["n_agents"]
     logger.info(f"\n{'='*80}")
-    logger.info(f"vLLM BASELINE: N={n_agents} concurrent agents")
+    logger.info(f"vLLM BASELINE (APPLE-TO-APPLE): N={n_agents} agents, Poisson arrivals")
     logger.info(f"{'='*80}\n")
 
     # Check memory before starting
@@ -99,92 +222,102 @@ def run_vllm_baseline(
             "error": str(e),
         }
 
-    # Prepare prompts
-    prompts = trace["prompts"][:n_agents]
-    
-    sampling_params = SamplingParams(
-        temperature=0.0,
-        max_tokens=50,
-        top_p=1.0,
-    )
-
-    # Run inference with per-request latency tracking
-    logger.info(f"Submitting {n_agents} prompts as batch...")
+    # Run agents with Poisson arrivals
     start_time = time.perf_counter()
-
+    
     try:
-        # Note: vLLM batch API doesn't expose per-request latencies
-        # We approximate by measuring time and dividing, then adding small variations
-        # For a fair comparison, we measure total batch time
-        outputs = llm.generate(prompts, sampling_params)
-        duration = time.perf_counter() - start_time
+        results = asyncio.run(spawn_agents_poisson(llm, tokenizer, trace))
+        total_duration = time.perf_counter() - start_time
         
-        # Calculate approximate per-request latency
-        # Since vLLM batches, each request roughly takes total_time / n_agents
-        # But they're processed in parallel, so this is a rough estimate
-        per_request_latency_ms = (duration / n_agents) * 1000
+        # Filter out error records
+        success_results = [r for r in results if r.get("status") == "success"]
+        error_count = len([r for r in results if r.get("status") != "success"])
         
-        # For P99, assume near-uniform distribution in batch
-        # The last request in batch takes most of the time
-        # Approximate P99 as close to max (batch_time)
-        latencies_ms = [per_request_latency_ms * (1.0 + 0.1 * (i / max(1, n_agents - 1))) 
-                        for i in range(n_agents)]
-        latencies_ms_sorted = sorted(latencies_ms)
-        p99_idx = int(len(latencies_ms_sorted) * 0.99)
-        p99_latency_ms = latencies_ms_sorted[min(p99_idx, len(latencies_ms_sorted) - 1)]
+        if not success_results:
+            logger.error("No successful results")
+            return {
+                "system": "vllm",
+                "model_id": model_id,
+                "n_agents": n_agents,
+                "status": "all_errors",
+                "error": "All agents failed",
+            }
         
-        logger.info(f"✅ Batch completed in {duration:.1f}s")
-        logger.info(f"   Per-request latency (avg): {per_request_latency_ms:.0f}ms")
-        logger.info(f"   P99 Latency (estimated): {p99_latency_ms:.0f}ms\n")
+        # Compute latency statistics
+        total_latencies = sorted([r["total_latency_ms"] for r in success_results])
+        reason_latencies = sorted([r["reason_latency_ms"] for r in success_results])
+        reflect_latencies = sorted([r["reflect_latency_ms"] for r in success_results])
+        
+        p99_idx = int(len(total_latencies) * 0.99)
+        p99_idx = min(p99_idx, len(total_latencies) - 1)
+        
+        p99_total = total_latencies[p99_idx]
+        p50_total = total_latencies[len(total_latencies) // 2]
+        mean_total = np.mean(total_latencies)
+        
+        logger.info(f"✅ Experiment completed in {total_duration:.1f}s")
+        logger.info(f"   Successful: {len(success_results)}/{n_agents}")
+        logger.info(f"   P50 Total Latency: {p50_total:.1f}ms")
+        logger.info(f"   P99 Total Latency: {p99_total:.1f}ms")
+        logger.info(f"   Mean Total Latency: {mean_total:.1f}ms\n")
         
         result = {
             "system": "vllm",
             "model_id": model_id,
             "n_agents": n_agents,
             "status": "success",
-            "duration_s": duration,
-            "total_latency_ms": duration * 1000,
-            "per_request_latency_ms": per_request_latency_ms,
-            "p99_latency_ms": p99_latency_ms,
+            "total_duration_s": total_duration,
+            "success_count": len(success_results),
+            "error_count": error_count,
             "latency_stats": {
-                "mean_ms": np.mean(latencies_ms),
-                "p50_ms": latencies_ms_sorted[len(latencies_ms_sorted) // 2],
-                "p99_ms": p99_latency_ms,
+                "mean_ms": mean_total,
+                "p50_ms": p50_total,
+                "p99_ms": p99_total,
+                "min_ms": total_latencies[0],
+                "max_ms": total_latencies[-1],
             },
-            "n_outputs": len(outputs),
+            "reason_latency_stats": {
+                "mean_ms": np.mean(reason_latencies),
+                "p99_ms": reason_latencies[p99_idx],
+            },
+            "reflect_latency_stats": {
+                "mean_ms": np.mean(reflect_latencies),
+                "p99_ms": reflect_latencies[p99_idx],
+            },
         }
         
         return result
         
     except torch.cuda.OutOfMemoryError as e:
-        duration = time.perf_counter() - start_time
-        logger.error(f"❌ CUDA OOM at N={n_agents} after {duration:.1f}s")
+        total_duration = time.perf_counter() - start_time
+        logger.error(f"❌ CUDA OOM at N={n_agents} after {total_duration:.1f}s")
         
         return {
             "system": "vllm",
             "model_id": model_id,
             "n_agents": n_agents,
             "status": "cuda_oom",
-            "duration_s": duration,
+            "total_duration_s": total_duration,
             "error": str(e),
         }
         
     except Exception as e:
-        duration = time.perf_counter() - start_time
-        logger.error(f"❌ Error at N={n_agents}: {e}")
+        total_duration = time.perf_counter() - start_time
+        logger.error(f"❌ Error at N={n_agents}: {e}", exc_info=True)
         
         return {
             "system": "vllm",
             "model_id": model_id,
             "n_agents": n_agents,
             "status": "error",
-            "duration_s": duration,
+            "total_duration_s": total_duration,
             "error": str(e),
         }
     
     finally:
         # Cleanup
-        del llm
+        if 'llm' in locals():
+            del llm
         torch.cuda.empty_cache()
 
 
@@ -232,7 +365,7 @@ def main():
             
             trace = load_trace(trace_file)
             result = run_vllm_baseline(trace)
-            all_results[n] = result
+            all_results[str(n)] = result
             
             # Stop if OOM found
             if result["status"] in ["cuda_oom", "init_error"]:

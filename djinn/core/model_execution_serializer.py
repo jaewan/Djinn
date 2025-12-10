@@ -586,6 +586,8 @@ class ModelExecutionSerializer:
         profile_id: Optional[str] = None,
         qos_class: Optional[str] = None,
         deadline_ms: Optional[int] = None,
+        return_activation: bool = True,
+        return_last_token_only: bool = False,
     ) -> bytes:
         """
         Serialize EXECUTE_WITH_BREAKPOINT request to binary protocol.
@@ -599,6 +601,8 @@ class ModelExecutionSerializer:
             profile_id: Optional profile ID
             qos_class: Optional QoS class
             deadline_ms: Optional deadline
+            return_activation: Whether to return checkpoint activation (default True for backward compat)
+            return_last_token_only: Whether to return only last token logits (not full sequence)
 
         Returns:
             Serialized binary data
@@ -613,6 +617,8 @@ class ModelExecutionSerializer:
             'tensor_keys': tensor_keys,
             'tensor_shapes': [list(inputs[k].shape) for k in tensor_keys],
             'tensor_dtypes': [str(inputs[k].dtype) for k in tensor_keys],
+            'return_activation': return_activation,
+            'return_last_token_only': return_last_token_only,
         }
         if session_id:
             metadata['session_id'] = session_id
@@ -724,6 +730,8 @@ class ModelExecutionSerializer:
         extras = {
             'qos_class': metadata.get('qos_class'),
             'deadline_ms': metadata.get('deadline_ms'),
+            'return_activation': metadata.get('return_activation', True),
+            'return_last_token_only': metadata.get('return_last_token_only', False),
         }
 
         return fingerprint, inputs, breakpoint_layer_index, wait_for_resume, session_id, profile_id, extras
@@ -961,16 +969,20 @@ class ModelExecutionSerializer:
     def serialize_resume_from_checkpoint_request(
         session_id: str,
         fingerprint: str,
-        modified_activation: torch.Tensor,
+        modified_activation: Optional[torch.Tensor],
         layer_index: int,
+        use_stored_activation: bool = False,
+        return_last_token_only: bool = False,
     ) -> bytes:
         """
         Serialize a resume-from-checkpoint request (activation steering).
         
         Args:
             session_id: Session ID to resume
-            modified_activation: Modified activation tensor
+            modified_activation: Modified activation tensor (or None if use_stored_activation=True)
             layer_index: Layer to resume from
+            use_stored_activation: If True, use server-side checkpoint (don't transfer tensor)
+            return_last_token_only: If True, return only last token logits (not full sequence)
         
         Returns:
             Serialized binary data
@@ -980,13 +992,21 @@ class ModelExecutionSerializer:
             'session_id': session_id,
             'fingerprint': fingerprint,
             'layer_index': layer_index,
-            'activation_shape': list(modified_activation.shape),
-            'activation_dtype': str(modified_activation.dtype),
+            'use_stored_activation': use_stored_activation,
+            'return_last_token_only': return_last_token_only,
         }
+        
+        if modified_activation is not None:
+            metadata['activation_shape'] = list(modified_activation.shape)
+            metadata['activation_dtype'] = str(modified_activation.dtype)
+        
         metadata_json = json.dumps(metadata).encode('utf-8')
         
-        # Serialize activation tensor
-        activation_bytes = ModelExecutionSerializer._serialize_tensor(modified_activation)
+        # Serialize activation tensor only if provided
+        if modified_activation is not None:
+            activation_bytes = ModelExecutionSerializer._serialize_tensor(modified_activation)
+        else:
+            activation_bytes = b''
         
         # Build header
         header = bytearray()
@@ -997,12 +1017,13 @@ class ModelExecutionSerializer:
         return bytes(header) + metadata_json + activation_bytes
 
     @staticmethod
-    def deserialize_resume_from_checkpoint_request(data: bytes) -> Tuple[str, str, torch.Tensor, int]:
+    def deserialize_resume_from_checkpoint_request(data: bytes) -> Tuple[str, str, Optional[torch.Tensor], int, bool, bool]:
         """
         Deserialize a resume-from-checkpoint request.
         
         Returns:
-            (session_id, fingerprint, modified_activation, layer_index)
+            (session_id, fingerprint, modified_activation, layer_index, use_stored_activation, return_last_token_only)
+            modified_activation will be None if use_stored_activation=True
         """
         offset = 0
         
@@ -1020,20 +1041,27 @@ class ModelExecutionSerializer:
         metadata = json.loads(metadata_json)
         offset += metadata_len
         
-        # Parse activation tensor
-        activation_bytes = data[offset:offset+activation_len]
-        activation_shape = tuple(metadata['activation_shape'])
-        activation_dtype = metadata['activation_dtype']
+        # Check if using stored activation
+        use_stored_activation = metadata.get('use_stored_activation', False)
+        return_last_token_only = metadata.get('return_last_token_only', False)
         
-        modified_activation = ModelExecutionSerializer._deserialize_tensor(
-            activation_bytes, activation_shape, activation_dtype
-        )
+        # Parse activation tensor only if provided
+        modified_activation = None
+        if activation_len > 0 and not use_stored_activation:
+            activation_bytes = data[offset:offset+activation_len]
+            activation_shape = tuple(metadata['activation_shape'])
+            activation_dtype = metadata['activation_dtype']
+            modified_activation = ModelExecutionSerializer._deserialize_tensor(
+                activation_bytes, activation_shape, activation_dtype
+            )
         
         return (
             metadata['session_id'],
             metadata.get('fingerprint', ''),
             modified_activation,
             metadata['layer_index'],
+            use_stored_activation,
+            return_last_token_only,
         )
 
     @staticmethod

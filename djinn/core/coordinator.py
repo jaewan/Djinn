@@ -325,23 +325,50 @@ class DjinnCoordinator:
         Returns:
             Dictionary with server capabilities (gpu_count, gpus, etc.)
             
-        NOTE: This queries the control plane for capabilities. The control plane
-        should have received server capabilities during connection establishment.
-        If not available, returns a minimal dict to avoid breaking initialization.
+        For servers: queries the local control plane.
+        For clients: queries the remote server via GET_CAPABILITIES RPC.
         """
-        if self.control_plane is None:
-            raise RuntimeError("Control plane not initialized")
-        
-        # Get capabilities from control plane
-        # The control plane stores server capabilities after capability exchange
-        try:
-            capabilities = self.control_plane.get_capabilities()
-            
-            # Handle None case (capabilities not yet exchanged)
-            if capabilities is None:
-                logger.debug("Control plane capabilities not yet available (capability exchange may not have completed)")
+        # For servers with local control plane
+        if self.control_plane is not None:
+            try:
+                capabilities = self.control_plane.get_capabilities()
+                
+                # Handle None case (capabilities not yet exchanged)
+                if capabilities is None:
+                    logger.debug("Control plane capabilities not yet available (capability exchange may not have completed)")
+                    return {
+                        'gpu_count': 0,
+                        'gpus': [],
+                        'networks': [],
+                        'total_memory_gb': 0,
+                        'supported_transports': ['tcp'],
+                        'hostname': 'unknown',
+                        'node_id': 'unknown',
+                    }
+                
+                # Convert NodeCapabilities dataclass to dict
+                from dataclasses import asdict
+                try:
+                    caps_dict = asdict(capabilities)
+                    if 'gpu_count' not in caps_dict:
+                        caps_dict['gpu_count'] = getattr(capabilities, 'gpu_count', 0)
+                    return caps_dict
+                except Exception:
+                    # Fallback: manual conversion
+                    return {
+                        'gpu_count': getattr(capabilities, 'gpu_count', 0),
+                        'gpus': [],
+                        'networks': [],
+                        'total_memory_gb': 0,
+                        'supported_transports': ['tcp'],
+                        'hostname': getattr(capabilities, 'node_id', 'unknown'),
+                        'node_id': getattr(capabilities, 'node_id', 'unknown'),
+                    }
+                
+            except Exception as e:
+                logger.warning(f"Failed to get capabilities from control plane: {e}")
                 return {
-                    'gpu_count': 0,  # Unknown until exchange completes
+                    'gpu_count': 0,
                     'gpus': [],
                     'networks': [],
                     'total_memory_gb': 0,
@@ -349,29 +376,51 @@ class DjinnCoordinator:
                     'hostname': 'unknown',
                     'node_id': 'unknown',
                 }
+        
+        # For clients without local control plane: query server via RPC
+        else:
+            logger.debug("Client mode: querying server for capabilities via RPC...")
+            return await self._query_remote_capabilities()
+    
+    async def _query_remote_capabilities(self) -> Dict[str, Any]:
+        """Query remote server for capabilities via GET_CAPABILITIES RPC."""
+        from .secure_serializer import SecureSerializer
+        from ..server.transport.protocol import MessageType
+        
+        try:
+            server_address = self._get_server_address()
+            request = {
+                'type': 'GET_CAPABILITIES',
+                '_request_id': str(uuid.uuid4()),
+            }
             
-            # Convert NodeCapabilities dataclass to dict
-            from dataclasses import asdict
+            serialized = SecureSerializer.serialize_request(request)
+            
             try:
-                caps_dict = asdict(capabilities)
-                # Ensure gpu_count is present (NodeCapabilities has it)
-                if 'gpu_count' not in caps_dict:
-                    caps_dict['gpu_count'] = getattr(capabilities, 'gpu_count', 0)
-                return caps_dict
-            except Exception:
-                # Fallback: manual conversion
-                return {
-                    'gpu_count': getattr(capabilities, 'gpu_count', 0),
-                    'gpus': [],
-                    'networks': [],
-                    'total_memory_gb': 0,
-                    'supported_transports': ['tcp'],
-                    'hostname': getattr(capabilities, 'node_id', 'unknown'),
-                    'node_id': getattr(capabilities, 'node_id', 'unknown'),
-                }
+                response_msg_type, response_data = await asyncio.wait_for(
+                    self._send_tcp_request(
+                        server_address,
+                        MessageType.GET_CAPABILITIES,
+                        serialized
+                    ),
+                    timeout=5.0
+                )
+            except asyncio.TimeoutError:
+                raise RuntimeError("Capabilities query timed out after 5s")
             
+            if response_msg_type == MessageType.ERROR:
+                error = SecureSerializer.deserialize_response(response_data)
+                raise RuntimeError(f"Server error: {error.get('message', 'Unknown error')}")
+            
+            response = SecureSerializer.deserialize_response(response_data)
+            if response.get('status') == 'success':
+                logger.info(f"✅ Capabilities retrieved from server: {response.get('gpu_count', 0)} GPUs")
+                return response
+            else:
+                raise RuntimeError(response.get('message', 'Failed to get capabilities'))
+                
         except Exception as e:
-            logger.warning(f"Failed to get capabilities from control plane: {e}")
+            logger.warning(f"Failed to query server capabilities: {e}")
             # Return minimal dict to avoid breaking initialization
             return {
                 'gpu_count': 0,
@@ -1398,6 +1447,8 @@ class DjinnCoordinator:
         """
         Send TCP request to server using message-type protocol.
         
+        Uses connection pooling for persistent connections to reduce handshake overhead.
+        
         Args:
             server_address: Server address (host:port)
             msg_type: Message type byte (from MessageType enum)
@@ -1406,14 +1457,34 @@ class DjinnCoordinator:
         Returns:
             Response data bytes
         """
-        host, port = server_address.split(':')
-        port = int(port)
+        import struct
         
-        # Open connection
-        reader, writer = await asyncio.open_connection(host, port)
+        conn = None
+        success = False
+        
+        # ✅ FIX: Ensure transport is initialized before attempting to use connection pool
+        if 'tcp' not in self.transports:
+            logger.debug("TCP transport not initialized, will create direct connection")
         
         try:
-            import struct
+            # ✅ OPTIMIZATION: Use connection pool if transport is available
+            if 'tcp' in self.transports:
+                try:
+                    conn = await self.transports['tcp']._connection_pool.acquire(server_address)
+                    reader = conn.reader
+                    writer = conn.writer
+                    logger.debug(f"Using pooled connection to {server_address}")
+                except Exception as e:
+                    logger.debug(f"Failed to acquire pooled connection ({e}), falling back to direct connection")
+                    # Fallback to direct connection if pool unavailable
+                    conn = None
+            
+            # Fallback: Create direct connection if no pool available
+            if conn is None:
+                host, port = server_address.split(':')
+                port = int(port)
+                reader, writer = await asyncio.open_connection(host, port)
+                logger.debug(f"Created direct connection to {server_address}")
             
             # Send message type (1 byte)
             writer.write(struct.pack('B', msg_type))
@@ -1448,11 +1519,22 @@ class DjinnCoordinator:
             response_data = await reader.readexactly(response_length)
             logger.debug(f"Read {len(response_data)} bytes response")
             
+            success = True
             return response_msg_type, response_data
             
         finally:
-            writer.close()
-            await writer.wait_closed()
+            # ✅ OPTIMIZATION: Return pooled connection to pool, or close direct connection
+            if conn is not None:
+                # Return to pool
+                await self.transports['tcp']._connection_pool.release(conn, success=success)
+            elif 'writer' in locals() and writer is not None:
+                # Close direct connection
+                try:
+                    if not writer.is_closing():
+                        writer.close()
+                        await writer.wait_closed()
+                except Exception as e:
+                    logger.debug(f"Error closing direct connection: {e}")
     
     async def register_remote_model(
         self,
@@ -1527,11 +1609,22 @@ class DjinnCoordinator:
                 logger.info(f"✅ Ghost request serialized in {serialize_time:.1f}ms ({len(serialized) / (1024*1024):.2f} MB total)")
 
                 send_start = time.perf_counter()
-                response_msg_type, response_data = await self._send_tcp_request(
-                    server_address,
-                    MessageType.REGISTER_MODEL,
-                    serialized
-                )
+                # Add 120s timeout for model registration (server may need time to load model from HF)
+                try:
+                    response_msg_type, response_data = await asyncio.wait_for(
+                        self._send_tcp_request(
+                            server_address,
+                            MessageType.REGISTER_MODEL,
+                            serialized
+                        ),
+                        timeout=120.0  # 2 minutes for model loading from HuggingFace
+                    )
+                except asyncio.TimeoutError:
+                    raise RuntimeError(
+                        f"Model registration timed out after 120s. "
+                        f"Server may be loading model {resolved_model_id} from HuggingFace. "
+                        f"This is expected for large models on first registration."
+                    )
                 send_time = (time.perf_counter() - send_start) * 1000.0
                 logger.info(f"✅ Ghost request sent and response received in {send_time:.1f}ms")
 
@@ -1897,6 +1990,8 @@ class DjinnCoordinator:
         profile_id: Optional[str] = None,
         qos_class: Optional[str] = None,
         deadline_ms: Optional[int] = None,
+        return_activation: bool = True,
+        return_last_token_only: bool = False,
     ) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
         """
         Execute registered model on remote server with breakpoint pause/resume.
@@ -1910,6 +2005,8 @@ class DjinnCoordinator:
             profile_id: Optional profile ID for tracing
             qos_class: Optional QoS hint
             deadline_ms: Optional latency target
+            return_activation: Whether to return checkpoint activation (default True for backward compat)
+            return_last_token_only: Whether to return only last token logits (not full sequence)
             
         Returns:
             (model_output, metrics_dict) where output is None if wait_for_resume=False
@@ -1935,6 +2032,8 @@ class DjinnCoordinator:
                 profile_id=profile_id,
                 qos_class=qos_class,
                 deadline_ms=deadline_ms,
+                return_activation=return_activation,
+                return_last_token_only=return_last_token_only,
             )
 
             # Send with EXECUTE_WITH_BREAKPOINT message type
@@ -2004,12 +2103,14 @@ class DjinnCoordinator:
         self,
         fingerprint: str,
         session_id: str,
-        modified_activation: torch.Tensor,
-        layer_index: int,
+        modified_activation: Optional[torch.Tensor] = None,
+        layer_index: int = 0,
+        use_stored_activation: bool = False,
+        return_last_token_only: bool = False,
     ) -> Any:
         """
         Resume model execution from a paused checkpoint with modified activations.
-        
+
         This enables the "Activation Steering" workflow:
         1. Pause at layer N with checkpoint_activation
         2. User modifies checkpoint_activation
@@ -2025,9 +2126,13 @@ class DjinnCoordinator:
         Returns:
             Model output (tensor or dict) reflecting the modified activation
         """
+        activation_info = (
+            "using stored server-side activation" if use_stored_activation 
+            else f"activation_shape={modified_activation.shape if modified_activation is not None else 'None'}"
+        )
         logger.info(
             f"Resuming from checkpoint for session {session_id} "
-            f"(layer={layer_index}, activation_shape={modified_activation.shape})"
+            f"(layer={layer_index}, {activation_info})"
         )
         
         from ..server.transport.protocol import MessageType
@@ -2042,6 +2147,8 @@ class DjinnCoordinator:
                 fingerprint=fingerprint,
                 modified_activation=modified_activation,
                 layer_index=layer_index,
+                use_stored_activation=use_stored_activation,
+                return_last_token_only=return_last_token_only,
             )
             
             # Send request to server

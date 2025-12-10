@@ -241,7 +241,7 @@ async def main():
     logger.info("")
     
     # Initialize Djinn
-    ensure_initialized_before_async("localhost:5556")
+    ensure_initialized_before_async("127.0.0.1:5556")
     
     try:
         results = await test_logit_correctness(num_runs=3)

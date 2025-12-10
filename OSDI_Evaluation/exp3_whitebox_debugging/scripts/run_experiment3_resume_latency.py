@@ -29,7 +29,7 @@ def main():
     parser.add_argument("--model", type=str, default="meta-llama/Llama-2-13b-hf")
     parser.add_argument("--layers", type=int, nargs="+", default=[1, 10, 20, 30, 40])
     parser.add_argument("--max-length", type=int, default=2048)
-    parser.add_argument("--server", type=str, default="localhost:5556")
+    parser.add_argument("--server", type=str, default="127.0.0.1:5556")
     parser.add_argument("--warmup", type=int, default=2, help="Warmup iterations per layer")
     parser.add_argument("--repeat", type=int, default=5, help="Measured iterations per layer")
     parser.add_argument("--sleep-between", type=int, default=5, help="Seconds to sleep between runs for GPU release")

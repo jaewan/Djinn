@@ -45,7 +45,7 @@ class NetworkConfig:
     tcp_fallback: bool = True
 
     # Connection settings
-    max_connections_per_target: int = 5
+    max_connections_per_target: int = 100  # OPTIMIZED: Increased from 5 to support high concurrency
     connection_timeout: float = 30.0
     heartbeat_interval: float = 30.0
     heartbeat_timeout: float = 90.0

@@ -13,6 +13,15 @@ import time
 import subprocess
 from pathlib import Path
 from typing import Any, Dict
+try:
+    from pynvml import (
+        nvmlInit,
+        nvmlDeviceGetHandleByIndex,
+        nvmlDeviceGetMemoryInfo,
+        nvmlShutdown,
+    )
+except Exception:
+    nvmlInit = None
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../../'))
 
@@ -21,6 +30,27 @@ logging.basicConfig(
     format='[%(asctime)s] %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+def _get_gpu_used_gb(index: int = 0) -> float:
+    """Return total GPU memory used (GB) via NVML; fallback to torch if NVML unavailable."""
+    try:
+        if nvmlInit is None:
+            raise RuntimeError("pynvml not available")
+        nvmlInit()
+        handle = nvmlDeviceGetHandleByIndex(index)
+        info = nvmlDeviceGetMemoryInfo(handle)
+        used_gb = info.used / (1024 ** 3)
+        nvmlShutdown()
+        return used_gb
+    except Exception:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                return torch.cuda.memory_allocated(0) / (1024 ** 3)
+        except Exception:
+            pass
+    return None
 
 
 def run_pytorch_baseline() -> Dict[str, Any]:
@@ -84,7 +114,7 @@ async def run_djinn_memory_pressure_test() -> Dict[str, Any]:
         logger.info("[Djinn] Initializing client...")
         # Use async initialization
         config = DjinnConfig()
-        config.network.remote_server_address = "localhost:5556"
+        config.network.remote_server_address = "127.0.0.1:5556"
         await init_async(config)
         coordinator = get_coordinator()
         
@@ -131,14 +161,10 @@ async def run_djinn_memory_pressure_test() -> Dict[str, Any]:
             
             try:
                 # Measure GPU memory before
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                    vram_before = torch.cuda.memory_allocated(0) / (1024**3)
-                else:
-                    vram_before = None
+                vram_before = _get_gpu_used_gb()
                 
                 logger.info(f"\n[Session {i+1:2d}/50] {time.strftime('%H:%M:%S')}")
-                if vram_before:
+                if vram_before is not None:
                     logger.info(f"   VRAM before: {vram_before:.2f}GB")
                 
                 # Execute with breakpoint
@@ -150,13 +176,9 @@ async def run_djinn_memory_pressure_test() -> Dict[str, Any]:
                 )
                 
                 # Measure GPU memory after
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                    vram_after = torch.cuda.memory_allocated(0) / (1024**3)
-                else:
-                    vram_after = None
+                vram_after = _get_gpu_used_gb()
                 
-                if vram_after:
+                if vram_after is not None:
                     logger.info(f"   VRAM after:  {vram_after:.2f}GB")
                 
                 session_latency = (time.perf_counter() - session_start) * 1000
@@ -174,10 +196,15 @@ async def run_djinn_memory_pressure_test() -> Dict[str, Any]:
                     "vram_gb": vram_after,
                     "timestamp": time.strftime('%H:%M:%S'),
                 })
-                
-                if i >= 40 and vram_before and vram_after and vram_after < vram_before:
-                    swap_latency = (vram_before - vram_after) * 1000
-                    logger.info(f"   ⚠️  SWAP EVENT: {swap_latency:.1f}ms (older session evicted)")
+
+                if (
+                    i >= 40
+                    and vram_before is not None
+                    and vram_after is not None
+                    and vram_after < vram_before
+                ):
+                    swap_drop_gb = vram_before - vram_after
+                    logger.info(f"   ⚠️  SWAP EVENT: drop {swap_drop_gb:.2f}GB (older session evicted)")
                 
             except Exception as e:
                 logger.error(f"   ❌ Session {i+1} failed: {e}")

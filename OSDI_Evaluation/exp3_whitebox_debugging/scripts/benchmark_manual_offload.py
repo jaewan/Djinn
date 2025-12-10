@@ -2,16 +2,18 @@
 """
 Experiment 3 Baseline: Manual CPU Offload (Resume Latency vs. Depth)
 
-Measures the time to move activations + KV cache at breakpoint layer L from CPU (pinned)
+Measures the time to move activations at breakpoint layer L from CPU (pinned)
 back to GPU, representing a hand-written tensor.to('cpu') / tensor.to('cuda')
 approach. Serves as the "speed-of-light" PCIe baseline.
 
-Data transferred: Hidden state + cumulative KV cache up to layer L
-  - Hidden state: [batch=1, seq_len, hidden_dim] = [1, 2048, 5120] @ fp16 (~10.56 MB)
-  - KV cache per layer: 2 * [batch=1, seq_len, num_heads, head_dim] @ fp16
-    - Total for L layers: grows with L (approximately 4 * seq_len * hidden_dim * L bytes)
+CRITICAL AUDIT: Djinn only checkpoints the hidden state activation, NOT KV cache.
+To ensure apple-to-apple comparison, this benchmark ALSO transfers hidden state only.
+
+Data transferred: Hidden state activation only (matches Djinn checkpoint scope)
+  - Shape: [batch=1, seq_len, hidden_dim] = [1, 2048, 5120] @ fp16
+  - Size: ~10.56 MB (constant, independent of depth L)
 Compute cost: O(1) (just DMA transfer)
-Memory cost: O(seq_len * hidden_dim * L)
+Memory cost: O(seq_len * hidden_dim) - constant with depth
 """
 
 import argparse
@@ -43,10 +45,10 @@ def compute_activation_at_layer(
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     target_layer: int,
-) -> tuple:
+) -> torch.Tensor:
     """
-    Forward to target_layer and return (hidden_states, kv_cache).
-    KV cache contains accumulated key-value pairs up to target_layer.
+    Forward to target_layer and return hidden_states activation.
+    MATCHES DJINN SCOPE: Djinn only checkpoints hidden state, not KV cache.
     """
     device = input_ids.device
 
@@ -67,8 +69,7 @@ def compute_activation_at_layer(
     rotary_emb = llama_model.rotary_emb
     position_embeddings = rotary_emb(hidden_states, position_ids)
 
-    # Collect KV cache as we run through layers
-    kv_cache = []
+    # Run through layers, but do NOT collect KV cache (matches Djinn)
     for idx, layer in enumerate(llama_model.layers):
         output = layer(
             hidden_states,
@@ -76,20 +77,17 @@ def compute_activation_at_layer(
             position_ids=position_ids,
             past_key_value=None,
             output_attentions=False,
-            use_cache=True,  # Enable caching
+            use_cache=False,  # Do NOT cache (to match Djinn checkpoint scope)
             cache_position=None,
             position_embeddings=position_embeddings,
         )
         hidden_states = output[0] if isinstance(output, tuple) else output
-        past_key_value = output[1] if isinstance(output, tuple) and len(output) > 1 else None
-        if past_key_value is not None:
-            kv_cache.append(past_key_value)
         
         if (idx + 1) >= target_layer:
             break
 
     hidden_states = llama_model.norm(hidden_states)
-    return hidden_states, kv_cache
+    return hidden_states
 
 
 def benchmark_offload(
@@ -99,49 +97,34 @@ def benchmark_offload(
     target_layer: int,
 ) -> tuple:
     """
-    Compute activation + KV cache at layer L, move to CPU (pinned),
-    then measure CPU->GPU transfer time (non_blocking + sync).
-    Returns (latency_ms, total_data_mb).
+    Compute activation at layer L (hidden state only, no KV cache),
+    move to CPU (pinned), then measure CPU->GPU transfer time.
+    Returns (latency_ms, data_size_mb).
+    
+    MATCHES DJINN SCOPE: Only transfers hidden state activation.
     """
     device = input_ids.device
 
-    # Compute activation + KV cache on GPU
-    act_gpu, kv_cache_gpu = compute_activation_at_layer(
+    # Compute activation on GPU (hidden state only)
+    act_gpu = compute_activation_at_layer(
         llama_model,
         input_ids,
         attention_mask,
         target_layer=target_layer,
     )
 
-    # Calculate total data size (hidden state + KV cache)
-    hidden_state_bytes = act_gpu.numel() * act_gpu.element_size()
-    kv_cache_bytes = 0
-    for kv_pair in kv_cache_gpu:
-        if isinstance(kv_pair, tuple) and len(kv_pair) == 2:
-            k, v = kv_pair
-            kv_cache_bytes += k.numel() * k.element_size()
-            kv_cache_bytes += v.numel() * v.element_size()
-    total_bytes = hidden_state_bytes + kv_cache_bytes
+    # Calculate data size (hidden state only)
+    total_bytes = act_gpu.numel() * act_gpu.element_size()
     total_mb = total_bytes / 1e6
 
     # Move to pinned CPU memory
     act_cpu = act_gpu.detach().to("cpu", non_blocking=True).pin_memory()
-    kv_cache_cpu = []
-    for kv_pair in kv_cache_gpu:
-        if isinstance(kv_pair, tuple) and len(kv_pair) == 2:
-            k, v = kv_pair
-            k_cpu = k.detach().to("cpu", non_blocking=True).pin_memory()
-            v_cpu = v.detach().to("cpu", non_blocking=True).pin_memory()
-            kv_cache_cpu.append((k_cpu, v_cpu))
 
     torch.cuda.synchronize(device)
     start = time.perf_counter()
 
     # Move back to GPU (simulate resume)
     _ = act_cpu.to(device, non_blocking=True)
-    for k_cpu, v_cpu in kv_cache_cpu:
-        _ = k_cpu.to(device, non_blocking=True)
-        _ = v_cpu.to(device, non_blocking=True)
 
     torch.cuda.synchronize(device)
     end = time.perf_counter()
@@ -177,7 +160,7 @@ def run_benchmark(
 
     results: List[Dict] = []
     for layer in layers:
-        # Warmup
+        # Warmup (PCIe drivers are lazy, multiple iterations stabilize)
         for _ in range(warmup_iters):
             _ = benchmark_offload(
                 llama_model,
@@ -199,20 +182,26 @@ def run_benchmark(
         data_sizes = [m[1] for m in measurements]
         
         mean_ms = statistics.mean(latencies)
+        median_ms = statistics.median(latencies)
         std_ms = statistics.stdev(latencies) if len(latencies) > 1 else 0.0
         mean_mb = statistics.mean(data_sizes)
+        
+        # Check for outliers (PCIe timing can be noisy)
+        outlier_count = sum(1 for lat in latencies if abs(lat - mean_ms) > 2 * std_ms) if std_ms > 0 else 0
 
         results.append(
             {
                 "layer": layer,
                 "resume_latency_ms": mean_ms,
+                "resume_latency_median_ms": median_ms,
                 "resume_latency_std_ms": std_ms,
                 "num_samples": repeat_iters,
+                "outlier_count": outlier_count,
                 "data_transferred_mb": mean_mb,
-                "note": "Includes hidden state + cumulative KV cache",
+                "note": "Hidden state only (matches Djinn checkpoint scope)",
             }
         )
-        print(f"[Manual Offload] Layer {layer}: mean={mean_ms:.1f} ms, std={std_ms:.1f} ms over {repeat_iters} runs (data ~{mean_mb:.2f} MB)")
+        print(f"[Manual Offload] Layer {layer}: mean={mean_ms:.1f} ms, median={median_ms:.1f} ms, std={std_ms:.1f} ms over {repeat_iters} runs (data ~{mean_mb:.2f} MB, outliers={outlier_count})")
 
     # Gather environment metadata for reproducibility
     import sys
@@ -246,7 +235,7 @@ def main():
         type=Path,
         default=Path("/tmp/exp3_resume_results/manual_offload_latency.json"),
     )
-    parser.add_argument("--warmup", type=int, default=2, help="Warmup iterations per layer")
+    parser.add_argument("--warmup", type=int, default=3, help="Warmup iterations per layer (PCIe drivers need stabilization)")
     parser.add_argument("--repeat", type=int, default=5, help="Measured iterations per layer")
     args = parser.parse_args()
 

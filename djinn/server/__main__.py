@@ -1,11 +1,12 @@
 """
 Entry point for running Djinn server as a module.
 
-Usage: python -m djinn.server --node-id 0
+Usage: python -m djinn.server --port 5556 --gpu 0
 """
 
-from djinn.server.server import main
+import asyncio
+from djinn.server.server_main import main
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
 

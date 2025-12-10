@@ -73,6 +73,8 @@ class BreakpointExecutor:
         breakpoint_layer_index: int,
         wait_for_resume: bool = True,
         resume_timeout_seconds: float = 300.0,
+        return_activation: bool = True,
+        return_last_token_only: bool = False,
     ) -> Tuple[Any, Dict[str, Any]]:
         """
         Execute model with breakpoint support.
@@ -189,34 +191,38 @@ class BreakpointExecutor:
                 metrics["state"] = "paused"
                 metrics["session_id"] = session_id  # Important: client needs this for resume RPC
                 
-                checkpoint_activation_tensor = None
-                try:
-                    # Restore activations to CPU so the client can inspect/modify them
-                    cpu_device = torch.device('cpu')
-                    activations_cpu, _ = checkpointer.restore(
-                        checkpoint_id=checkpoint_id,
-                        device=cpu_device,
-                    )
-                    logger.debug(f"[{session_id}] Restored activations keys: {list(activations_cpu.keys())}")
-                    output_key = 'output' if 'output' in activations_cpu else 'output_0'
-                    checkpoint_activation_tensor = activations_cpu.get(output_key)
-                    if checkpoint_activation_tensor is not None:
-                        logger.info(
-                            f"[{session_id}] ✅ Prepared checkpoint_activation for client "
-                            f"(shape={checkpoint_activation_tensor.shape}, dtype={checkpoint_activation_tensor.dtype})"
-                        )
-                    else:
-                        logger.warning(f"[{session_id}] ❌ Failed to extract activation from key '{output_key}'")
-                except Exception as activation_err:
-                    logger.error(
-                        f"[{session_id}] ❌ Failed to materialize checkpoint activation for client: {activation_err}",
-                        exc_info=True
-                    )
+                result_payload = {}
                 
-                result_payload = {
-                    'checkpoint_activation': checkpoint_activation_tensor
-                } if checkpoint_activation_tensor is not None else {}
-                logger.info(f"[{session_id}] Returning result_payload with {len(result_payload)} keys (checkpoint_activation present: {checkpoint_activation_tensor is not None})")
+                if return_activation:
+                    checkpoint_activation_tensor = None
+                    try:
+                        # Restore activations to CPU so the client can inspect/modify them
+                        cpu_device = torch.device('cpu')
+                        activations_cpu, _ = checkpointer.restore(
+                            checkpoint_id=checkpoint_id,
+                            device=cpu_device,
+                        )
+                        logger.debug(f"[{session_id}] Restored activations keys: {list(activations_cpu.keys())}")
+                        output_key = 'output' if 'output' in activations_cpu else 'output_0'
+                        checkpoint_activation_tensor = activations_cpu.get(output_key)
+                        if checkpoint_activation_tensor is not None:
+                            logger.info(
+                                f"[{session_id}] ✅ Prepared checkpoint_activation for client "
+                                f"(shape={checkpoint_activation_tensor.shape}, dtype={checkpoint_activation_tensor.dtype})"
+                            )
+                        else:
+                            logger.warning(f"[{session_id}] ❌ Failed to extract activation from key '{output_key}'")
+                    except Exception as activation_err:
+                        logger.error(
+                            f"[{session_id}] ❌ Failed to materialize checkpoint activation for client: {activation_err}",
+                            exc_info=True
+                        )
+                    
+                    if checkpoint_activation_tensor is not None:
+                        result_payload['checkpoint_activation'] = checkpoint_activation_tensor
+                    logger.info(f"[{session_id}] Returning activation (return_activation=True)")
+                else:
+                    logger.info(f"[{session_id}] Skipping activation transfer (return_activation=False)")
                 
                 # Do NOT unregister breakpoint—the session remains paused until resume RPC
                 metrics["awaiting_resume"] = True
@@ -290,7 +296,8 @@ class BreakpointExecutor:
                         model=model,
                         layer_index=layer_index,
                         checkpoint_activation=checkpoint_activation,
-                        session_id=session_id
+                        session_id=session_id,
+                        return_last_token_only=return_last_token_only,
                     )
                     logger.info(
                         f"[{session_id}] Continued execution from layer {layer_index + 1} "
@@ -388,10 +395,15 @@ class BreakpointExecutor:
         session_id: str,
         model: nn.Module,
         layer_index: int,
-        modified_activation: torch.Tensor,
+        modified_activation: Optional[torch.Tensor] = None,
+        return_last_token_only: bool = False,
     ) -> Tuple[Any, Dict[str, Any]]:
         """
         Resume execution from a paused checkpoint using a user-modified activation tensor.
+        If modified_activation is None, uses the stored checkpoint activation without modification.
+        
+        Args:
+            return_last_token_only: If True, slice logits to return only last token
         """
         import time
         from djinn.server.activation_checkpointer import get_activation_checkpointer
@@ -425,14 +437,22 @@ class BreakpointExecutor:
         if output_key not in activations:
             raise RuntimeError(f"Checkpoint activations missing '{output_key}' for session {session_id}")
 
-        modified_on_device = modified_activation.to(model_device)
-        if activations[output_key].shape != modified_on_device.shape:
-            raise ValueError(
-                f"Modified activation shape {tuple(modified_on_device.shape)} "
-                f"!= checkpoint shape {tuple(activations[output_key].shape)}"
-            )
+        # Use stored checkpoint or modified activation
+        if modified_activation is None:
+            modified_on_device = activations[output_key]
+            logger.info(f"[{session_id}] Using stored checkpoint activation (no modification)")
+            steering_applied = False
+        else:
+            modified_on_device = modified_activation.to(model_device)
+            if activations[output_key].shape != modified_on_device.shape:
+                raise ValueError(
+                    f"Modified activation shape {tuple(modified_on_device.shape)} "
+                    f"!= checkpoint shape {tuple(activations[output_key].shape)}"
+                )
+            activations[output_key] = modified_on_device
+            logger.info(f"[{session_id}] Using modified activation (steering applied)")
+            steering_applied = True
 
-        activations[output_key] = modified_on_device
         self._restored_activations = activations
 
         # Resume semantics
@@ -442,7 +462,7 @@ class BreakpointExecutor:
         metrics: Dict[str, Any] = {
             "session_id": session_id,
             "resume_layer": layer_index,
-            "steering_applied": True,
+            "steering_applied": steering_applied,
             "restore_time_ms": restore_time * 1000,
             "modified_activation_shape": list(modified_on_device.shape),
         }
@@ -453,6 +473,7 @@ class BreakpointExecutor:
                 layer_index=layer_index,
                 checkpoint_activation=modified_on_device,
                 session_id=session_id,
+                return_last_token_only=return_last_token_only,
             )
             metrics["model_output"] = "completed"
             self.stats["successful_resumes"] += 1
@@ -481,7 +502,8 @@ class BreakpointExecutor:
         model: nn.Module,
         layer_index: int,
         checkpoint_activation: torch.Tensor,
-        session_id: str
+        session_id: str,
+        return_last_token_only: bool = False,
     ) -> Any:
         """
         Continue model execution from layer_index + 1 using restored activation.
@@ -493,6 +515,7 @@ class BreakpointExecutor:
             layer_index: Index of layer where we paused (0-based)
             checkpoint_activation: Activation tensor from layer_index's output
             session_id: Session identifier for logging
+            return_last_token_only: If True, slice logits to return only last token
         
         Returns:
             Final model output (logits or prediction)
@@ -525,6 +548,8 @@ class BreakpointExecutor:
         # ✅ CRITICAL: Get attention_mask from restored activations
         # This is saved by _collect_activations in breakpoint_hooks.py
         attention_mask = None
+        position_ids = None
+        
         if hasattr(self, '_restored_activations') and self._restored_activations:
             attention_mask = self._restored_activations.get('attention_mask')
             if attention_mask is None:
@@ -536,6 +561,37 @@ class BreakpointExecutor:
         else:
             logger.warning(f"[{session_id}] No restored activations available for attention_mask")
         
+        # ✅ CRITICAL: Compute position_ids and position_embeddings for Llama/Mistral models
+        # Needed for Rotary Positional Embeddings (RoPE) when resuming
+        position_embeddings = None
+        rotary_emb = None
+        if hasattr(model, "model") and hasattr(model.model, "rotary_emb"):
+            rotary_emb = model.model.rotary_emb
+        elif hasattr(model, "rotary_emb"):
+            rotary_emb = model.rotary_emb
+        elif layers and hasattr(layers[0], "self_attn") and hasattr(layers[0].self_attn, "rotary_emb"):
+            rotary_emb = layers[0].self_attn.rotary_emb
+
+        if checkpoint_activation is not None and hasattr(checkpoint_activation, "shape"):
+            batch_size = checkpoint_activation.shape[0]
+            seq_len = checkpoint_activation.shape[1] if len(checkpoint_activation.shape) > 1 else 1
+            device = checkpoint_activation.device
+
+            position_ids = torch.arange(
+                seq_len, dtype=torch.long, device=device
+            ).unsqueeze(0).expand(batch_size, -1).contiguous()
+            logger.info(f"[{session_id}] Computed position_ids shape {position_ids.shape} from checkpoint activation")
+
+            if rotary_emb is not None:
+                try:
+                    position_embeddings = rotary_emb(checkpoint_activation, position_ids)
+                    logger.info(
+                        f"[{session_id}] Computed position_embeddings via rotary_emb "
+                        f"(shape {position_embeddings[0].shape if isinstance(position_embeddings, tuple) else getattr(position_embeddings, 'shape', None)})"
+                    )
+                except Exception as rope_err:
+                    logger.warning(f"[{session_id}] Failed computing position_embeddings with rotary_emb: {rope_err}")
+        
         # Execute layers from layer_index + 1 to end
         current_output = checkpoint_activation
 
@@ -545,31 +601,58 @@ class BreakpointExecutor:
         )
 
         with torch.no_grad():
-            # Pass through remaining layers with attention mask
+            # Pass through remaining layers with attention/position info
             for i in range(layer_index + 1, len(layers)):
                 layer = layers[i]
                 logger.info(f"[{session_id}] Executing layer {i} ({type(layer).__name__})")
                 try:
-                    # ✅ CRITICAL: Pass attention_mask to transformer layers
-                    # This ensures correct attention computation (not garbage output)
-                    
-                    # For Mistral and other models, try multiple calling conventions
+                    # ✅ CRITICAL: Pass attention_mask/position_ids/position_embeddings and disable cache
+                    # Try multiple calling conventions to match HF Llama decoder layers
                     outputs = None
-                    
-                    # Try 1: With attention_mask as keyword argument (standard)
-                    if attention_mask is not None:
+
+                    llama_kwargs = {
+                        "attention_mask": attention_mask,
+                        "position_ids": position_ids,
+                        "past_key_value": None,
+                        "output_attentions": False,
+                        "use_cache": False,
+                        "cache_position": None,
+                    }
+                    if position_embeddings is not None:
+                        llama_kwargs["position_embeddings"] = position_embeddings
+
+                    # Try 1: Full Llama signature
+                    try:
+                        outputs = layer(current_output, **{k: v for k, v in llama_kwargs.items() if v is not None})
+                        logger.debug(f"[{session_id}] Layer {i} executed with Llama kwargs")
+                    except TypeError as te_full:
+                        logger.debug(f"[{session_id}] Layer {i} Llama kwargs not accepted: {te_full}")
+                        # Try 2: attention + position_ids
                         try:
-                            outputs = layer(current_output, attention_mask=attention_mask)
-                        except TypeError as te_mask:
-                            logger.debug(f"[{session_id}] Layer {i} doesn't accept attention_mask kwarg: {te_mask}")
-                            # Try 2: Without attention_mask (e.g., if layer is fully attention-free or self-handles it)
+                            if attention_mask is not None and position_ids is not None:
+                                outputs = layer(
+                                    current_output,
+                                    attention_mask=attention_mask,
+                                    position_ids=position_ids,
+                                )
+                                logger.debug(f"[{session_id}] Layer {i} executed with attention_mask and position_ids")
+                        except TypeError as te_both:
+                            logger.debug(f"[{session_id}] Layer {i} no attention+position_ids: {te_both}")
+                        # Try 3: attention_mask only
+                        if outputs is None and attention_mask is not None:
+                            try:
+                                outputs = layer(current_output, attention_mask=attention_mask)
+                                logger.debug(f"[{session_id}] Layer {i} executed with attention_mask only")
+                            except TypeError as te_mask:
+                                logger.debug(f"[{session_id}] Layer {i} no attention_mask: {te_mask}")
+                        # Try 4: bare call
+                        if outputs is None:
                             try:
                                 outputs = layer(current_output)
-                            except Exception as e_nomask:
-                                logger.error(f"[{session_id}] Both attempts failed at layer {i}: {e_nomask}")
-                                raise RuntimeError(f"Failed executing layer {i}: {e_nomask}") from e_nomask
-                    else:
-                        outputs = layer(current_output)
+                                logger.debug(f"[{session_id}] Layer {i} executed without kwargs")
+                            except Exception as e_nokw:
+                                logger.error(f"[{session_id}] All attempts failed at layer {i}: {e_nokw}")
+                                raise RuntimeError(f"Failed executing layer {i}: {e_nokw}") from e_nokw
                     
                     # ✅ Handle tuple returns (GPT-2 returns (hidden_states, present_kv, ...))
                     # Extract hidden states from position 0 if tuple
@@ -617,6 +700,18 @@ class BreakpointExecutor:
             'logits': current_output
         }
         logger.debug(f"[{session_id}] Wrapped output in dict with 'logits' key")
+        
+        # Optimization: Slice logits to return only last token if requested
+        if return_last_token_only and isinstance(output_dict, dict) and 'logits' in output_dict:
+            logits = output_dict['logits']
+            if hasattr(logits, 'shape') and len(logits.shape) >= 2:
+                original_shape = logits.shape
+                # Slice last token: [..., seq, vocab] -> [..., 1, vocab]
+                output_dict['logits'] = logits[..., -1:, :]
+                logger.info(
+                    f"[{session_id}] Sliced logits from {original_shape} to {output_dict['logits'].shape} "
+                    f"(return_last_token_only=True)"
+                )
         
         return output_dict
 

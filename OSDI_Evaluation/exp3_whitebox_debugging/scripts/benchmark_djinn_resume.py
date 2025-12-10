@@ -98,7 +98,7 @@ async def run_benchmark_async(
     layers: List[int],
     max_length: int,
     output_path: Path,
-    server: str = "localhost:5556",
+    server: str = "127.0.0.1:5556",
     warmup_iters: int = 2,
     repeat_iters: int = 5,
 ):
@@ -208,8 +208,8 @@ def main():
         type=Path,
         default=Path("/tmp/exp3_resume_results/djinn_resume_latency.json"),
     )
-    parser.add_argument("--server", type=str, default="localhost:5556")
-    parser.add_argument("--warmup", type=int, default=2, help="Warmup iterations per layer")
+    parser.add_argument("--server", type=str, default="127.0.0.1:5556")
+    parser.add_argument("--warmup", type=int, default=3, help="Warmup iterations per layer (increased for stability)")
     parser.add_argument("--repeat", type=int, default=5, help="Measured iterations per layer")
     args = parser.parse_args()
 

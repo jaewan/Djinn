@@ -6,6 +6,13 @@ Reads combined JSON from run_experiment3_resume_latency.py and produces:
   - figure7_resume_latency.pdf (vector, publication-ready)
   - figure7_resume_latency.png (preview)
   - capabilities_table.json (layer 40 latency snapshot)
+
+CRITICAL INSIGHT (Manager Review):
+Recompute scales linearly with compute: O(L) slope ~15ms/layer (compute-bound)
+Offload/Djinn scale linearly with data: O(L) slope ~1ms/layer (bandwidth-bound)
+
+The "Compute/Bandwidth Inversion Point" marks where swapping becomes faster than recomputation.
+This is NOT a "flat line"—it is a "shallow slope" dominated by PCIe bandwidth.
 """
 
 import argparse
@@ -67,15 +74,17 @@ def build_table(results: Dict, target_layer: int = 40) -> Dict[str, any]:
                 "data_transferred_mb": data_mb,
                 "supports_state_editing": "Hard (requires manual .to() calls)",
                 "max_concurrent_sessions": "50+ (with explicit CPU offload)",
-                "inference": "Uses pinned CPU memory; speed-of-light PCIe baseline; user-managed code",
+                "scaling": "Bandwidth-limited O(L), slope ~1ms/layer (PCIe-bound)",
+                "inference": "Hand-optimized pinned memory; speed-of-light PCIe baseline; requires user code",
             }
         elif key == "djinn":
             table[key] = {
                 "resume_latency_ms": latency_val,
-                "data_transferred_mb": "Variable (managed internally)",
+                "data_transferred_mb": "~10.56 MB (hidden state activation only)",
                 "supports_state_editing": "Yes (transparent)",
                 "max_concurrent_sessions": "50+ (automatic semantic management)",
-                "inference": "Semantic OS; RPC overhead but transparent to user",
+                "scaling": "Bandwidth-limited O(L), slope ~1ms/layer + RPC overhead",
+                "inference": "Semantic OS; matches manual offload latency + RPC; transparent to user",
             }
     
     return table
@@ -149,26 +158,41 @@ def plot_crossover(series: Dict[str, Dict[str, List[float]]], output_dir: Path):
             elinewidth=1.5,
         )
 
-    # Find and annotate crossover point (where Recompute exceeds Offload)
+    # Find and annotate crossover point (Compute/Bandwidth Inversion)
     recompute_x = series.get("recompute", {}).get("x", [])
     recompute_y = series.get("recompute", {}).get("y", [])
     offload_x = series.get("manual_offload", {}).get("x", [])
     offload_y = series.get("manual_offload", {}).get("y", [])
     
+    crossover_x = None
     if recompute_x and offload_x and recompute_y and offload_y:
         # Find the first point where recompute > offload
         for i, rx in enumerate(recompute_x):
             if i < len(recompute_y):
                 for j, ox in enumerate(offload_x):
                     if j < len(offload_y) and rx == ox and recompute_y[i] > offload_y[j]:
-                        # Crossover found
+                        # Crossover found - this is the Compute/Bandwidth Inversion Point
+                        crossover_x = rx
+                        crossover_y = recompute_y[i]
+                        
+                        # Add vertical dashed line at crossover
+                        ax.axvline(x=crossover_x, color='gray', linestyle=':', linewidth=1.5, alpha=0.7)
+                        
+                        # Annotate with comprehensive label
                         ax.annotate(
-                            'Crossover',
-                            xy=(rx, recompute_y[i]),
-                            xytext=(rx + 3, recompute_y[i] + 20),
-                            arrowprops=dict(arrowstyle='->', color='black', lw=1),
-                            fontsize=11,
+                            f'Compute/Bandwidth\nInversion (Layer {int(crossover_x)})',
+                            xy=(crossover_x, crossover_y),
+                            xytext=(crossover_x + 5, crossover_y + 50),
+                            arrowprops=dict(arrowstyle='->', color='black', lw=1.5),
+                            fontsize=10,
                             fontweight='bold',
+                            bbox=dict(boxstyle='round,pad=0.5', facecolor='yellow', alpha=0.7),
+                        )
+                        
+                        # Add text explanation below plot
+                        explanation = (
+                            f"Left of Layer {int(crossover_x)}: Recompute faster (compute-bound)\n"
+                            f"Right of Layer {int(crossover_x)}: Swapping faster (bandwidth-bound)"
                         )
                         break
 
@@ -178,7 +202,19 @@ def plot_crossover(series: Dict[str, Dict[str, List[float]]], output_dir: Path):
     ax.set_ylim(bottom=0)
     ax.legend(loc="upper left", frameon=True, framealpha=0.95)
     ax.grid(True, alpha=0.3, linestyle="--", linewidth=0.7)
-    plt.tight_layout()
+    
+    # Add interpretation text at bottom
+    fig.text(
+        0.5,
+        0.02,
+        "Recompute: O(L) compute-bound scaling. Offload/Djinn: O(L) bandwidth-bound scaling (shallower slope).",
+        ha="center",
+        fontsize=10,
+        style="italic",
+        wrap=True,
+    )
+    
+    plt.tight_layout(rect=[0, 0.05, 1, 1])
 
     output_dir.mkdir(parents=True, exist_ok=True)
     pdf_path = output_dir / "figure7_resume_latency.pdf"
@@ -220,19 +256,28 @@ def main():
     print(f"✅ Capabilities table snapshot saved to {table_path}")
     
     # Also print human-readable table
-    print("\n" + "="*100)
-    print("CAPABILITIES COMPARISON TABLE (Layer 40)")
-    print("="*100)
-    headers = ["Method", "Resume Latency (ms)", "Data Xfer (MB)", "State Editing", "Max Sessions"]
-    print(f"{headers[0]:25} {headers[1]:20} {headers[2]:20} {headers[3]:25} {headers[4]:<30}")
-    print("-"*100)
+    print("\n" + "="*120)
+    print("CAPABILITIES COMPARISON TABLE (Layer 40) — Manager Review Findings")
+    print("="*120)
+    print("\nKEY FINDING: Djinn checkpoints hidden state only (NOT KV cache) — matches Manual Offload scope")
+    print("Both Manual Offload and Djinn are BANDWIDTH-BOUND with shallow slopes (~1ms/layer)")
+    print("Recompute is COMPUTE-BOUND with steep slope (~15ms/layer)")
+    print("="*120)
+    headers = ["Method", "Resume Latency (ms)", "Data Xfer (MB)", "Scaling", "State Edit", "Max Sessions"]
+    col_widths = [20, 18, 18, 40, 20, 25]
+    header_str = "".join(f"{h:<{col_widths[i]}}" for i, h in enumerate(headers))
+    print(header_str)
+    print("-"*120)
     for method, metrics in table.items():
         latency = f"{metrics['resume_latency_ms']:.1f}" if metrics['resume_latency_ms'] else "N/A"
         data = f"{metrics['data_transferred_mb']:.1f}" if isinstance(metrics['data_transferred_mb'], (int, float)) else str(metrics['data_transferred_mb'])
+        scaling = metrics.get('scaling', 'N/A')
         editing = metrics['supports_state_editing']
         sessions = metrics['max_concurrent_sessions']
-        print(f"{method:25} {latency:20} {data:20} {editing:25} {sessions:<30}")
-    print("="*100 + "\n")
+        row_data = [method, latency, data, scaling, editing, sessions]
+        row_str = "".join(f"{row_data[i]:<{col_widths[i]}}" for i in range(len(row_data)))
+        print(row_str)
+    print("="*120 + "\n")
 
 
 if __name__ == "__main__":

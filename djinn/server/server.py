@@ -803,6 +803,22 @@ class DjinnServer:
 
         except Exception as e:
             logger.error(f"Error handling connection from {addr}: {e}")
+            # Send error response to client before closing connection
+            try:
+                from djinn.core.secure_serializer import SecureSerializer
+                error_response = {
+                    'status': 'error',
+                    'message': str(e)
+                }
+                error_bytes = SecureSerializer.serialize_response(error_response)
+                writer.write(bytes([MessageType.ERROR]))  # ERROR message type
+                writer.write(len(error_bytes).to_bytes(8, 'big'))
+                writer.write(error_bytes)
+                await writer.drain()
+                logger.info("✅ Error response sent to client")
+            except Exception as send_error:
+                logger.debug(f"Could not send error response: {send_error}")
+                # Fall through to close connection anyway
         finally:
             # ✅ IMPROVEMENT: Support keep-alive for message type protocol
             from .transport.protocol import MessageType
@@ -830,10 +846,10 @@ class DjinnServer:
             
             # Always close connection after response
             try:
-                # Variable delay based on message type
-                delay = 5.0 if (hasattr(self, '_last_msg_type') and 
-                               self._last_msg_type == MessageType.REGISTER_MODEL_FINALIZE) else 0.1  # Reduced delay
-                await asyncio.sleep(delay)  # Delay to allow client to read
+                # Short delay to allow client to read response before closing
+                # (the 60s delay was removed - model loading happens during request handling, not after)
+                delay = 0.1
+                await asyncio.sleep(delay)  # Small delay to allow client to read
                 if not writer.is_closing():
                     writer.close()
                     await writer.wait_closed()
@@ -864,30 +880,18 @@ class DjinnServer:
                 # ✅ BUG FIX: Log the raw bytes for debugging protocol mismatches
                 logger.debug(f"Length header bytes: {length_bytes.hex()} = {length} bytes ({length / (1024*1024):.2f} MB)")
                 
-                # ✅ BUG FIX: Validate length header is not a suspicious round number BEFORE reading data
-                # This catches protocol mismatches early (before wasting time reading wrong amount of data)
-                SUSPICIOUS_SIZES = [
-                    64 * 1024 * 1024,      # 64MB (2^26) - common in errors
-                    128 * 1024 * 1024,     # 128MB (2^27)
-                    256 * 1024 * 1024,     # 256MB (2^28)
-                ]
-                if length in SUSPICIOUS_SIZES:
-                    # This is almost certainly a protocol mismatch - reject early
-                    raise ValueError(
-                        f"⚠️  PROTOCOL MISMATCH: Suspicious length header {length} bytes ({length / (1024*1024):.1f} MB) "
-                        f"for message type 0x{msg_type:02x}. "
-                        f"Length header bytes: {length_bytes.hex()}. "
-                        f"This indicates leftover data from previous message or connection state corruption. "
-                        f"Closing connection and requesting client to reconnect."
-                    )
+                # ✅ RELAXED: Removed early SUSPICIOUS_SIZES check
+                # Large models can naturally have sizes that appear "round" in binary
+                # The max size check below is sufficient for safety
+                # Detailed logging will help diagnose actual protocol issues
                 
                 # ✅ BUG FIX: Validate message length to catch protocol mismatches
-                MAX_REASONABLE_MESSAGE_SIZE = 10 * 1024 * 1024 * 1024  # 10GB (safety limit)
+                MAX_REASONABLE_MESSAGE_SIZE = 100 * 1024 * 1024 * 1024  # 100GB (supports large models like Llama-13B ~26GB)
                 if length > MAX_REASONABLE_MESSAGE_SIZE:
                     raise ValueError(
                         f"⚠️  Suspicious message length: {length} bytes ({length / (1024*1024):.1f} MB). "
                         f"This is likely a protocol mismatch or leftover data from previous message. "
-                        f"Expected reasonable size (< 10GB)."
+                        f"Expected reasonable size (< 100GB)."
                     )
                 if length == 0:
                     raise ValueError("Invalid message length: 0 bytes (possible protocol mismatch)")
@@ -895,35 +899,19 @@ class DjinnServer:
                 # Import protocol constants for validation
                 from .transport.protocol import MessageType
                 
-                # ✅ BUG FIX: Check for suspicious round numbers (like 64MB = 2^26)
-                # These often indicate protocol mismatches or leftover data
-                # Apply to ALL message types, not just registration
-                SUSPICIOUS_SIZES = [
-                    64 * 1024 * 1024,      # 64MB (2^26) - common in errors
-                    128 * 1024 * 1024,     # 128MB (2^27)
-                    256 * 1024 * 1024,     # 256MB (2^28)
-                    512 * 1024 * 1024,     # 512MB (2^29)
-                    1024 * 1024 * 1024,    # 1GB (2^30)
-                ]
-                if length in SUSPICIOUS_SIZES:
-                    # ✅ BUG FIX: Raise error for suspicious round numbers - they indicate protocol mismatch
-                    # This applies to ALL message types, not just registration
-                    raise ValueError(
-                        f"⚠️  Suspicious message length: {length} bytes ({length / (1024*1024):.1f} MB) "
-                        f"is a round number (power of 2) for message type 0x{msg_type:02x}. "
-                        f"This indicates protocol mismatch or leftover data from previous message. "
-                        f"Expected actual message size, not a round number. Check connection state and protocol detection."
-                    )
+                # ✅ RELAXED: Removed strict SUSPICIOUS_SIZES check
+                # Round numbers like 64MB, 128MB, 256MB can be legitimate for large model weights
+                # Large models (e.g., Llama-13B ~26GB) naturally align to round boundaries
+                # The max size check above is sufficient to catch real protocol errors
+                # Detailed logging will help diagnose any actual issues if they occur
                 
-                # ✅ BUG FIX: For registration messages, check if length is reasonable
-                # Small models should be < 100MB, large models might be up to 1GB
-                # But 64MB exactly is suspicious (round number)
-                if msg_type == MessageType.REGISTER_MODEL and length > 50 * 1024 * 1024:  # > 50MB
-                    logger.warning(
-                        f"⚠️  Large registration message: {length} bytes ({length / (1024*1024):.1f} MB). "
-                        f"If this is a small model, this might indicate protocol mismatch."
+                # ✅ INFO: For registration messages, log large payloads for debugging
+                # Models like Llama-13B can be 26GB or larger, which is expected
+                if msg_type == MessageType.REGISTER_MODEL and length > 1 * 1024 * 1024:  # > 1MB
+                    logger.info(
+                        f"📦 REGISTER_MODEL message detected: length={length} bytes ({length / (1024*1024):.1f} MB), "
+                        f"will check for binary protocol"
                     )
-                    logger.info(f"🔍 REGISTER_MODEL message detected: length={length} bytes, will check for binary protocol")
                 
                 logger.info(
                     f"📊 Message length: {length} bytes ({length / (1024*1024):.1f} MB, "
@@ -990,12 +978,14 @@ class DjinnServer:
                     from djinn.core.model_execution_serializer import ModelExecutionSerializer
                     if msg_type == MessageType.RESUME_FROM_CHECKPOINT:
                         logger.info("🔍 Detected resume-from-checkpoint binary request")
-                        session_id, fingerprint, modified_activation, layer_index = ModelExecutionSerializer.deserialize_resume_from_checkpoint_request(request_bytes)
+                        session_id, fingerprint, modified_activation, layer_index, use_stored_activation, return_last_token_only = ModelExecutionSerializer.deserialize_resume_from_checkpoint_request(request_bytes)
                         request = {
                             'session_id': session_id,
                             'fingerprint': fingerprint,
                             'modified_activation': modified_activation,
                             'layer_index': layer_index,
+                            'use_stored_activation': use_stored_activation,
+                            'return_last_token_only': return_last_token_only,
                             '_binary_protocol': True,
                         }
                         self._ensure_request_id(request)
@@ -1233,6 +1223,8 @@ class DjinnServer:
                     response = await self._handle_init_model(request)
                 elif msg_type == MessageType.WARMUP_GPU:
                     response = await self._handle_warmup_gpu(request)
+                elif msg_type == MessageType.GET_CAPABILITIES:
+                    response = await self._handle_get_capabilities(request)
                 elif msg_type == MessageType.CACHE_QUERY:
                     response = await self._handle_cache_query(request)
                 elif msg_type == MessageType.QUERY_RESULT:
@@ -1557,16 +1549,32 @@ class DjinnServer:
             )
             registration_response['registration_time_ms'] = registration_time
             try:
+                # Ensure the model is actually present in ModelCacheV23 before returning success.
+                # We attempt to mirror from the handler cache; if still missing, fail the registration.
                 model_ref = self._model_handler.model_cache.get_model_reference(fingerprint)
+                if model_ref is None:
+                    # Fallback: try to get the concrete model from handler cache
+                    concrete_model = self._model_handler.model_cache.get_model(fingerprint)
+                    if concrete_model is not None:
+                        model_ref = concrete_model
+                        logger.info("ℹ️  Using concrete model from handler cache for ModelCacheV23 mirroring")
+
                 if model_ref is not None:
                     from .model_cache_v23 import get_model_cache_v23
                     cache_v23 = get_model_cache_v23()
                     cache_v23.register_model(fingerprint, model_ref, request.get('model_id'))
                     logger.info("✅ Model mirrored into ModelCacheV23")
+                    # Verify insertion
+                    if cache_v23.get_model(fingerprint) is None:
+                        raise RuntimeError("ModelCacheV23 registration verification failed")
                 else:
-                    logger.warning("⚠️  Model reference missing after registration; ModelCacheV23 not updated")
+                    raise RuntimeError("Model reference missing after registration; ModelCacheV23 not updated")
             except Exception as mirror_error:
-                logger.error(f"⚠️  Failed to mirror model into ModelCacheV23: {mirror_error}")
+                logger.error(f"❌ Failed to mirror model into ModelCacheV23: {mirror_error}")
+                return {
+                    'status': 'error',
+                    'message': f'Model not cached after registration: {mirror_error}'
+                }
             return registration_response
         else:
             error_msg = registration_response.get('message', 'Unknown error')
@@ -1999,6 +2007,50 @@ class DjinnServer:
             logger.error(f"GPU warmup failed: {e}")
             import traceback
             logger.error(f"Traceback:\n{traceback.format_exc()}")
+            return {
+                'status': 'error',
+                'message': str(e)
+            }
+
+    async def _handle_get_capabilities(self, request: Dict) -> Dict:
+        """Handle GET_CAPABILITIES request from client for initialization."""
+        try:
+            # Return server capabilities gathered at startup
+            if self.capabilities is None:
+                logger.warning("Capabilities not yet initialized")
+                return {
+                    'status': 'success',
+                    'gpu_count': 0,
+                    'gpus': [],
+                    'networks': [],
+                    'total_memory_gb': 0,
+                    'supported_transports': ['tcp'],
+                    'hostname': 'unknown',
+                    'node_id': 'unknown',
+                }
+            
+            # Convert capabilities object to dict
+            from dataclasses import asdict
+            try:
+                caps_dict = asdict(self.capabilities)
+                return {
+                    'status': 'success',
+                    **caps_dict
+                }
+            except Exception:
+                # Fallback: manual conversion
+                return {
+                    'status': 'success',
+                    'gpu_count': getattr(self.capabilities, 'gpu_count', 0),
+                    'gpus': getattr(self.capabilities, 'gpus', []),
+                    'networks': getattr(self.capabilities, 'networks', []),
+                    'total_memory_gb': getattr(self.capabilities, 'total_memory_gb', 0),
+                    'supported_transports': ['tcp'],
+                    'hostname': getattr(self.capabilities, 'hostname', 'unknown'),
+                    'node_id': getattr(self.capabilities, 'node_id', 'unknown'),
+                }
+        except Exception as e:
+            logger.error(f"Failed to handle GET_CAPABILITIES: {e}")
             return {
                 'status': 'error',
                 'message': str(e)
@@ -2713,6 +2765,8 @@ class DjinnServer:
             
             breakpoint_layer_index = request.get('breakpoint_layer_index', 0)
             wait_for_resume = request.get('wait_for_resume', True)
+            return_activation = request.get('return_activation', True)
+            return_last_token_only = request.get('return_last_token_only', False)
             inputs = request.get('inputs', {})
             session_id_provided = request.get('session_id')
             
@@ -2750,6 +2804,8 @@ class DjinnServer:
                 inputs=inputs,
                 breakpoint_layer_index=breakpoint_layer_index,
                 wait_for_resume=wait_for_resume,
+                return_activation=return_activation,
+                return_last_token_only=return_last_token_only,
             )
             
             # Serialize response using breakpoint-specific serializer
@@ -2814,13 +2870,17 @@ class DjinnServer:
             fingerprint = request.get('fingerprint')
             layer_index = request.get('layer_index')
             modified_activation = request.get('modified_activation')
+            use_stored_activation = request.get('use_stored_activation', False)
+            return_last_token_only = request.get('return_last_token_only', False)
 
             if not session_id or not fingerprint:
                 return {'status': 'error', 'message': 'session_id and fingerprint required'}
             if layer_index is None:
                 return {'status': 'error', 'message': 'layer_index required'}
-            if modified_activation is None:
-                return {'status': 'error', 'message': 'modified_activation tensor required'}
+            
+            # If not using stored activation, activation tensor is required
+            if not use_stored_activation and modified_activation is None:
+                return {'status': 'error', 'message': 'modified_activation tensor required when use_stored_activation=False'}
 
             # Ensure session exists
             session_mgr = get_session_manager()
@@ -2835,9 +2895,13 @@ class DjinnServer:
 
             executor = get_breakpoint_executor()
 
+            activation_info = (
+                "using stored server-side activation" if use_stored_activation
+                else f"activation_shape={tuple(modified_activation.shape)}"
+            )
             logger.info(
                 f"[{session_id}] Resuming from checkpoint via RPC "
-                f"(layer={layer_index}, activation_shape={tuple(modified_activation.shape)})"
+                f"(layer={layer_index}, {activation_info}, return_last_token_only={return_last_token_only})"
             )
 
             model_output, metrics = executor.resume_from_modified_activation(
@@ -2845,6 +2909,7 @@ class DjinnServer:
                 model=model,
                 layer_index=layer_index,
                 modified_activation=modified_activation,
+                return_last_token_only=return_last_token_only,
             )
 
             serialized = ModelExecutionSerializer.serialize_resume_from_checkpoint_response(

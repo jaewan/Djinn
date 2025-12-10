@@ -93,7 +93,7 @@ class EnhancedModelManager:
         self._connection_lock = asyncio.Lock()
         self._connection_timeout = 60.0
         self._max_connection_errors = 3
-        self._max_connections_per_target = 20
+        self._max_connections_per_target = 100  # OPTIMIZED: Increased from 20 to support high concurrency
 
         loop = None
         try:
@@ -164,7 +164,8 @@ class EnhancedModelManager:
                 )
                 logger.info("✅ Model registered on server: %s", fingerprint[:8])
             except Exception as exc:
-                logger.warning("Server registration failed: %s", exc)
+                logger.error("Server registration failed: %s", exc)
+                raise  # Re-raise so caller knows registration failed
         else:
             logger.info("✅ Model registered locally: %s", fingerprint[:8])
 

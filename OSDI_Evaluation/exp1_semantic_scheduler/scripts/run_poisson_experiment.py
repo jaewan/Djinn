@@ -142,7 +142,8 @@ async def agent_lifecycle_poisson(
             # Measure wake-up latency (includes restore overhead if swapped)
             wake_start = time.perf_counter()
             
-            with djinn.session(phase="decode", session_id=session_id, priority="normal"):
+            # OPTIMIZATION: Use interactive priority for decode to enable fast-path scheduling
+            with djinn.session(phase="decode", session_id=session_id, priority="interactive"):
                 reflect_result, reflect_server_metrics = await manager.execute_model(
                     model,
                     inputs,
@@ -189,6 +190,8 @@ async def spawn_agents_poisson(
     tokenizer: Any,
     prompt: str,
     config: Dict[str, Any],
+    arrival_times: List[float] = None,
+    think_times: List[float] = None,
 ) -> Tuple[List[List[Dict]], float]:
     """
     Spawn agents with Poisson inter-arrival times (staggered, not all-at-once).
@@ -196,29 +199,56 @@ async def spawn_agents_poisson(
     Args:
         manager, model, tokenizer, prompt: Model execution infrastructure
         config: Contains total_agents, arrival_rate, think_time_min/max
+        arrival_times: Optional list of arrival times from trace (if provided, uses these instead of generating)
+        think_times: Optional list of think times from trace (if provided, uses these instead of config)
     
     Returns:
         (results_list, total_duration_s)
     """
     total_agents = config.get("total_agents", 200)
-    arrival_rate = config.get("arrival_rate", 1.0)  # agents per second
     
-    logger.info(f"Spawning {total_agents} agents with Poisson arrival_rate={arrival_rate}/s")
+    # Use provided traces if available, otherwise fall back to config
+    if arrival_times is not None and think_times is not None:
+        logger.info(f"Spawning {total_agents} agents from deterministic trace")
+        trace_arrival_times = arrival_times[:total_agents]
+        trace_think_times = think_times[:total_agents]
+    else:
+        arrival_rate = config.get("arrival_rate", 1.0)  # agents per second
+        logger.info(f"Spawning {total_agents} agents with Poisson arrival_rate={arrival_rate}/s")
+        trace_arrival_times = None
+        trace_think_times = None
     
     agent_tasks = []
     spawn_start = time.perf_counter()
     
     for i in range(total_agents):
-        # Compute inter-arrival time (Poisson exponential distribution)
-        if arrival_rate > 0:
-            inter_arrival = random.expovariate(arrival_rate)
+        # Determine arrival time and think time
+        if trace_arrival_times is not None:
+            arrival_time = trace_arrival_times[i]
+            think_time = trace_think_times[i]
         else:
-            inter_arrival = 0
+            # Compute inter-arrival time (Poisson exponential distribution)
+            arrival_rate = config.get("arrival_rate", 1.0)
+            if arrival_rate > 0:
+                inter_arrival = random.expovariate(arrival_rate)
+            else:
+                inter_arrival = 0
+            
+            # Wait for next arrival (staggered spawning)
+            await asyncio.sleep(inter_arrival)
+            
+            arrival_time = time.perf_counter() - spawn_start
+            
+            # Generate think time from config
+            think_min = config.get("think_time_min", 2.0)
+            think_max = config.get("think_time_max", 10.0)
+            think_time = random.uniform(think_min, think_max)
         
-        # Wait for next arrival (staggered spawning)
-        await asyncio.sleep(inter_arrival)
-        
-        arrival_time = time.perf_counter() - spawn_start
+        # For trace-based arrivals, wait until arrival time
+        if trace_arrival_times is not None:
+            current_wall_time = time.perf_counter() - spawn_start
+            if arrival_time > current_wall_time:
+                await asyncio.sleep(arrival_time - current_wall_time)
         
         # Spawn agent as non-blocking task
         task = asyncio.create_task(
@@ -228,7 +258,7 @@ async def spawn_agents_poisson(
         
         if (i + 1) % 50 == 0:
             logger.info(f"[Spawn] {i + 1}/{total_agents} agents spawned, "
-                       f"elapsed={arrival_time:.1f}s")
+                       f"elapsed={time.perf_counter() - spawn_start:.1f}s")
     
     # Wait for all agents to complete
     logger.info(f"All {total_agents} agents spawned. Waiting for completion...")
@@ -244,10 +274,17 @@ async def spawn_agents_poisson(
 async def run_poisson_experiment(
     args: argparse.Namespace,
     coordinator,
-    config: Dict
+    config: Dict,
+    trace_data: Dict = None,
 ) -> Dict[str, Any]:
     """
     Main experiment runner: spawn Poisson agents and collect metrics.
+    
+    Args:
+        args: Command-line arguments
+        coordinator: Djinn coordinator
+        config: Workload config
+        trace_data: Optional trace data (if provided, uses deterministic arrivals and think times)
     """
     
     # Load model
@@ -283,11 +320,21 @@ async def run_poisson_experiment(
     
     # Run Poisson experiment
     logger.info("=" * 70)
-    logger.info("POISSON EXPERIMENT: N=200 Staggered Arrivals")
+    logger.info("POISSON EXPERIMENT: Staggered Arrivals")
     logger.info("=" * 70)
     
+    # Prepare trace data
+    arrival_times = None
+    think_times = None
+    if trace_data is not None:
+        arrival_times = trace_data.get("arrival_times", [])
+        think_times = trace_data.get("think_times", [])
+        logger.info(f"Using deterministic trace with {len(arrival_times)} agents")
+    
     results_list, total_duration = await spawn_agents_poisson(
-        manager, model, tokenizer, prompt_text, config["workload"]
+        manager, model, tokenizer, prompt_text, config["workload"],
+        arrival_times=arrival_times,
+        think_times=think_times
     )
     
     all_records = [rec for sublist in results_list for rec in sublist]
@@ -483,7 +530,8 @@ def main():
     )
     parser.add_argument("--config", type=Path, required=True, help="Config file (YAML)")
     parser.add_argument("--model-id", type=str, default="meta-llama/Llama-2-13b-hf")
-    parser.add_argument("--djinn-server", type=str, default="localhost:5556")
+    parser.add_argument("--djinn-server", type=str, default="127.0.0.1:5556")
+    parser.add_argument("--trace-file", type=Path, default=None, help="Deterministic trace file (JSON)")
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -501,6 +549,14 @@ def main():
     logger.info(f"Model: {args.model_id}")
     logger.info(f"Server: {args.djinn_server}")
     
+    # Load trace if provided
+    trace_data = None
+    if args.trace_file is not None:
+        logger.info(f"Loading trace: {args.trace_file}")
+        with open(args.trace_file) as f:
+            trace_data = json.load(f)
+        logger.info(f"Loaded trace with {trace_data.get('n_agents', 0)} agents")
+    
     # Initialize Djinn
     logger.info("Initializing Djinn client...")
     ensure_initialized_before_async(args.djinn_server)
@@ -512,7 +568,7 @@ def main():
     
     # Run experiment
     try:
-        payload = asyncio.run(run_poisson_experiment(args, coordinator, config))
+        payload = asyncio.run(run_poisson_experiment(args, coordinator, config, trace_data))
     except Exception as e:
         logger.error(f"Experiment failed: {e}", exc_info=True)
         sys.exit(1)

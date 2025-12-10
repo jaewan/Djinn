@@ -509,7 +509,7 @@ def main_sync():
     parser.add_argument("--skip-vllm", action="store_true")
     parser.add_argument("--skip-djinn", action="store_true")
     parser.add_argument("--gpu-index", type=int, default=0, help="GPU index for VRAM sampling")
-    parser.add_argument("--server", type=str, default="localhost:5556", help="Djinn server address")
+    parser.add_argument("--server", type=str, default="127.0.0.1:5556", help="Djinn server address")
 
     args = parser.parse_args()
 

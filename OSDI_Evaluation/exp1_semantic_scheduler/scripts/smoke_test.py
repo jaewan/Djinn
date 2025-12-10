@@ -351,7 +351,7 @@ def main():
     logger.info("\n\n" + "="*80)
     logger.info("STEP 5: Djinn Baseline (N=10)")
     logger.info("="*80)
-    logger.info("Note: Requires Djinn server running on localhost:5556")
+    logger.info("Note: Requires Djinn server running on 127.0.0.1:5556")
     
     # Try to start Djinn server (python -m djinn.server.server_main)
     logger.info("Attempting to start Djinn server (python -m djinn.server.server_main)...")

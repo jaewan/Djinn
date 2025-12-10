@@ -30,6 +30,7 @@ class MessageType(IntEnum):
     EXECUTE_WITH_BREAKPOINT = 0x0F  # ✅ NEW: Execute with mid-inference breakpoint (Exp3)
     SIGNAL_PHASE = 0x10  # ✅ NEW: Semantic phase signal (IO_WAIT, COMPUTE)
     RESUME_FROM_CHECKPOINT = 0x11  # ✅ NEW: Resume execution from checkpoint (activation steering)
+    GET_CAPABILITIES = 0x12  # ✅ NEW: Query server capabilities (for client initialization)
 
     # Error response
     ERROR = 0xFF

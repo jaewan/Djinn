@@ -1,59 +1,132 @@
 \section{Introduction}
 
-The economics of AI infrastructure are driving a fundamental architectural reversion: the return of the mainframe. With individual NVIDIA GB200 NVL72 racks commanding \$52–65 million—comparable to the inflation-adjusted cost of an IBM System/370—the era of the personal high-performance workstation has ended. This capital concentration necessitates a return to time-sharing, where thousands of users via "thin clients" (laptops) borrow compute from a centralized pool.
 
-However, the software abstractions governing these clusters have failed to adapt to the dominant mode of AI development: \textit{interactive exploration}. Data scientists and researchers work in tight, human-speed loops—debugging model internals, testing hypotheses, and visualizing activations. 
-Similarly, emerging Reasoning Agents exhibit identical patterns: they interleave bursty GPU generation with long-latency I/O (tool execution), leaving accelerators idle during these "machine think-times".
-Unlike static production workloads, these tasks require the flexibility to execute arbitrary code combined with the elasticity to acquire resources in milliseconds.
+We contend that here we require a similar abstract which we call "Tensor Process". Then say what are the challenges... Then say how we address them..."} 
 
-Current infrastructure forces a bifurcation that leaves interactive workloads behind.
-Production serving systems like vLLM~\cite{vllm} achieve high throughput via closed-loop execution: 
-the system owns the execution loop, treating the model as a static appliance.
-While they employ sophisticated paging, they rely on static execution graphs, lacking the semantic visibility to handle the arbitrary control flow, external tool usage, or state intervention required for research.
-Conversely, cluster schedulers like Ray~\cite{ray} or Kubernetes~\cite{kubernetes} support arbitrary code but enforce coarse-grained batch semantics: users must reserve exclusive GPUs. 
-This leads to the "parking lot" problem, where expensive accelerators sit idle while users think and type, resulting in average cluster utilization of 55--60\%~\cite{gao2024empirical}.
-
-Enabling interactive exploration on shared accelerators requires more than simply disaggregating resources.
-Existing disaggregation approaches~\cite{rcuda,dxpu,bitfusion} fail because they perform physical rather than logical virtualization.
-As computation descends the software stack—from the deep learning framework, through the runtime, down to the driver and hardware—crucial semantic intent is stripped away~\cite{hong2025lost}.
-Consequently, when a user pauses to "think," the remote GPU remains locked to hold their memory, solving nothing.
-A PyTorch program understands that model weights are immutable and shared, while a KV-cache is session-private state. It knows when an operation is part of a long-lived prefill versus a short decode step. By the time these operations reach the driver, however, they have been flattened into opaque buffers and kernel launches. 
-Lacking the high-level distinction between 'active computation' and 'interactive think-time', the driver is forced into a conservative posture: it must pin gigabytes of KV-cache in VRAM during minutes of user inactivity simply because the memory handle remains open. Similarly, without knowledge of model identity, it redundantly transfers identical weights for different users, unable to implement the shared-memory deduplication standard in modern OSes.
-
-We argue that enabling efficient interactivity on shared accelerators requires a new abstraction: the \textbf{Tensor Process}.
-Just as a Unix process virtualizes the CPU and RAM via Code, Heap, and Stack segments, a Tensor Process must virtualize the distinct semantic components of Deep Learning—Model Weights (Text), KV Caches (Data), and Activations (Stack).
-This abstraction allows the system to manage memory lifecycles independently, enabling multiple sessions to time-share a single accelerator without thrashing.
-
-We present \sys, a framework-level Tensor Operating System designed for this abstraction.
-\sys bridges the semantic gap by interposing at the PyTorch dispatch layer, treating tensor operations as system calls.
-It exposes a virtual tensor device to PyTorch: user code issues ordinary tensor operations against what appears to be a local accelerator, while \sys maps those operations and tensors onto remote GPU resources and physically multiplexes computations across a disaggregated cluster.
-It introduces three OS primitives to the deep learning stack.
-
-First, Lazy Evaluation via \textit{Semantically Rich Graph (SRG)}.
-\sys acts as a semantic hypervisor, intercepting tensor operations and immediately returning a \textit{LazyTensor}—a virtual handle—without executing code or moving data.
-This decouples the logical definition of computation from its physical execution. \sys records these operations into a \textit{Semantically Rich Graph (SRG)}, which captures tensor lifecycles and execution phases (e.g., prefill vs. decode). 
-This allows the scheduler to optimize allocation globally, prefetching data for active phases and proactively swapping out idle sessions based on code structure.
-The heavy lifting of graph capture, serialization, and remote execution is handled transparently, enabling features like \textit{Lazy I/O}, where \sys returns lightweight skeleton references and transfers concrete data only when the user explicitly inspects it.
-%This graph drives a semantic scheduler that interleaves requests from multiple tenants, prioritizing interactive latency while maximizing throughput. SRG informs placement decisions: which tensors remain in the GPU and which are materialized or spilled, allowing \sys to co-locate long-lived state with compute. Additionally, the LazyTensor abstraction enables Lazy I/O: \sys returns lightweight "skeleton" references for complex results, transferring concrete data only when the user explicitly accesses it (e.g., printing a value).
+Modern AI infrastructure development has largely been driven by two dominant use cases.
+On one end, today's training clusters operate as monolithic supercomputers focused on maximizing throughput over large input datasets.
+On the other end, inference services are typically deployed as massively parallel, decoupled service pools optimized for high-throughput and low-latency batch processing.
 
 
-Second, memory segmentation via \textit{Unified Virtual Memory Unit (VMU)}.
-To realize Tensor Process, \sys partitions GPU memory into semantic segments defined by their lifecycle, mirroring Unix memory model.
-Guided by the SRG, it maps immutable weights to a shared \textit{Text Segment}, session-private KV caches to a swappable \textit{Data Segment}, and ephemeral activations to a volatile \textit{Stack Segment}. 
-Crucially, the Stack Segment employs a watermark-based reset, guaranteeing zero external fragmentation for intermediate computations.
-This allows \sys to context-switch at the granularity of individual operations, solving the "parking lot" problem: users retain logical session state without locking physical compute.
+Receiving comparatively little attention, a third important workload class has emerged as a critical bottleneck in AI infrastructure, \emph{stateful interactive workloads}.
+Consider the experience of an MLOps engineer or data scientist developing or debugging a model.
+She connects to a remote GPU environment within a Jupyter Notebook.
+The initial resource allocation grants her exclusive access to a high-end accelerator, e.g., an NVIDIA H100, consuming tens of thousands of dollars per year in operational costs.
+However, her workflow is inherently sporadic: she spends minutes writing a few lines of $\texttt{PyTorch}$ code, then triggers a small model execution or a quick data preprocessing job that lasts perhaps thirty seconds.
+While the model runs, the expensive GPU's SM utilization spikes momentarily, but for the remaining minutes of the session---as she analyzes the output tensors, consults documentation, or steps through code in a debugger---the device sits virtually idle, with GPU utilization hovering near 0\%.
+Similar patterns of interaction can be observed in services like GPU-backed databases or reasoning agents that execute multi-step, tool-augmented workflows, among others.
 
-Third, Latency-hiding Virtualization via \textit{Ghost Loading}. 
-To virtualize access to massive models, \sys implements Ghost Loading. 
-Clients instantiate zero-memory "ghost" modules; 
-the server maps physical weights into the shared Text Segment.
-Unlike general-purpose demand paging which reacts to page faults or relies on spatial locality heuristics, \sys leverages the SRG's deterministic lookahead to perfectly pipeline memory transfers with computation.
-By treating the Text Segment as a streaming ring buffer, \sys prefetches future layers over PCIe synchronously while the GPU computes the current layer, effectively hiding virtualization latency."
+Stateful interactive workloads are fundamentally different from training jobs that saturate compute or stateless serving requests that can be easily batched.
+They require massive, persistent VRAM allocation (for model weights and KV-cache) to maintain context, yet they exhibit significant \textit{temporal sparsity} due to I/O-bound delays---whether from a human thinking or an agent waiting for a tool execution or database query.
+During these idle intervals, expensive accelerators sit locked and unutilized, capping average cluster utilization to 55--60\% despite constant demand pressure~\cite{Gupta2023GPUUtilization}.
 
+The problem goes beyond traditional GPU multiplexing techniques, which tend to either be specialized for a specific workload and use case (e.g., transformer batch inference engines like vLLM and SGLang), or operate a low level (e.g., MIG~\cite{MIG}, BitFusion~\cite{bitfusion}, and DxPU~\cite{dxpu}), losing critical semantic information and resulting in extreme inefficiencies.
+In particular, we identify three interconnected challenges that current systems fail to address simultaneously.
+
+\begin{packeditemize}
+\item The first is identifying when to retain and when to evict state.
+ML applications ingest, manipulate, and generate massive amounts of data.
+Depending on the usage of the data, evicting it during idle periods to make room for other workloads can destroy interactivity, while keeping it may hamstring the capacity to run other workloads.
+
+\end{packeditemize}
+
+For general programs, 
+
+
+Interactive workloads, the context (KV-cache) can grow to gigabytes.
+
+Disaggregation requires systems to swap in and out 
+
+First, there is the thinking problem.
+Disaggregation requires context switching.
+However, for 
+Evicting this state during idle periods destroys interactivity (latency); keeping it pins the GPU (waste).
+A viable system must distinguish \emph{semantic state} (private KV-cache) from \emph{static state} (weights) to manage them with different policies.
+
+Second, the capacity challenge.
+Effective bin-packing is impossible if a single model consumes 90\% of a GPU's VRAM. To enable true multi-tenancy, the system must virtualize memory capacity, allowing workloads to exceed physical VRAM limits (e.g., running a 70B model on a 24GB GPU) without crashing, by treating model weights as a streamable resource rather than a static allocation.
+
+Third, the semantic gap challenge.
+Hardware-level virtualization (MIG, MPS) provides isolation but lacks semantic awareness. Neither do lower-level disaggregation systems ~\cite{rcuda,bitfusion,dgsf}. It cannot distinguish between a shareable weight tensor and a private activation tensor. Without this distinction, the system cannot safely deduplicate memory across users, forcing redundant allocations that limit tenancy density.
+
+
+Rather, what we would like to do is decouple (that is to say, disaggregate) the execution context from the physical hardware.
+By doing so, a system could theoretically interleave thousands of bursty sessions onto a small pool of devices.
+However, realizing this vision requires solving three interconnected challenges that current GPU disaggregation~\cite{rcuda} and batch serving systems~\cite{vllm} fail to address simultaneously.
+
+
+
+Existing solutions trade off one requirement for another. 
+Batch inference engines like vLLM and Orca optimize for throughput via continuous batching but treat requests as stateless, precluding the persistent session state required for debugging or agentic loops.
+Offloading systems like DeepSpeed and FlexGen address the capacity challenge via CPU offloading, but prioritize bandwidth-optimal blocking transfers that destroy interactive latency.
+Finally, remote GPU primitives like rCUDA and Ray disaggregate execution but not state management, effectively moving the "memory lock" to a remote server rather than eliminating it.
+
+We present \sys, a framework-level runtime that virtualizes GPU resources with semantic awareness.
+\sys interposes at PyTorch's dispatch layer, intercepting tensor operations before they reach GPU drivers. To user code, \sys exposes what appears to be a local GPU; internally, it multiplexes sessions across a shared accelerator pool by exploiting lifecycle semantics.
+
+\vl{Is the key idea the tensor process or the SRG?}
+\vl{types determined automatically thorugh SRG}
+\sys introduces the \texttt{Tensor Process},
+an execution context with a segmented virtual address space inspired by Unix process memory layout.
+A Tensor Process partitions accelerator memory into three semantically-defined segments: a shared \textit{Text segment} for immutable weights (enabling O(1) deduplication across sessions), a private \textit{Data segment} for session-scoped state like KV-caches (the unit of swapping), and a volatile \textit{Stack segment} for ephemeral activations (managed via watermark reset for zero fragmentation). 
+
+However, implementing this abstraction over high-latency interconnects (PCIe/Ethernet Network) introduces severe performance penalties. Naively paging 70B parameters or swapping gigabytes of KV-cache during interactive loops would render the system unusable. To bridge this performance gap, \sys introduces three architectural mechanisms that exploit the specific access patterns of deep learning:
+
+First, Adaptively Virtualized Text Segment via Skip-End Ring Buffering:
+To address the Capacity Challenge, \sys implements the Text Segment as a hybrid resource.
+Rather than naively streaming all weights (which is PCIe-bound), we introduce \textit{Adaptive Virtualization}: latency-critical parameters (embeddings, early layers) are pinned in VRAM, while deep layers are managed via a \textit{Skip-End Ring Buffer}. This mechanism streams weights layer-by-layer in a circular buffer, using "skip-end" allocation to prevent tensor fragmentation at wrap boundaries. By overlapping compute with prefetching via async dual-stream pipelining, \sys enables a 24GB GPU to execute 140GB models with a 59$\times$ speedup over standard offloading, throttling gracefully to PCIe speeds only when necessary.
+%not as a static allocation, but as a streaming resource. We introduce a \textit{Skip-End Ring Buffer} that treats model weights as a continuous data stream. Unlike traditional demand paging which incurs random access overhead, the Ring Buffer prefetches layer weights in a circular sequential pattern. The "Skip-End" allocator guarantees that tensor boundaries never straddle the buffer wrap-point, eliminating memory-copy overhead during kernel launches. This allows a 24GB GPU to execute a 70B parameter model (140GB) by streaming weights at line-rate, virtualization that is transparent to the user.
+
+Second, Semantic Scheduling of the Data Segment:
+To address the Density Challenge, \sys decouples "thinking" from "resident memory." We introduce \textit{Compact Session Arenas}, which reduce the per-session static kernel footprint from 300MB to 64MB, minimizing the cost of dormancy.
+For dynamic state, \sys employs a \textit{Hierarchical Signal} mechanism—ranging from explicit system calls to implicit hooks in agent libraries (e.g., \texttt{LangChain.Tool.run()})—to predict "IO-Wait" phases.
+Upon detecting a tool execution, \sys proactively swaps the private Data Segment to pinned host memory and schedules a prefetch based on estimated task duration. This allows \sys to interleave 80 concurrent agents on a single GPU where baselines OOM at 48.
+%To address the Think Problem, \sys replaces reactive LRU swapping with \textit{Semantic Phase Detection}. By hooking into the agent framework's control flow (e.g., \texttt{tool.run()} or \texttt{await}), \sys identifies "IO-Wait" phases where the GPU will be idle. It proactively evicts the private Data Segment (KV-cache) to host memory \textit{before} the timeout occurs, and schedules a prefetch based on estimated task duration. This cooperative multitasking enables \sys to interleave independent agents on the same GPU without the cold-start latency of stateless serverless architectures.
+
+Third, Latency Hiding via Dual-Stream Pipelining:
+To mask the cost of streaming the Text Segment and swapping the Data Segment, \sys employs \textit{Async Dual-Stream Pipelining}. We decouple memory operations (DMA) from execution (Compute) into separate CUDA streams. By enforcing a strict dependency graph where Layer $N$'s compute overlaps with Layer $N+1$'s weight transfer and Layer $N+2$'s KV-cache prefetch, \sys saturates the PCIe bus while keeping the GPU compute units busy.
+
+\jw{one of above or below para for intro. not decided yet}
+
+Third, Zero-Copy Output Skeletonization.
+To mask network latency, \sys implements a \textit{Lazy Reference Engine}. Instead of eagerly returning massive tensors to the client, \sys performs \textit{Output Skeletonization}, returning lightweight handles (RemoteRefStubs) that preserve data structure (shapes, types) without moving bytes. Data flows over the network only upon explicit materialization (e.g., \texttt{.item()} or control flow), reducing read-back bandwidth by 99.7\% in interactive loops.
 
 Our evaluation shows that \sys enables new regimes of interactivity and efficiency. For reasoning agents, \sys eliminates the "parking lot" effect, scaling concurrent sessions by ×× over batch schedulers by transparently swapping state during tool execution. 
 For heterogeneous pipelines, \sys runs multi-model workflows (e.g., Audio-LLM-Vision) on a single GPU that would otherwise OOM, by dynamically paging "Text Segments." \sys demonstrates that by lifting OS primitives into the framework layer, we can transform the GPU cluster from a rigid batch processor into a flexible interactive utility.
 
+\section{A Case for Framework-Level Disaggregation}
+\label{sec:motivation}
+
+Efficient disaggregation requires answering three fundamental resource management questions for every operation:
+\begin{enumerate}
+    \item \textbf{Life Cycle \& Residency:} Is this tensor ephemeral (activations), session-scoped (KV-cache), or globally shared (weights)?
+    \item \textbf{Locality:} Should the computation move to the data (e.g., near a KV-cache), or should the data move to the computation?
+    \item \textbf{Scheduling:} Does the dataflow allow for latency masking via pipelining or prefetching?
+\end{enumerate}
+
+These are not merely optimization flags; they are semantic properties inherent to the workload. In this section, we demonstrate that the \textit{semantic translation gap} prevents lower layers from answering these questions, identifying the framework layer as the unique "narrow waist" capable of driving a Tensor Operating System.
+
+\subsection{The Challenges of Temporal Sparsity}
+\label{sec:interactive_crisis}
+
+AI workloads are bifurcating. While training and bulk serving maximize compute density, interactive workloads exhibit extreme \emph{temporal sparsity}: distinct periods of high-intensity compute interspersed with long periods of idleness (``think time'').
+Existing infrastructure handles this pathology poorly where a user must reserve a physical accelerator for the entire duration of a session, regardless of actual utilization resulting in a duty cycle of $<1\%$.  
+This sparsity originates from two structural shifts in the workloads that break the assumptions of traditional batch schedulers.
+
+\paragraph{Human-in-the-Loop: The Notebook Granularity Mismatch.}
+The Jupyter notebook, the de facto interface for AI research, interacts inefficiently with monolithic schedulers. A researcher debugging Llama-3-70B requires exclusive allocation of two NVIDIA H100-80GB GPUs to satisfy the model's memory footprint.
+However, the execution model is fragmented: computation occurs in cells—small, sporadic graph fragments—while the Python kernel maintains persistent state for hours.
+Because the scheduler cannot distinguish between ``holding state'' and ``computing,'' the researcher is forced to lock 140GB of HBM and 4,000 TFLOPS of compute during minutes of code modification.
+This "parking lot" behavior prevents the cluster from reclaiming the accelerator's compute units for other pending jobs, artificially inflating the scarcity of high-end hardware.
+
+\paragraph{Machine-in-the-Loop: Agentic Workflows.}
+Emerging \textit{Reasoning Agents} accelerate this pattern: they interleave bursty GPU generation with I/O-bound tool execution in rapid loops.
+Agents execute stateful loops: \textit{Reason(GPU) → Act(Tool/IO) → Observe(GPU)}.
+During the I/O-bound ``Act'' phase (e.g., querying a database), the GPU execution units are idle.
+However, standard serverless abstractions (e.g., K-Serve) fail here because they conflate idleness with termination as they are stateless where agents have session dependency.
+Releasing the GPU during the ``Act'' phase forces a full flush of the session's KV-cache (State).
+When the agent returns to ``Observe,'' the system must pay a prohibitive Cold Start Tax: reloading weights and re-computing the entire history.
+This forces architects into a false choice: reserve the GPU (wasting compute) or recompute state (wasting latency).
 
 %Emerging \textit{AI Agents} exhibit identical structural sparsity but at higher frequency. Unlike stateless HTTP inference requests, Agents execute stateful loops: \textit{Reason → Act → Observe}.
 %An agent might generate a plan on the GPU (Reason), execute a remote tool or database query (Act), and wait for the result (Observe).
@@ -79,18 +152,17 @@ At the \textbf{Hardware Layer} (PCIe/NVLink), context is erased. The system obse
 
 This blindness forces lower-layer systems into conservative behaviors. Unable to identify which data is shareable (Weights) versus private (KV), a driver-level system must enforce strict process isolation. It cannot deduplicate weights across tenants, nor can it migrate an interactive session without copying the entire VRAM context---even if the active state is only a fraction of the allocated memory.
 
-\subsection{The Cost of Agnosticism}
+%\subsection{The Cost of Agnosticism}
+%We quantify the impact of this semantic blindness across three representative workloads.
 
-We quantify the impact of this semantic blindness across three representative workloads.
+%\paragraph{LLM Serving (Residency \& Locality).}
+%LLMs are defined by state management. Weights are immutable/shared; KV-caches are private/growing; activations are ephemeral. A driver-level system (e.g., rCUDA~\cite{rcuda}) sees only memory writes. To serve 50 users, it must allocate 50 copies of the weights, exhausting cluster memory. In contrast, a framework-aware system identifies the \textbf{Residency} of weights as "Global/Read-Only" and KV-caches as "Session/Private." In our benchmarks (GPT-J), this semantic caching reduces the memory footprint for 50 concurrent sessions by \jw{todo}.
 
-\paragraph{LLM Serving (Residency \& Locality).}
-LLMs are defined by state management. Weights are immutable/shared; KV-caches are private/growing; activations are ephemeral. A driver-level system (e.g., rCUDA~\cite{rcuda}) sees only memory writes. To serve 50 users, it must allocate 50 copies of the weights, exhausting cluster memory. In contrast, a framework-aware system identifies the \textbf{Residency} of weights as "Global/Read-Only" and KV-caches as "Session/Private." In our benchmarks (GPT-J), this semantic caching reduces the memory footprint for 50 concurrent sessions by \jw{todo}.
+%\paragraph{Computer Vision (Scheduling).}
+%Convolutional networks exhibit strict sequential dataflow ($L_1 \rightarrow L_2 \rightarrow L_3$). A driver-level system sees independent kernels and forces sequential execution to ensure safety. Framework visibility exposes the dependency chain, allowing the system to automate \textbf{Scheduling} decisions like pipeline parallelism. \jw{Update to newer models}On ResNet-50, overlapping communication with computation reduces latency by \jw{todo}.
 
-\paragraph{Computer Vision (Scheduling).}
-Convolutional networks exhibit strict sequential dataflow ($L_1 \rightarrow L_2 \rightarrow L_3$). A driver-level system sees independent kernels and forces sequential execution to ensure safety. Framework visibility exposes the dependency chain, allowing the system to automate \textbf{Scheduling} decisions like pipeline parallelism. \jw{Update to newer models}On ResNet-50, overlapping communication with computation reduces latency by \jw{todo}.
-
-\paragraph{Recommendation Systems (Access Patterns).}
-Embedding lookups follow a Zipfian distribution. A hardware-level system sees random access and defaults to LRU eviction. The framework layer observes embedding IDs, enabling value-based caching that pins "hot" rows. This semantic caching reduces average lookup latency by \jw{todo, maybe cut this}.
+%\paragraph{Recommendation Systems (Access Patterns).}
+%Embedding lookups follow a Zipfian distribution. A hardware-level system sees random access and defaults to LRU eviction. The framework layer observes embedding IDs, enabling value-based caching that pins "hot" rows. This semantic caching reduces average lookup latency by \jw{todo, maybe cut this}.
 
 \subsection{The Design Space}
 
@@ -109,21 +181,21 @@ While efficient, this approach is Black-Box: it restricts users to a fixed API, 
 \begin{table}[t]
 \centering
 \small
-\caption{The Framework layer balances semantic visibility with application generality.}
-\label{tab:design_space}
 \begin{tabular}{@{}lcccc@{}}
 \toprule
-\textbf{Layer} & \textbf{Semantic} & \textbf{Multi-} & \textbf{Stable} & \textbf{Zero} \\
-& \textbf{Visibility} & \textbf{Tenancy} & \textbf{API} & \textbf{Code} \\ \midrule
+\textbf{Layer} & \textbf{Semantic} & \textbf{Multi-} & \textbf{Stable} & \textbf{Trans-} \\
+& \textbf{Visibility} & \textbf{Tenancy} & \textbf{API} & \textbf{parency} \\ \midrule
 Hardware & None & Low & Yes & Yes \\
 Driver & Low & Low & No & Yes \\
 Application & High & High & N/A & No \\
 \textbf{Framework} & \textbf{High} & \textbf{High} & \textbf{Yes} & \textbf{Yes} \\ \bottomrule
 \end{tabular}
+\caption{The Framework layer balances semantic visibility with application generality.}
+\label{tab:design_space}
 \end{table}
 
 \paragraph{Framework (The Semantic Narrow Waist).}
-The ML framework acts as the "narrow waist" of the stack. It observes graph structures and tensor lifecycles (High Visibility) yet intercepts operations via standard dispatch mechanisms (High Generality). It abstracts hardware, allowing one codebase to support NVIDIA, AMD, or TPU backends. This is the optimal layer for a Tensor OS.
+The ML framework acts as the "narrow waist" of the stack. It observes graph structures and tensor lifecycles (High Visibility) yet intercepts operations via standard dispatch mechanisms (High Generality). It abstracts hardware, allowing one codebase to support NVIDIA, AMD, or TPU backends. This is the optimal layer for a disaggregation.
 
 
 \subsection{Design Requirements}
@@ -132,7 +204,7 @@ To realize a Tensor Operating System at the framework layer, \sys targets five s
 
 \begin{itemize}
     \item \textbf{Transparent Capture:} Infer semantic intent (phases, lifecycles) from standard PyTorch code without manual user annotation.
-    \item \textbf{Virtualization:} Decouple logical tensors from physical memory. Data should never move to the client unless explicitly accessed ("Zero Data Movement").
+    \item \textbf{Virtualization:} Decouple logical tensors from physical memory. Data should never move to the client unless explicitly accessed ("On-Demand Paging: Data moves only when semantically required").
     \item \textbf{Zero-Fragmentation:} Manage remote memory to eliminate external fragmentation while enforcing session isolation (addressing the Residency decision).
     \item \textbf{Failure Resilience:} Detect and recover from remote failures at the tensor operation boundary.
     \item \textbf{Interactive Latency:} Mask network latency via lookahead scheduling to approach local execution speeds for interactive use.
@@ -140,8 +212,254 @@ To realize a Tensor Operating System at the framework layer, \sys targets five s
 
 Existing systems fail at least two of these. \sys satisfies all five.
 
+\section{\sys Design}
+\label{sec:design}
+
+To bridge the semantic translation gap identified in \S\ref{sec:motivation}, \sys adopts a \texttt{Split-Process Architecture} that decouples the logical definition of tensor programs from their physical execution.
+This separation enables the server to function as a \texttt{Semantic Hypervisor}---managing GPU memory not as a flat byte array, but as a structured address space composed of semantically-classified tensor segments. Figure~\ref{fig:arch} illustrates the architecture.
+
+\begin{figure}[t]
+    \centering
+    % \includegraphics[width=\linewidth]{figures/architecture.pdf}
+    \caption{Architecture overview illustrating the separation between the Trace Process (Client) and the Kernel Process (Server).}
+    \label{fig:arch}
+\end{figure}
+
+
+\sys partitions execution across two processes connected by a binary RPC protocol:
+
+\begin{itemize}
+    \item \textbf{Trace Process (Client).} A lightweight Python process that executes no GPU kernels. It intercepts tensor operations via PyTorch's dispatch mechanism, constructing a Semantically Rich Graph (SRG)---a DAG annotated with tensor classifications and phase markers. The client maintains zero GPU memory; models exist as ``ghost'' structures backed by meta-tensors.
+    
+    \item \textbf{Kernel Process (Server).} A centralized resource manager holding the physical CUDA context. It receives SRGs, performs meta-simulation to generate static memory plans, and executes computation on behalf of multiple Trace Processes. The server manages GPU memory through a \textbf{Unified Virtual Memory Unit (VMU)} that partitions VRAM into semantically-typed segments.
+\end{itemize}
+
+This split enables the key invariant: the server possesses semantic context that would be lost at lower abstraction layers, allowing optimizations impossible for driver-level or hardware-level disaggregation.
+
+\subsection{The Tensor Process Abstraction}
+\label{ssec:tensor_process}
+We define a \textbf{Tensor Process} as an execution context characterized by a \textit{segmented semantic address space}.
+Unlike Unix processes that view memory as a flat virtual address space, a Tensor Process partitions accelerator memory into three segments with distinct ownership, mutability, and lifetime properties:
+
+\paragraph{Text Segment (Global, Read-Only).} Stores model parameters. Since weights are immutable during inference, the VMU maps a single physical copy into the virtual address space of all sessions using the same model, achieving $O(1)$ memory deduplication. For models exceeding physical VRAM, this segment operates as a streaming ring buffer (\S\ref{ssec:impl_ring}).
+
+\paragraph{Data Segment (Private, Persistent).} Stores session-scoped state---primarily KV-caches, but also RNG seeds and user-defined persistent tensors. This segment defines the process's ``working set'' and is the unit of swapping: during idle periods, the scheduler evicts the entire Data Segment to pinned host memory, freeing VRAM while preserving session continuity.
+
+\paragraph{Stack Segment (Shared, Volatile).} Stores intermediate activations. Because activations have strictly nested lifetimes within a forward pass, \sys manages this segment via a linear watermark allocator. The stack pointer resets at request boundaries, guaranteeing zero external fragmentation. The Stack is a \textit{shared resource}: sessions acquire exclusive access for the duration of their execution burst.
+
+\subsubsection{Tensor Classification}
+The system must classify each tensor into its appropriate segment. \sys employs a three-rule classification hierarchy applied during SRG construction:
+
+\noindent\textbf{Rule 1: Parameter Detection.} Tensors accessed via \texttt{nn.Module.parameters()} or \texttt{nn.Module.buffers()} are classified as Text. The client traverses the model's parameter registry during ghost loading and tags these tensors with a \texttt{PARAM} lifecycle marker.
+
+\noindent\textbf{Rule 2: Mutation Tracking.} Tensors created during forward execution that persist across multiple forward calls are classified as Data. \sys detects this via liveness analysis: if a tensor is written in pass $N$ and read in pass $N+1$ (e.g., KV-cache), it is promoted from Stack to Data. The client maintains a session-scoped tensor registry; tensors appearing in this registry across materialization boundaries are tagged \texttt{PERSISTENT}.
+
+\noindent\textbf{Rule 3: Default Ephemeral.} All remaining tensors---primarily activations---are classified as Stack. These tensors are created and consumed within a single forward pass.
+
+This classification is deterministic and requires no user annotation. The rules are applied in order; a tensor matching multiple rules takes the first classification. The result is encoded in the SRG as a \texttt{lifecycle} field on each tensor node.
+
+\subsection{The Semantically Rich Graph (SRG)}
+\label{subsec:srg}
+
+The SRG is the intermediate representation transmitted from client to server, capturing both the computation DAG and the semantic metadata required for optimization. Each SRG node contains the standard PyTorch operator and arguments, augmented with a \texttt{lifecycle} tag (Text/Data/Stack) derived from the classification rules, and a \texttt{phase} marker.
+
+\sys infers execution phases from graph structure to inform memory budgeting. For example, phase prefill is detected when the sequence dimension of attention inputs exceeds 1 and the KV-cache is being populated; phase decode is detected when the sequence dimension is 1 and the KV-cache is read. 
+Operations outside known patterns default to phase generic. These hints allow the scheduler to allocate higher activation memory for prefill (parallel attention) versus higher KV-capacity for decoding.
+
+%\paragraph{Example.} For $y = \text{softmax}(\text{matmul}(x, W) + b)$:
+%\begin{verbatim}
+%Node 0: {op: "aten::matmul", inputs: [x, W], lifecycle: STACK, phase: GENERIC}
+%Node 1: {op: "aten::add", inputs: [Node0, b], lifecycle: STACK}
+%Node 2: {op: "aten::softmax", inputs: [Node1], lifecycle: STACK}
+%\end{verbatim}
+%Here, $W$ and $b$ are external inputs classified as TEXT (parameters); $x$ may be TEXT (embedding) or STACK (intermediate); all outputs are STACK.
+
+\subsection{Meta-Simulation and Memory Planning}
+\label{subsec:meta_sim}
+
+Before execution, the server performs \texttt{meta-simulation}: a symbolic execution of the SRG on PyTorch's \texttt{meta} device to compute shapes and dtypes without physical allocation. 
+This phase transforms the high-level computation graph into a deterministic \texttt{Memory Plan}, mapping every tensor $t$ to a tuple $(\text{segment}, \text{offset}, \text{size})$.
+
+The meta-simulator traverses the SRG in topological order using PyTorch's meta-device backend to resolve output shapes and data types without allocating storage. It maintains virtual instruction pointers for the Data and Stack segments. 
+For each node, the simulator aligns the requested size to 256 bytes, assigns a virtually contiguous offset from the appropriate segment pointer, and advances the pointer. Crucially, the simulator simultaneously tracks liveness; as it traverses the graph, it tracks reader counts for ephemeral Stack tensors. Once a tensor's consumer count reaches zero, its memory range is marked available for reuse by subsequent operations.
+This process eliminates the overhead of runtime memory management. By resolving all addresses a priori, \sys replaces expensive \texttt{cudaMalloc} and \texttt{cudaFree} calls with zero-cost pointer arithmetic against pre-allocated arenas.
+
+While robust, symbolic execution incurs a latency cost (10--50ms) that is prohibitive for interactive loops. To amortize this, \sys implements \textbf{Structural Plan Caching}. The server caches memory plans keyed by a fingerprint of the SRG structure and input shapes. In iterative workloads like autoregressive decoding or agentic loops, the cache hit rate approaches 100\%, reducing the per-step scheduling overhead to $<10 \mu s$ server-side dispatch latency. For operators with data-dependent output shapes (e.g., \texttt{nonzero}, \texttt{unique} which are often control flow points), where static analysis is impossible, \sys falls back to conservative maximum-bound allocation or eager materialization.
+
+
+%\begin{verbatim}
+%MemoryPlan := {
+%  stack_layout: Dict[NodeId, (offset, size)],
+%  data_layout: Dict[NodeId, (offset, size)],
+%  peak_stack: int,   // Maximum Stack bytes needed
+%  peak_data: int     // Maximum Data bytes needed
+%}
+%\end{verbatim}
+
+%\paragraph{Algorithm.} The meta-simulator walks the SRG in topological order. For each node:
+%\begin{enumerate}
+%    \item Execute the operation on meta-tensors to determine output shape.
+%    \item Compute $\text{size} = \text{numel}(\text{shape}) \times \text{sizeof}(\text{dtype})$, aligned to 256 bytes.
+%    \item For STACK tensors: assign to current stack pointer; increment pointer.
+%    \item For DATA tensors: assign to current data pointer; increment pointer.
+%    \item Track liveness: when all consumers of a STACK tensor are processed, that tensor's memory can be reused (dead %tensor elimination).
+%\end{enumerate}
+
+
+
+\subsection{Semantic Scheduling}
+\label{subsec:scheduling}
+\sys employs a cooperative, phase-aware scheduler to multiplex sessions onto the shared GPU. Unlike preemptive OS schedulers that slice time based on clock interrupts, \sys slices time based on semantic boundaries inherent to the workload. The scheduler models each session as a state machine transitioning between four states: \textsc{Queued}, \textsc{Running}, \textsc{IO\_Wait}, and \textsc{Swapped} (Table~\ref{tab:transitions}).
+
+\begin{table}[t]
+    \centering
+    \small
+    \caption{Scheduler State Transitions.}
+    \label{tab:transitions}
+    \begin{tabularx}{\columnwidth}{@{}l X@{}}
+        \toprule
+        \textbf{Signal} & \textbf{Transition Logic} \\
+        \midrule
+        \texttt{SRG\_SUBMIT} & \textsc{Idle} $\to$ \textsc{Queued}. Session waits for Stack availability. \\
+        \midrule
+        \texttt{STACK\_GRANT} & \textsc{Queued} $\to$ \textsc{Running}. Scheduler grants exclusive Stack lock. \\
+        \midrule
+        \texttt{COMPLETE} & \textsc{Running} $\to$ \textsc{Queued} (if more compute) or \textsc{IO\_Wait} (if finished). \\
+        \midrule
+        \texttt{IO\_WAIT} & \textsc{Running} $\to$ \textsc{IO\_Wait}. Triggered by explicit client hint or idle timeout. \\
+        \midrule
+        \texttt{EVICT} & \textsc{IO\_Wait} $\to$ \textsc{Swapped}. Data Segment moved to host via DMA. \\
+        \bottomrule
+    \end{tabularx}
+\end{table}
+
+\paragraph{The Serialized Stack Discipline.}
+A defining characteristic of \sys is the management of the Stack Segment as a serially-reusable resource. While the Data Segment (KV-cache) is space-shared, the Stack Segment (activations) is time-shared with strict mutual exclusion. At any instant, exactly one session holds the Stack lock to execute its SRG; all other sessions remain queued.
+
+This serialization is a deliberate architectural trade-off. In a naive multi-tenant system, allocating private activation space for $N$ concurrent sessions would rapidly fragment VRAM, reducing the maximum model size supportable. By serializing the Stack, \sys guarantees zero external fragmentation, allowing the full remaining VRAM to be dedicated to caching resident state for dormant agents. 
+
+A known limitation of run-to-completion scheduling is Head-of-Line (HoL) blocking, where a long-running ``prefill'' phase (e.g., processing 4K tokens) starves short ``decode'' requests.
+\sys addresses this via \textit{Budget-Aware Graph Fission}. The Meta-Simulator acts as a JIT compiler, profiling the SRG against a cost model. When a graph violates the latency budget ($\tau_{\max}$), it is topologically sorted and sliced into sub-graphs $G_1 \dots G_n$.
+
+The challenge is state preservation. Normally, intermediate activations live in the shared Stack and are lost upon lock release. \sys{} enforces \textbf{Boundary State Promotion}: the output tensors of $G_i$ which feed into $G_{i+1}$ are allocated in the user's \textit{Data Segment} rather than the shared \textit{Stack}. This effectively ``checkpoints'' the computation into the user's private memory, enabling the scheduler to safely release the global Stack lock between $G_i$ and $G_{i+1}$. This ensures that a long prefill phase is serviced as a sequence of small bursts, maintaining system responsiveness.
+
+\paragraph{Proactive State Management.}
+Transitions to the \textsc{IO\_Wait} state are triggered either by explicit hints (e.g., a client entering \texttt{tool.execute()}) or a configurable idle timeout (default 200ms). Unlike reactive systems that evict only on allocation failure, \sys uses these signals to perform \textit{cooperative swapping}. When a session signals a long wait, the scheduler asynchronously migrates its Data Segment to pinned host memory. If the client provides an \texttt{estimated\_resume\_ms} hint, the scheduler schedules a corresponding prefetch operation $\delta$ milliseconds before the expected wake-up, effectively hiding the PCIe transfer latency behind the agent's external I/O.
+
+
+\subsection{Design Rationale}
+\paragraph{Why segment by lifecycle rather than tensor type?} Lifecycle directly determines management policy. A KV-cache and a user-defined accumulator may have different types but identical lifecycles (session-persistent). Segmenting by lifecycle enables uniform policies: all Data Segment contents can be swapped together without tensor-specific logic.
+
+%\paragraph{Why a shared Stack rather than per-session Stacks?} Per-session Stacks would waste memory: if 80 sessions each reserve peak activation memory, the aggregate exceeds any practical VRAM. A shared Stack exploits the observation that sessions execute serially---only one needs activation memory at a time. The tradeoff is serialized compute, but individual forward passes complete in $<100$ms, making this acceptable for interactive workloads.
+
+\paragraph{Why cooperative rather than preemptive scheduling?} GPU preemption incurs high overhead (context save/restore, pipeline drain). Cooperative scheduling at semantic boundaries (request completion, barriers) achieves similar multiplexing with near-zero overhead. Sessions voluntarily yield at natural pause points; the scheduler never forcibly interrupts mid-computation.
+
+\jw{APPENDIX: text dump, missing details that may deserve in the paper. This is not a part of paper!}
+
+\subsection{Semantic Virtualization Primitives}
+
+\sys leverages semantic information not just for scheduling, but to fundamentally alter the memory footprint of interactive sessions.
+
+\paragraph{Ghost Modeling via Shape Semantics.}
+To decouple the client from the physical model size, \sys employs \textbf{Ghost Interception}. When a user loads a model (e.g., Llama-3-70B), the client captures only the \textit{Shape Semantics} on a \texttt{meta} device, consuming zero physical RAM.
+The weights are managed server-side in the \textit{Text Segment}. The SRG constructed on the client contains symbolic handles; the semantic link is established via a \textbf{Structural Fingerprint} ($\text{SHA256}(\text{Arch} \parallel \text{ParamNames})$) transmitted during the handshake. This allows a hardware-constrained client to define and drive execution for models exceeding local capacity by orders of magnitude.
+
+\paragraph{Selective Laziness via Materialization Triggers.}
+A challenge in graph-based execution is dynamic control flow. \sys addresses this through \textbf{Selective Laziness}. The client builds the SRG lazily until it encounters a \textit{Materialization Trigger}---an operation where semantic correctness requires a concrete value (e.g., \texttt{if tensor.any()}, \texttt{.item()}, or \texttt{.cpu()}).
+Upon hitting a trigger, the client flushes the current SRG to the server, waits for the specific scalar result, and resolves the control flow branch.
+This ensures that \sys handles dynamic Python logic correctly while maintaining large graph capture windows for the bulk of computation.
+The Client (Trace Process) uses Python's reference counting. When a LazyTensor goes out of scope (e.g., intermediate activations in a loop), its node in the SRG is eligible for pruning once it has been submitted to the server.
+When a Materialization Trigger occurs (or an implicit flush), the current SRG is serialized. Once the server acknowledges receipt, the client drops the graph nodes that are no longer reachable by active Python variable.
+To prevent unbounded graph growth during long-running sessions, \sys employs Liveness-Based Pruning. The SRG operates as a sliding window of the active dependency frontier; once a subgraph is submitted for execution and its leaf nodes are either materialized or dereferenced by the Python runtime, the client constructs a new SRG root, keeping the client-side memory footprint constant O(1) regardless of session duration.
+
+\paragraph{High-Density Session Arenas.}
+Standard deep learning frameworks incur high static overhead (approx.\ 300MB) per process for CUDA contexts. For 80 concurrent agents, this baseline overhead ($24$GB) would consume the entire GPU.
+\sys leverages the semantic distinction between \textit{Framework State} (Python objects) and \textit{Kernel State} (tensors). It implements \textbf{Session Arenas}: compact, 64MB pre-allocated regions in the \textit{Data Segment} that store only the essential semantic metadata required for the session.
+By stripping away the framework bloat and packing agents into these arenas, \sys reduces static overhead by $5\times$, enabling the high density observed in our evaluation.
+
+\subsection{Optimizing the Framework Overhead}
+A primary criticism of framework-level interposition is the latency of Python interpretation and graph analysis. \sys overcomes this via two semantic caching mechanisms that function analogously to hardware TLBs and Branch Predictors.
+
+\paragraph{Structural Plan Caching (The Tensor TLB).}
+Meta-simulation incurs a one-time cost (approx.\ 50ms) to resolve memory addresses. However, interactive workloads exhibit high \textit{Structural Locality}: an agent thinking for 100 steps generates 100 identical computation graphs, differing only in input token values.
+\sys implements a \textbf{Structural Plan Cache}, keyed by the tuple $\langle \text{ModelFingerprint}, \text{InputShapes}, \text{ControlFlowPath} \rangle$. On a cache hit, the scheduler bypasses simulation and retrieves pre-calculated memory offsets in $\mathcal{O}(1)$ time, reducing dispatch latency to $<0.5$ms.
+
+\paragraph{Phase-Aware Memory Budgeting.}
+Unlike static allocators, \sys dynamically resizes memory segments based on the semantic phase detected in the SRG.
+During the \textbf{Prefill Phase} (parallel processing), the system expands the \textit{Stack Segment} to accommodate large activation tensors.
+During the \textbf{Decode Phase} (serial generation), it shrinks the Stack to reclaim VRAM for the \textit{Data Segment} (KV-cache).
+This dynamic resizing allows \sys to support larger batch sizes than static drivers, which must pessimistically reserve memory for the worst-case phase.
+
+\paragraph{Output Skeletonization.}
+To eliminate serialization bottlenecks, \sys employs \text{Lazy Materialization}. Model outputs are not transmitted eagerly; instead, the client receives a ``Skeleton''---a lightweight structure (tuples/dicts) containing \textbf{RemoteRefStubs}. Bulk data transfer occurs only upon explicit access (e.g., \texttt{.item()}), reducing network traffic by 99.7\% in typical reasoning loops.
+o the user's private memory, enabling the scheduler to safely release the global Stack lock between $G_i$ and $G_{i+1}$. This ensures that a long prefill phase is serviced as a sequence of small bursts, maintaining system responsiveness.
+
+\paragraph{Semantic Reduction Routing}
+For bandwidth-heavy operations that produce small outputs (e.g., \texttt{torch.argmax}, \texttt{loss.item()}), \sys exploits operation semantics to perform \textit{Remote Reduction}. Instead of streaming the full tensor to the client for local reduction, the system ships the operator to the data, transmitting only the scalar result. 
+The semantic layer sees the operator is sum(). It knows the output is a scalar (4 bytes). It automatically routes the computation to the Server, and only sends back the 4 bytes.
+
+\textit{Granular Laziness via LazyTuples.} Operations that return collections (e.g., \texttt{split}, \texttt{topk}) return \textit{LazyTuples}, which defer materialization of individual elements. This prevents 'false sharing' of bandwidth where accessing a single head of a multi-head output forces the transfer of all heads."
+
+\section{Implementation}
+
+\sys is implemented as a Python extension for PyTorch, comprising approximately 22,000 lines of code. It requires no modifications to user model code, interfacing strictly via standard PyTorch APIs. This section details the key implementation challenges: transparent operation capture on the client, semantic memory management on the server, and the mechanisms enabling efficient virtualization of models that exceed physical device capacity.
+
+\subsection{Client-Side Dispatch and Ghost Loading}
+\jw{needs improvement with detail of graph caching like commented one}
+%The client intercepts tensor operations via PyTorch's \texttt{__torch_dispatch__}, treating the Python runtime as a Just-In-Time trace generator. Unlike eager execution systems that dispatch operations synchronously, \sys accumulates operations into a local SRG buffer, returning lightweight \texttt{LazyTensor} handles to the user program.
+%This effectively unrolls Python-side loops into a single linear computation graph. For example, a for loop executing a Transformer layer 32 times does not trigger 32 RPC calls; it generates a single SRG containing 32 unrolled layer blocks. Network transmission occurs only at Materialization Boundaries---points where the user program attempts to observe a concrete value (e.g., \texttt{.item()}, \texttt{print()}, or control flow based on tensor data).
+%This \textit{Trace-then-Burst} execution model masks the RTT of the binary protocol, amortizing the network overhead across thousands of GPU operations."
+The client's primary responsibility is to intercept tensor operations without executing them, constructing the Semantically Rich Graph (SRG) that the server will later execute. We leverage PyTorch's \texttt{\_\_torch\_dispatch\_\_} mechanism to capture all operations issued against tensors residing on our virtual \texttt{remote} device. When an operation is intercepted, the client first executes it on meta-tensors (CPU, zero memory) to determine the output shape and dtype. It then applies the three-rule classification hierarchy from \S\ref{ssec:tensor_process} to assign a lifecycle tag, appends a node to the SRG buffer, and returns a \texttt{LazyTensor} handle wrapping the meta-tensor. No GPU computation occurs on the client; the SRG accumulates until a materialization trigger forces a flush.
+
+Materialization is triggered when Python semantics require a concrete value. This occurs on control flow decisions (\texttt{if tensor.any()}), scalar extraction (\texttt{tensor.item()}), device transfers (\texttt{tensor.cpu()}), or explicit printing. Upon triggering, the client serializes the SRG, transmits it to the server, and blocks until results return.
+
+To instantiate models without client-side memory, \sys implements Ghost Loading by hooking \texttt{transformers.from\_pretrained} and \texttt{torch.load}. Rather than loading weights, the system instantiates the model architecture on the \texttt{meta} device (consuming zero bytes), computes a structural fingerprint as $\text{SHA256}(\text{architecture} \parallel \text{sorted(param\_names)})$, and performs a server handshake. If the server's Model Cache contains a matching entry, it maps the existing Text Segment to this session; otherwise, the server initiates a direct download to GPU memory. This mechanism allows a laptop client to load a 70B-parameter model in milliseconds with zero network transfer of weights. The fingerprint is structure-only; weight values are not checksummed, so fine-tuned variants of the same architecture share fingerprints. The server's Model Cache is keyed by \texttt{(fingerprint, weight\_source\_url)} to distinguish variants.
+
+Communication efficiency is critical for interactive latency. We replace Python's \texttt{pickle} with a length-prefixed binary protocol consisting of a 17-byte header (version, body size, metadata length, tensor count), followed by JSON-encoded metadata describing the graph and tensor shapes, followed by raw tensor data prefixed by length. This reduces serialization latency from 3--4ms (pickle) to $<$0.5ms.
+
+\subsection{Server-Side Memory Management}
+
+The Unified VMU manages GPU memory as three contiguous regions: the Text Segment occupying $[0, T)$ for read-only shared weights, the Data Segment occupying $[T, T+D)$ for private paged state, and the Stack Segment occupying $[T+D, T+D+S)$ for volatile watermarked activations. Segment boundaries are configurable at server startup based on expected workload characteristics.
+
+For models fitting in VRAM, the Text Segment loads weights once and maps them via pointer aliasing to all sessions using that model. The Data Segment assigns each session a contiguous region implemented as a Session Arena (64MB default) storing CUDA handles, scalar scratchpads, and metadata; KV-caches grow dynamically within the arena via a bump allocator. We minimize per-session static footprint to maximize density: standard PyTorch processes consume approximately 300MB for CUDA context, while \sys's Session Arena reduces this to 64MB, enabling 80 concurrent sessions in 5.1GB of VRAM.
+
+The Stack Segment employs a linear watermark allocator where allocation is pointer increment and deallocation is watermark reset. The Stack is protected by a mutex; a session must hold the lock to allocate. Upon SRG completion, the lock holder resets the watermark and releases the lock, making the entire Stack available to the next session. Incoming tensor data flows through a staged DMA pipeline: Network $\to$ Pinned Host Buffer $\to$ GPU Slab, with each stage using asynchronous DMA and a \texttt{stream.synchronize()} barrier separating stages to prevent data corruption.
+
+\paragraph{High-Density Session Arenas.}
+A critical barrier to high-tenancy inference is the static overhead of the execution context. Standard PyTorch processes consume approximately 300MB for CUDA context handles and workspace, meaning 50 concurrent agents would consume 15GB of VRAM merely to exist, leaving no room for model weights.
+\sys solves this via \textbf{Compact Session Arenas}. Because the Server acts as a single CUDA context, we virtualize the per-session overhead into a pre-allocated 64MB arena within the Data Segment. This arena stores the session's scalar scratchpads, RNG states, and metadata handles.
+By reducing the static footprint by $4.7\times$, \sys reduces the fixed overhead for 80 concurrent agents from $\approx 24$GB to just $5.1$GB. This structural optimization is the primary enabler for the density results in \S\ref{sec:eval}, allowing the remaining VRAM to be dedicated to the shared Text Segment and active KV-caches.
+
+\subsection{Adaptive Virtualization via Ring Buffer}
+While \sys prioritizes state-swapping for residency (latency-optimal), it supports models exceeding physical VRAM capacity through \textbf{Adaptive Text Virtualization}. Rather than treating model weights as a monolithic allocation, \sys partitions the Text Segment into two regions: a \textit{Resident Tier} (pinned in VRAM) and a \textit{Streaming Tier} (fetched on-demand). This hybrid approach ensures that oversized agents never OOM, but instead gracefully throttle to PCIe speeds—a trade-off acceptable for background reasoning tasks where throughput matters more than interactive latency.
+
+\paragraph{Skip-End Ring Buffer.}
+For the Streaming Tier, \sys implements a circular buffer using \textbf{Skip-End Allocation}. At model registration, the system pre-computes layer offsets: if layer $L$ of size $S$ would extend past the buffer end with only $R < S$ bytes remaining, the allocator inserts a skip marker and wraps the layer to offset 0. Tensors are never split across the wrap boundary, eliminating the need for complex kernel modification or memory coalescing during execution.
+
+\paragraph{Dual-Stream Pipelining.}
+\sys hides the streaming latency via \textbf{Async Dual-Stream Pipelining}. Layers are classified at load time: early layers and embeddings typically occupy the Resident Tier (maximizing cache hits), while deeper layers rely on the Streaming Tier. For a Llama-2-13B (26GB) model on a 24GB L4 GPU, \sys allocates 55\% of parameters as Resident and 45\% as Streaming.
+During execution, a high-priority \textit{Transfer Stream} prefetches Layer $N+1$ from pinned host memory while the \textit{Compute Stream} executes Layer $N$. Synchronization is handled entirely via GPU-side events (\texttt{cudaStreamWaitEvent}), ensuring the CPU never blocks.
+
+\paragraph{Integration with Cooperative Scheduling.}
+Streaming execution is inherently IO-bound, which \sys exploits to maintain cluster responsiveness. Through **Budget-Aware Graph Fission**, the Meta-Simulator slices the SRG into sub-graphs at layer boundaries. This allows the \textbf{Cooperative Scheduler} to inject yield points between streaming iterations. If a latency-sensitive "Realtime" session arrives while a background agent is streaming a 70B model, \sys yields execution at the next layer boundary—pausing the ring buffer pointers—to service the high-priority request. This turns the PCIe bottleneck into a scheduling opportunity, preventing long-running background agents from monopolizing the GPU compute units.
+
+%While \sys prioritizes state-swapping for residency (latency-optimal), it falls back to Ring-Buffer Streaming for capacity (throughput-suboptimal). This hybrid approach ensures that interactive sessions never OOM, they simply throttle to PCIe speeds, sufficient for automated background reasoning agents where latency is secondary to successful execution.
+
+%When model size exceeds VRAM capacity, \sys enters streaming execution to avoid OOM. The Text Segment operates as a circular buffer that streams weights layer-by-layer. At model registration, \sys pre-computes layer offsets within the ring buffer using Skip-End Allocation: if layer $L$ of size $S$ would extend past the buffer end with only $R < S$ bytes remaining, the allocator inserts a skip marker and wraps to offset 0. Tensors are never split across the wrap boundary, simplifying kernel code.
+
+%Layers are classified as either Resident (fitting permanently in the ring buffer, typically early layers and embeddings) or Streaming (loaded on-demand during forward pass). For Llama-2-13B (26GB) on a 24GB GPU with 16GB ring buffer, 55\% of parameters are resident while 45\% are streamed. Two CUDA streams operate concurrently: a high-priority Transfer Stream prefetches Layer $N+1$ from pinned host memory while the Compute Stream executes Layer $N$. Synchronization uses \texttt{cudaStreamWaitEvent}: the compute stream waits on a transfer-complete event before accessing Layer $N+1$; the CPU never blocks. PyTorch \texttt{register\_forward\_pre\_hook} redirects each layer's weight pointers to ring buffer views before \texttt{forward()} executes, remaining transparent to model code.
+
+\subsection{Scheduler and Fault Tolerance}
+
+Phase detection employs a three-level hierarchy. Explicit signals have highest priority: clients call \texttt{djinn.signal\_phase("IO\_WAIT", estimated\_resume\_ms=N)}. Library hooks provide the second level: shim wrappers for common agent libraries (LangChain, LlamaIndex) emit IO\_WAIT on entering \texttt{Tool.run()} and COMPUTE on exit. A reactive timeout serves as fallback: a background watchdog marks sessions as swappable after 200ms of inactivity (note that it is a safety net for when library hooks nor explicit signal are absent).
+
+The eviction policy is signal-driven: only sessions explicitly marked IO\_WAIT are eligible for eviction, with the scheduler selecting the longest-idle session among candidates. A pre-allocated region of pinned host memory (32GB default) serves as the swap target; eviction copies the session's Data Segment via a dedicated high-priority CUDA stream achieving approximately 24 GB/s throughput. When \texttt{estimated\_resume\_ms} is provided, the scheduler computes $T_{prefetch} = T_{now} + \text{estimated\_resume\_ms} - 100\text{ms}$ and queues an asynchronous restore, pipelining state restoration with the agent's external work.
+
+For correctness verification, \sys validates that outputs match local PyTorch execution within FP16 tolerance ($\|y_{djinn} - y_{ref}\| < 0.1$) on every release. Fault tolerance relies on a heartbeat watchdog: clients must renew their session lease every 500ms, and expired leases (from client crashes or network partitions) trigger immediate reclamation of the session's Data Segment and release of any held locks, preventing deadlock from abandoned sessions. For white-box research workflows, \sys supports breakpoints via \texttt{djinn.breakpoint(layer=20)}, which inserts a \texttt{BARRIER} node in the SRG causing the server to execute up to this node then yield control. Tensor modifications on the client generate \texttt{PATCH} commands that update the resident or swapped Data Segment before resumption.
+
 \section{Evaluation}
 \label{sec:evaluation}
+\jw{Exp 1,2,3 are the main experiments I planned. Will add more baselines to each experiments and optionally another ablation study if time allows.}
 
 We evaluate \sys's ability to virtualize GPU memory through a controlled oversubscription experiment. Our goal is to verify that semantic phase signaling enables the system to support concurrent interactive workloads that exceed physical device capacity, a regime where reactive baselines fail.
 
@@ -180,7 +498,7 @@ The semantic swap-in mechanism ($T_{transfer}$) accounts for only $0.2\%$ of the
 Crucially, this latency profile confirms that the \sys runtime is not the bottleneck. The system effectively virtualizes the memory hierarchy, trading latency (queue wait) for capacity (density) without introducing significant virtualization overhead. Unlike sequential baselines which would serialize 80 agents, forcing the 80th user to endure a $\sim$112s Time-to-First-Token latency ($80 \times 1.4$s per inference), \sys provides fair, concurrent progress for all users, maintaining the illusion of a dedicated (albeit slower) device for workloads that physically exceed the hardware.
 
 \subsection{Memory Virtualization and Fractional Residency}
-\label{sec:eval_virt}
+\label{ssec:eval_virt}
 
 While \S\ref{ssec:eval_density} demonstrated \sys's ability to virtualize memory for many small workloads, Experiment 2 evaluates the complementary challenge: virtualizing a single massive workload that exceeds physical device capacity. This scenario is critical for commodity "Edge AI" clusters where model size often outstrips the VRAM of affordable accelerators (e.g., NVIDIA L4).
 
@@ -240,3 +558,55 @@ Combined with kernel overhead ($\sim$300ms), the physical floor is $\sim$700ms. 
 The significance of \sys is not that it makes the hardware faster, but that it makes the hardware \textit{usable}.
 DeepSpeed's 36-second startup latency renders the L4 GPU unusable for interactive applications; users perceive the system as frozen. \sys's 1.1-second TTFT falls within the interactive response threshold.
 By converting a hard capacity wall into a linear bandwidth cost, \sys's Ring Buffer transforms commodity GPUs from batch-only processors into viable interactive agents, achieving a 2.0$\times$ end-to-end speedup for short sequences while reducing aggregate PCIe traffic by 4$\times$.
+
+\subsection{White-Box Interactivity and State Virtualization}
+\label{ssec:eval_interactivity}
+
+While \S\ref{ssec:eval_density} demonstrated virtualization for throughput, interactive research requires inspection and intervention. We evaluate \sys's ability to expose mutable process state through a ``Breakpoint \& Steering'' experiment, quantifying the cost of virtualizing active sessions.
+
+\paragraph{Workload and Oversubscription.}
+We configure a single NVIDIA H100 (80 GB) to serve Llama-2-13B. To force virtualization, we instantiate $N=50$ concurrent interactive sessions. Each session performs a forward pass, triggers a \textit{semantic breakpoint} at Layer 20, inspects activations on the CPU, and resumes execution.
+This workload creates an aggregate memory demand that strictly exceeds physical capacity:
+\begin{equation}
+\label{eq:interactivity_math}
+M_{total} = \underbrace{27\text{ GB}}_{\text{Shared Weights}} + \sum_{i=1}^{50} (\underbrace{1.3\text{ GB}}_{\text{Private KV}_i}) \approx 92\text{ GB}
+\end{equation}
+Since $M_{total} > M_{physical}$ ($92 > 80$), the workload is unsatisfiable without paging the private state of paused sessions.
+
+\paragraph{Baseline Analysis: The Parking Lot Problem.}
+We compare \sys against a standard PyTorch Eager baseline. In the baseline, a paused session retains ownership of its private KV cache and activation scratchpads in VRAM. Our measurements confirm that a single paused PyTorch session holds 24.3 GB of VRAM. Consequently, the H100 saturates at $N=3$; the fourth concurrent session triggers an OOM crash. This illustrates the ``Parking Lot'' pathology: the baseline treats the accelerator as a blocking resource, serializing interactive users and degrading cluster utilization to $<10\%$.
+
+\paragraph{\sys Results: Concurrency and Overhead.}
+\sys executes all $N=50$ sessions with a 100\% success rate.
+Upon reaching the Layer 20 breakpoint, the \sys runtime detects the transition to the \texttt{IO\_WAIT} phase and pages the session's 1.3 GB private data segment to pinned host memory.
+We quantify virtualization overhead as the latency penalty perceived by the resuming user, $T_{overhead} = T_{dispatch} + T_{restore}$.
+Because \sys employs an asynchronous command queue, client-side dispatch ($T_{dispatch}$) is negligible ($<10 \mu$s). Physical state restoration ($T_{restore}$) is dominated by PCIe transfer time. Moving the 1.3 GB state over PCIe Gen4 incurs a latency of $\sim20$ ms. This mechanism enables a $16\times$ increase in concurrent capacity ($N=50$ vs $N=3$) with sub-frame latency penalties.
+
+\begin{table}[t]
+\centering
+\small
+\caption{\textbf{Interactivity Microbenchmarks.} Comparison of resource efficiency and capabilities on Llama-2-13B (H100). \sys transforms the GPU from a blocking processor into a time-shared utility, enabling 50 concurrent debugging sessions where the baseline fails at 3.}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Metric} & \textbf{PyTorch Eager} & \textbf{\sys (Ours)} \\
+\midrule
+\textit{Resource Efficiency} & & \\
+VRAM Held (Paused) & 24.3 GB & \textbf{$\approx$ 0 GB} \\
+Max Concurrent Sessions & 3 & \textbf{50+} \\
+Oversubscription & Crash & \textbf{Virtualize} \\
+\midrule
+\textit{Interactive Latency} & & \\
+Breakpoint Dispatch & N/A & \textbf{$<10 \mu$s} \\
+State Restore (PCIe) & N/A & \textbf{$\sim 20$ ms} \\
+\midrule
+\textit{Capabilities} & & \\
+State Access & Read-Only & \textbf{Read/Write} \\
+Steering Divergence & N/A & \textbf{0.39\%} \\
+\bottomrule
+\end{tabular}
+\label{tab:interactivity}
+\end{table}
+
+\paragraph{Verification of Write-Back Semantics.}
+To verify that \sys enables genuine intervention (write access) rather than passive inspection, we perform an \textit{activation steering} test. At the Layer 20 breakpoint, we inject a perturbation vector (scaling activations by $0.9\times$) into the virtualized state on the host before resuming execution on the device. We measure a deterministic token output divergence of 0.39\% compared to a golden reference run.
+This confirms that \sys correctly propagates state modifications through the virtualization layer. This capability is architecturally distinct from compiled serving engines (e.g., vLLM), which treat internal KV state as opaque and immutable, thereby precluding white-box research workflows.

@@ -95,12 +95,13 @@ async def run_djinn_at_n(
     with open(config_file, 'w') as f:
         yaml.dump(config, f)
     
-    # Run experiment
+    # Run experiment with trace file
     cmd = [
         sys.executable,
         str(Path(__file__).parent / "run_poisson_experiment.py"),
         "--config", str(config_file),
         "--model-id", model_id,
+        "--trace-file", str(trace_file),
     ]
     
     result_file = Path(f"/tmp/djinn_result_n{n_agents}.json")

@@ -17,7 +17,7 @@ Prove that Djinn's performance comes from **engineered components**, not magic. 
 - Djinn latency for the same operations (Cold = first call with meta-simulation, Warm = cached plan)
 
 **Expected Result**: 
-- Micro-ops (torch.add): ~20x overhead (but unrealistic workload)
+- Micro-ops (torch.add): overhead visible but amortizes
 - Real operations (transformer layer): <5% overhead
 - Full forward pass: <1% overhead
 
@@ -25,57 +25,52 @@ Prove that Djinn's performance comes from **engineered components**, not magic. 
 
 **Run**: 
 ```bash
-python scripts/ablation_os_tax.py --remote
+python scripts/ablation_os_tax.py
 ```
 
 ---
 
-### Ablation 2: Session Arena Decomposition
+### Ablation 2: Session Arena Allocation Microbenchmark
 
-**Question**: How much of the 80-agent density comes from Session Arenas vs Semantic Scheduling?
+**Question**: What is the per-session allocation cost as arena size changes?
 
 **What We Measure**:
-- Maximum concurrent agents for different arena sizes (64, 128, 256, 300 MB)
-- Two scheduling modes: Semantic (proactive signals) vs Reactive (timeout-based)
+- Direct latency of `reserve_session_arena` for arena sizes (64, 128, 256, 300 MB)
+- 1000 allocations per trial, multiple trials for confidence intervals
+- Linear scaling check to ensure no thrashing/pathological behavior
 
 **Expected Result**:
-```
-Arena 64MB:  Semantic=80,  Reactive=40,  Gain=100%
-Arena 128MB: Semantic=50,  Reactive=30,  Gain=67%
-Arena 256MB: Semantic=28,  Reactive=20,  Gain=40%
-Arena 300MB: Semantic=20,  Reactive=15,  Gain=33%
-```
+- Allocation cost in tens of microseconds, roughly linear and stable across sizes
 
-**Key Claim**: "Session Arenas contribute ~60% of density; Semantic Scheduling contributes ~40%"
+**Key Claim**: Session Arenas add negligible per-session allocation cost; smaller arenas reduce static overhead without adding allocation penalty.
 
 **Run**:
 ```bash
-python scripts/ablation_session_arena.py --arena-sizes 64 128 256 300 --modes semantic reactive
+python scripts/ablation_session_arena.py --arena-sizes 64 128 256 300 --n-sessions 1000 --n-trials 3
 ```
 
 ---
 
-### Ablation 3: Plan Cache Effectiveness
+### Ablation 3: Plan Cache Effectiveness (Cold vs Warm Tokens)
 
 **Question**: Does the plan cache actually work? What happens without it?
 
 **What We Measure**:
-- Per-token latency during 100-token decode loop
-- Cache hit rate and miss penalty
-- Dispatch latency (meta-simulation time)
+- Per-token latency during a decode loop
+- Cold tokens: first token per sequence (cache miss → meta-sim runs)
+- Warm tokens: subsequent tokens (cache hit → plan lookup only)
+- Multiple trials for confidence intervals
 
 **Expected Result**:
-```
-Cache Hit Rate:        99% (ON) vs 0% (OFF)
-Avg Dispatch Latency:  0.3ms (ON) vs 45ms (OFF)  → 150x slower
-P99 Token Latency:     35ms (ON) vs 80ms (OFF)   → 2.3x slower
-```
+- Cold: tens of milliseconds (meta-sim)
+- Warm: low single-digit milliseconds (cache hit)
+- Speedup: 10–50× improvement from caching
 
-**Key Claim**: "Without caching, interactive latency is unacceptable"
+**Key Claim**: "Caching is mandatory for interactive latency; cold→warm shows the real impact."
 
 **Run**:
 ```bash
-python scripts/ablation_plan_cache.py --n-tokens=100
+python scripts/ablation_plan_cache.py --n-tokens 100 --n-trials 3
 ```
 
 ---
@@ -86,23 +81,19 @@ python scripts/ablation_plan_cache.py --n-tokens=100
 
 **What We Measure**:
 - Maximum concurrent agents in three modes:
-  1. **Proactive**: Explicit `djinn.signal_phase("IO_WAIT")` before tool execution
-  2. **Reactive**: Rely on idle timeout (1.0s threshold)
+  1. **Proactive**: Explicit `djinn.signal_phase("IO_WAIT")`
+  2. **Reactive**: Idle-timeout-based eviction
   3. **None**: No swapping (baseline)
+- Multiple trials for confidence intervals
 
 **Expected Result**:
-```
-Mode        Max Agents  P99 Latency  Gain
-Proactive   80          9.7s         baseline
-Reactive    48          15.2s        -40% density, +57% latency
-None        25          OOM          -69% density
-```
+- Proactive achieves highest density with lower latency; reactive lower density; none degrades sharply or OOMs.
 
-**Key Claim**: "Semantic signals enable 1.67x higher density (80 vs 48) with 36% lower latency"
+**Key Claim**: "Semantic signals are required for high density; reactive or none degrade density and latency."
 
 **Run**:
 ```bash
-python scripts/ablation_semantic_signals.py
+python scripts/ablation_semantic_signals.py --n-trials 3
 ```
 
 ---
@@ -115,16 +106,21 @@ python scripts/ablation_semantic_signals.py
 # Run all ablations in sequence
 python scripts/run_all_ablations.py
 
-# Expected total time: ~12 hours on H100
+# Updated expectations:
+# - Ablation 1: ~15 minutes
+# - Ablation 2 (microbenchmark): ~5 minutes
+# - Ablation 3: ~30 minutes (3 trials)
+# - Ablation 4: ~6–9 hours (binary search × 3 trials)
+# Total: ~7–10 hours on H100
 ```
 
 ### Skip Longest Ablations
 
-Session Arena sweep (Ablation 2) takes ~6 hours. Skip it for faster validation:
+If you need faster validation, skip Ablation 4 (longest due to binary search) or run with fewer trials:
 
 ```bash
-python scripts/run_all_ablations.py --skip-ablation 2
-# Total time: ~6 hours
+python scripts/run_all_ablations.py --skip-ablation 4
+# Or reduce trials via per-script flags, e.g., --n-trials 1
 ```
 
 ### Custom Output Directory
@@ -142,10 +138,8 @@ Each ablation generates:
 ```
 results/
 ├── ablation_1.json                 # Raw results
-├── ablation_os_tax_table.tex      # LaTeX table
-├── ablation_2.json
-├── ablation_arena_table.tex
-├── ablation_arena_decomposition.pdf
+├── ablation_os_tax_table.tex       # LaTeX table
+├── ablation_2.json                 # Allocation latency results (microbenchmark)
 ├── ablation_3.json
 ├── ablation_cache_table.tex
 ├── ablation_cache_histogram.pdf
@@ -173,14 +167,14 @@ This creates:
 
 ### Configuration Flags
 
-Ablations use these environment variables to control Djinn behavior:
+Ablations use these configuration points to control Djinn behavior:
 
-| Ablation | Config | Values |
-|----------|--------|--------|
-| 1 (OS Tax) | None | Standard Djinn config |
-| 2 (Arena) | `GENIE_VMU_SESSION_ARENA_MB` | 64, 128, 256, 300 |
-| 3 (Cache) | Plan cache disable via MetaSimulator | Enabled/Disabled |
-| 4 (Signals) | `DJINN_USE_SIGNALS` | true/false |
+| Ablation | Config | Values / Notes |
+|----------|--------|----------------|
+| 1 (OS Tax) | None | Uses remote_accelerator device by default |
+| 2 (Arena) | `GENIE_VMU_SESSION_ARENA_MB` | Set per run; direct allocation benchmark |
+| 3 (Cache) | Meta-sim plan cache | Cold vs warm measured implicitly (no flag) |
+| 4 (Signals) | Scheduling mode | Controlled via experiment args; signals vs timeout vs none |
 
 ### Experimental Design
 
@@ -189,15 +183,14 @@ Ablations use these environment variables to control Djinn behavior:
 - Shows amortization across three operation scales
 - Validates that fixed overhead is <1% for real workloads
 
-**Ablation 2** (Session Arena):
-- Sweeps arena sizes from 64MB (optimized) to 300MB (baseline)
-- Compares semantic (proactive) vs reactive (timeout) scheduling
-- Isolates memory architecture contribution from scheduling contribution
+**Ablation 2** (Session Arena - Microbenchmark):
+- Directly measures `reserve_session_arena` allocation latency
+- Arena sizes 64/128/256/300 MB
+- Multiple trials; linear scaling check to ensure no thrashing
 
 **Ablation 3** (Plan Cache):
-- Runs 100-token autoregressive decoding loop
-- Measures cache hit rate and per-token latency impact
-- Shows cache is critical for interactive performance
+- Runs decode loops and separates cold (first token, cache miss) vs warm (cache hit)
+- Multiple trials; reports speedup and confidence intervals
 
 **Ablation 4** (Semantic Signals):
 - Runs Poisson agent workload (same as Exp1) with three modes
@@ -208,14 +201,14 @@ Ablations use these environment variables to control Djinn behavior:
 
 ## Expected Results Summary
 
-### Table: Ablation Contributions to Djinn Performance
+### Table: Ablation Contributions to Djinn Performance (Expected)
 
 | Component | Baseline | Optimized | Contribution |
 |-----------|----------|-----------|--------------|
-| **OS Tax** | 50ms | 0.5ms | Overhead acceptable |
-| **Session Arena** | 256MB/agent | 64MB/agent | 4.7x memory reduction |
-| **Plan Cache** | 45ms dispatch | 0.3ms dispatch | 150x speedup |
-| **Semantic Signals** | 48 agents | 80 agents | 1.67x density increase |
+| **OS Tax** | Micro-ops show overhead; full models <1% | Dispatch overhead acceptable | Overhead amortizes |
+| **Session Arena** | Larger arenas | 64MB default | Low allocation cost; reduced static overhead |
+| **Plan Cache** | Cold: meta-sim tens of ms | Warm: ~1–5ms | 10–50× speedup on dispatch |
+| **Semantic Signals** | Reactive/none lower density | Proactive signals | ~1.5–1.7× density gain; lower latency |
 
 ### Paper Claims Validated
 
@@ -234,8 +227,8 @@ These ablations directly address the critique:
 
 **Our Response**: These four ablations provide factor analysis:
 - Ablation 1 proves the framework layer has acceptable overhead
-- Ablation 2 decomposes memory gains (60% arenas, 40% scheduling)
-- Ablation 3 proves the cache is mandatory for performance
+- Ablation 2 shows arena allocation cost is negligible and scales linearly across sizes
+- Ablation 3 proves the cache is mandatory for performance (cold vs warm gap)
 - Ablation 4 proves signals are necessary for high density
 
 ---
@@ -264,10 +257,7 @@ ablation/
 
 ### Ablation 2 Takes Too Long
 
-Session Arena sweep tests N=20...80 agents for 4 arena sizes × 2 modes = 8 configurations.
-Total: ~6 hours on H100.
-
-**Solution**: Skip with `--skip-ablation 2` and run on multiple GPUs in parallel.
+The session arena benchmark is now a **microbenchmark** (direct allocation). It should finish in seconds to a couple of minutes. If it runs long, check for thrashing or misconfiguration, and ensure you are not accidentally running the old macro density experiment.
 
 ### Out of Memory During Ablations
 

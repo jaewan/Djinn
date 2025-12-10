@@ -121,7 +121,7 @@ def run_benchmark(
 
     results: List[Dict] = []
     for layer in layers:
-        # Warmup to stabilize kernels
+        # Warmup to stabilize CUDA kernels
         for _ in range(warmup_iters):
             _ = recompute_to_layer(
                 llama_model,
@@ -140,17 +140,23 @@ def run_benchmark(
             for _ in range(repeat_iters)
         ]
         mean_ms = statistics.mean(latencies)
+        median_ms = statistics.median(latencies)
         std_ms = statistics.stdev(latencies) if len(latencies) > 1 else 0.0
+        
+        # Check for outliers
+        outlier_count = sum(1 for lat in latencies if abs(lat - mean_ms) > 2 * std_ms) if std_ms > 0 else 0
 
         results.append(
             {
                 "layer": layer,
                 "resume_latency_ms": mean_ms,
+                "resume_latency_median_ms": median_ms,
                 "resume_latency_std_ms": std_ms,
                 "num_samples": repeat_iters,
+                "outlier_count": outlier_count,
             }
         )
-        print(f"[Recompute] Layer {layer}: mean={mean_ms:.1f} ms, std={std_ms:.1f} ms over {repeat_iters} runs")
+        print(f"[Recompute] Layer {layer}: mean={mean_ms:.1f} ms, median={median_ms:.1f} ms, std={std_ms:.1f} ms over {repeat_iters} runs (outliers={outlier_count})")
 
     # Gather environment metadata for reproducibility
     import sys
@@ -184,7 +190,7 @@ def main():
         type=Path,
         default=Path("/tmp/exp3_resume_results/recompute_latency.json"),
     )
-    parser.add_argument("--warmup", type=int, default=2, help="Warmup iterations per layer")
+    parser.add_argument("--warmup", type=int, default=3, help="Warmup iterations per layer (increased for stability)")
     parser.add_argument("--repeat", type=int, default=5, help="Measured iterations per layer")
     args = parser.parse_args()
 
