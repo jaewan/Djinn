@@ -592,12 +592,15 @@ class KVSessionManager:
                     sess.gpu_id
                 )
                 
-                # Mark as swapped
-                sess.is_swapped = True
-                self.stats["kv_bytes_pinned"] -= actual_bytes
-                
-                # ✅ CRITICAL FIX: Clear kv_cache to free GPU memory immediately!
-                sess.kv_cache = None
+                # Mark as swapped only if data was actually evicted
+                if actual_bytes > 0:
+                    sess.is_swapped = True
+                    self.stats["kv_bytes_pinned"] -= actual_bytes
+                    
+                    # ✅ CRITICAL FIX: Clear kv_cache to free GPU memory immediately!
+                    sess.kv_cache = None
+                else:
+                    logger.warning(f"Eviction returned 0 bytes for {session_id[:12]} - leaving KV cache resident")
                 
                 return actual_bytes
             

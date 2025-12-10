@@ -137,29 +137,68 @@ class DjinnServer:
         # PHASE 3: Admission Control for Prefill (Prevents "Thundering Herd" OOM)
         # Only MAX_CONCURRENT_PREFILLS agents can do prefill simultaneously
         # Others queue up while semantic scheduler swaps idle agents to host
-        self.MAX_CONCURRENT_PREFILLS = 4  # Configurable, but 4 is safe for Llama-13B
+        
+        # TIER 3 OPTIMIZATION: Compute optimal prefill concurrency based on GPU memory
         prefill_override = os.getenv("GENIE_MAX_CONCURRENT_PREFILLS")
         if prefill_override:
             try:
-                override_value = max(1, int(prefill_override))
-                if override_value != self.MAX_CONCURRENT_PREFILLS:
-                    logger.info(
-                        "GENIE_MAX_CONCURRENT_PREFILLS override detected: %s -> %s",
-                        self.MAX_CONCURRENT_PREFILLS,
-                        override_value,
-                    )
-                    self.MAX_CONCURRENT_PREFILLS = override_value
+                self.MAX_CONCURRENT_PREFILLS = max(1, int(prefill_override))
+                logger.info(f"GENIE_MAX_CONCURRENT_PREFILLS override: {self.MAX_CONCURRENT_PREFILLS}")
             except ValueError:
-                logger.warning(
-                    "Invalid GENIE_MAX_CONCURRENT_PREFILLS value: %s. Using default %s.",
-                    prefill_override,
-                    self.MAX_CONCURRENT_PREFILLS,
-                )
+                self.MAX_CONCURRENT_PREFILLS = self._compute_optimal_prefill_concurrency()
+                logger.warning(f"Invalid GENIE_MAX_CONCURRENT_PREFILLS, using computed: {self.MAX_CONCURRENT_PREFILLS}")
+        else:
+            self.MAX_CONCURRENT_PREFILLS = self._compute_optimal_prefill_concurrency()
+        
         self.prefill_semaphore = asyncio.Semaphore(self.MAX_CONCURRENT_PREFILLS)
         self.prefill_queue_depth = 0
         self._prefill_queue_lock = asyncio.Lock()
         logger.info(f"✅ Admission Control enabled: MAX_CONCURRENT_PREFILLS={self.MAX_CONCURRENT_PREFILLS}")
 
+    def _compute_optimal_prefill_concurrency(self) -> int:
+        """
+        TIER 3 OPTIMIZATION: Compute optimal prefill concurrency based on GPU memory.
+        
+        Strategy:
+        - Get total GPU memory
+        - Reserve 30% for model weights and overhead
+        - Allocate remaining 70% for concurrent prefills
+        - Assume ~4GB per prefill for Llama-13B (2048 tokens)
+        
+        Returns:
+            Optimal number of concurrent prefills (minimum 2, maximum 12)
+        """
+        try:
+            if not torch.cuda.is_available():
+                return 4  # Default fallback
+            
+            # Get total GPU memory in GB
+            total_memory_bytes = torch.cuda.get_device_properties(0).total_memory
+            total_memory_gb = total_memory_bytes / (1024**3)
+            
+            # Reserve 30% for model weights and overhead
+            available_for_prefills_gb = total_memory_gb * 0.70
+            
+            # Assume 4GB per concurrent prefill (conservative for Llama-13B @ 2048 tokens)
+            # This includes activation memory + KV cache growth during prefill
+            memory_per_prefill_gb = 4.0
+            
+            optimal_concurrency = int(available_for_prefills_gb / memory_per_prefill_gb)
+            
+            # Clamp to reasonable bounds: [2, 12]
+            optimal_concurrency = max(2, min(12, optimal_concurrency))
+            
+            logger.info(
+                f"Computed optimal prefill concurrency: {optimal_concurrency} "
+                f"(GPU: {total_memory_gb:.1f}GB, available: {available_for_prefills_gb:.1f}GB)"
+            )
+            
+            return optimal_concurrency
+            
+        except Exception as e:
+            logger.warning(f"Failed to compute optimal prefill concurrency: {e}, using default=4")
+            return 4
+    
     def _configure_qos_scheduler(self) -> None:
         """Initialize the QoS scheduler if enabled in config."""
         qos_cfg = getattr(self._central_config, 'server', None)
@@ -1791,11 +1830,12 @@ class DjinnServer:
                 logger.debug(f"Could not record signal metric: {e}")
             
             # Mark session as signal-managed (skip 1-second timeout fallback)
+            # TIER 2 OPTIMIZATION: Pass estimated_resume_ms for prefetch scheduling
             try:
                 from .semantic_idle_detector import get_activity_tracker
                 tracker = get_activity_tracker()
                 if tracker:
-                    tracker.mark_signal_managed(session_id)
+                    tracker.mark_signal_managed(session_id, estimated_resume_ms or 0)
             except Exception as e:
                 logger.debug(f"Could not mark signal-managed: {e}")
             

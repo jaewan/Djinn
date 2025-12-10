@@ -258,7 +258,8 @@ async def run_poisson_experiment(
     # Initialize manager
     manager = EnhancedModelManager()
     
-    # Create prompt with sufficient length for memory pressure
+    # Create prompt: Use same prompt as in traces (2048 tokens) for consistency
+    # This matches the trace_generator.py which creates 2048-token prompts
     base_text = """
     We the People of the United States, in Order to form a more perfect Union, 
     establish Justice, insure domestic Tranquility, provide for the common defence, 
@@ -266,14 +267,19 @@ async def run_poisson_experiment(
     and our Posterity, do ordain and establish this Constitution for the United States of America.
     Article I: The Legislative Branch. Congress shall have Power To lay and collect Taxes, 
     Duties, Imposts and Excises, to pay the Debts and provide for the common Defence and general Welfare.
+    Section 1. All legislative Powers herein granted shall be vested in a Congress of the United States,
+    which shall consist of a Senate and House of Representatives.
+    Section 2. The House of Representatives shall be composed of Members chosen every second Year
+    by the People of the several States, and the Electors in each State shall have the Qualifications
+    requisite for Electors of the most numerous Branch of the State Legislature.
     """
     
-    # Repeat to reach target token count (~1024 tokens for memory pressure)
-    repeated = base_text * 10
-    prompt_tokens = tokenizer.encode(repeated)[:1024]
+    # Repeat to reach target token count (2048 tokens for consistency with trace)
+    repeated = base_text * 15
+    prompt_tokens = tokenizer.encode(repeated)[:2048]
     prompt_text = tokenizer.decode(prompt_tokens)
     
-    logger.info(f"Using {len(prompt_tokens)}-token prompt (memory pressure config)")
+    logger.info(f"Using {len(prompt_tokens)}-token prompt (matching trace format)")
     
     # Run Poisson experiment
     logger.info("=" * 70)

@@ -340,8 +340,11 @@ class MetaSimulator:
             
             allocations[name] = (0, alloc_size)  # Offset computed at execution time
         
-        # Plan allocations for input tensors
+        # Plan allocations for input tensors (skip non-tensor inputs such as DynamicCache)
         for name, tensor in inputs.items():
+            if not hasattr(tensor, "numel") or not hasattr(tensor, "element_size"):
+                logger.debug(f"Skipping non-tensor input during planning: {name} ({type(tensor)})")
+                continue
             size = tensor.numel() * tensor.element_size()
             allocations[f"input_{name}"] = (0, size)
         

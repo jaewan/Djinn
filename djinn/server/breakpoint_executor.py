@@ -393,8 +393,12 @@ class BreakpointExecutor:
         """
         Resume execution from a paused checkpoint using a user-modified activation tensor.
         """
+        import time
         from djinn.server.activation_checkpointer import get_activation_checkpointer
         from djinn.server.breakpoint_manager import get_breakpoint_manager, BreakpointState
+
+        # Start measuring server-side resume latency
+        resume_start_time = time.perf_counter()
 
         checkpointer = self.activation_checkpointer or get_activation_checkpointer()
         manager = self.breakpoint_manager or get_breakpoint_manager()
@@ -453,6 +457,11 @@ class BreakpointExecutor:
             metrics["model_output"] = "completed"
             self.stats["successful_resumes"] += 1
         finally:
+            # Record end of server-side resume and compute total latency
+            resume_end_time = time.perf_counter()
+            server_resume_latency_ms = (resume_end_time - resume_start_time) * 1000.0
+            metrics["server_resume_latency_ms"] = server_resume_latency_ms
+            
             self._restored_activations = None
             try:
                 checkpointer.release_checkpoint(checkpoint_id)

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Semantic Idle Detector: Proactive idle session detection for Phase 3 Semantic Scheduler.
 
@@ -29,7 +31,7 @@ import logging
 import threading
 import time
 import asyncio
-from typing import Dict, Optional, Set, Callable, Awaitable
+from typing import Dict, Optional, Set, Callable, Awaitable, Any
 from dataclasses import dataclass, field
 from enum import Enum
 from concurrent.futures import ThreadPoolExecutor
@@ -57,6 +59,8 @@ class SessionActivity:
     restore_event_count: int = 0  # Number of restore events
     total_idle_time_seconds: float = 0.0  # Cumulative idle time
     received_signal: bool = False  # True if client sent signal_phase() for this session
+    estimated_resume_ms: int = 0  # TIER 2: Estimated time until resume (for prefetch scheduling)
+    prefetch_task: Optional[object] = None  # TIER 2: Scheduled prefetch task
     
     @property
     def idle_duration(self) -> float:
@@ -259,12 +263,17 @@ class SemanticActivityTracker:
                 del self._sessions[session_id]
                 logger.debug(f"Unregistered session: {session_id}")
     
-    def mark_signal_managed(self, session_id: str) -> None:
-        """Mark session as managed via signal_phase() (not idle timeout)."""
+    def mark_signal_managed(self, session_id: str, estimated_resume_ms: int = 0) -> None:
+        """
+        Mark session as managed via signal_phase() (not idle timeout).
+        
+        TIER 2 OPTIMIZATION: Store estimated_resume_ms for prefetch scheduling.
+        """
         with self._lock:
             if session_id in self._sessions:
                 self._sessions[session_id].received_signal = True
-                logger.debug(f"Session {session_id[:12]} marked as signal-managed")
+                self._sessions[session_id].estimated_resume_ms = estimated_resume_ms
+                logger.debug(f"Session {session_id[:12]} marked as signal-managed, resume in {estimated_resume_ms}ms")
     
     def register_idle_callback(self, callback: Callable[[str], Optional[Awaitable[None]]]) -> None:
         """
@@ -317,6 +326,53 @@ class SemanticActivityTracker:
                 sid for sid, activity in self._sessions.items()
                 if activity.is_idle
             ]
+    
+    def schedule_prefetch(self, session_id: str) -> None:
+        """
+        TIER 2 OPTIMIZATION: Schedule proactive KV prefetch before expected resume.
+        
+        Uses estimated_resume_ms to prefetch KV cache 100ms before agent resumes,
+        hiding PCIe transfer latency behind agent's external work.
+        """
+        with self._lock:
+            activity = self._sessions.get(session_id)
+            if not activity or activity.estimated_resume_ms <= 0:
+                return
+            
+            # Schedule prefetch 100ms before expected resume
+            prefetch_delay_ms = max(0, activity.estimated_resume_ms - 100)
+            prefetch_delay_s = prefetch_delay_ms / 1000.0
+            
+            # Cancel any existing prefetch task
+            if activity.prefetch_task and not activity.prefetch_task.done():
+                activity.prefetch_task.cancel()
+            
+            # Schedule new prefetch
+            if self._event_loop:
+                try:
+                    activity.prefetch_task = self._event_loop.call_later(
+                        prefetch_delay_s,
+                        lambda: asyncio.create_task(self._execute_prefetch(session_id))
+                    )
+                    logger.info(f"📅 Scheduled prefetch for {session_id[:12]} in {prefetch_delay_ms}ms")
+                except Exception as e:
+                    logger.warning(f"Failed to schedule prefetch for {session_id[:12]}: {e}")
+    
+    async def _execute_prefetch(self, session_id: str) -> None:
+        """Execute the prefetch operation (restore KV from host to GPU)."""
+        try:
+            from .multi_tenant.kv_session_manager import get_kv_session_manager
+            kv_manager = get_kv_session_manager()
+            
+            logger.info(f"🔄 Executing prefetch for {session_id[:12]}")
+            bytes_restored = await kv_manager.restore_kv_from_host(session_id)
+            
+            if bytes_restored > 0:
+                logger.info(f"✅ Prefetch complete for {session_id[:12]}: {bytes_restored/(1024**2):.1f}MB")
+            else:
+                logger.debug(f"Prefetch skipped for {session_id[:12]} (not swapped or already restored)")
+        except Exception as e:
+            logger.error(f"Prefetch failed for {session_id[:12]}: {e}", exc_info=True)
     
     def _invoke_callback(
         self, 
@@ -407,6 +463,9 @@ class SemanticActivityTracker:
                     self.stats["idle_detections"] += 1
             
             logger.debug(f"Detected idle session: {session_id}")
+            
+            # TIER 2 OPTIMIZATION: Schedule prefetch if estimated_resume_ms is available
+            self.schedule_prefetch(session_id)
             
             # Emit callbacks
             for callback in self._idle_callbacks:

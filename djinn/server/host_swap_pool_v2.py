@@ -41,6 +41,7 @@ class SwapMapping:
     gpu_device: int           # GPU device ID this was swapped from
     timestamp: float          # When swapped
     data_type: str = "tensor" # Type of data: "tensor", "tuple", or "dynamic_cache"
+    completion_event: Optional[Any] = None  # CUDA event for async completion tracking
 
 
 class HostSwapPool:
@@ -69,6 +70,16 @@ class HostSwapPool:
         self.pool_size_gb = pool_size_gb
         self.pool_size_bytes = int(pool_size_gb * 1024**3)
         self._lock = threading.Lock()
+        
+        # TIER 1 OPTIMIZATION: Dedicated CUDA streams for swap/restore
+        # Separate streams allow overlap with compute and avoid blocking main stream
+        if torch.cuda.is_available():
+            self.swap_stream = torch.cuda.Stream()
+            self.restore_stream = torch.cuda.Stream()
+            logger.info("✅ Dedicated CUDA streams created for swap/restore operations")
+        else:
+            self.swap_stream = None
+            self.restore_stream = None
         
         # Track swapped sessions
         self.swapped_sessions: Dict[str, SwapMapping] = {}
@@ -229,10 +240,18 @@ class HostSwapPool:
                     else:
                         return data
                 
-                cpu_data = move_to_cpu(data_to_swap)
+                # TIER 1 OPTIMIZATION: Use dedicated swap stream for async transfer
+                if self.swap_stream:
+                    with torch.cuda.stream(self.swap_stream):
+                        cpu_data = move_to_cpu(data_to_swap)
+                else:
+                    cpu_data = move_to_cpu(data_to_swap)
                 
-                # Synchronize to ensure copy completes
-                torch.cuda.current_stream().synchronize()
+                # TIER 1 OPTIMIZATION: Use event-based completion instead of blocking sync
+                # This allows CPU to continue while GPU transfer completes asynchronously
+                swap_event = torch.cuda.Event() if torch.cuda.is_available() else None
+                if swap_event:
+                    swap_event.record()
                 
                 # Step 5: Track the swap
                 mapping = SwapMapping(
@@ -242,6 +261,7 @@ class HostSwapPool:
                     gpu_device=gpu_device,
                     timestamp=time.time(),
                     data_type=data_type,
+                    completion_event=swap_event,
                 )
                 self.swapped_sessions[session_id] = mapping
                 
@@ -317,13 +337,22 @@ class HostSwapPool:
                     else:
                         return data
                 
-                gpu_data = move_to_gpu(mapping.cpu_data)
+                # TIER 1 OPTIMIZATION: Use dedicated restore stream for async transfer
+                if self.restore_stream:
+                    with torch.cuda.stream(self.restore_stream):
+                        gpu_data = move_to_gpu(mapping.cpu_data)
+                else:
+                    gpu_data = move_to_gpu(mapping.cpu_data)
                 
-                # Synchronize
-                torch.cuda.current_stream().synchronize()
+                # TIER 1 OPTIMIZATION: Use event-based completion instead of blocking sync
+                # Record completion event for async tracking
+                restore_event = torch.cuda.Event() if torch.cuda.is_available() else None
+                if restore_event:
+                    restore_event.record()
                 
                 # Free the pinned memory by deleting the mapping
                 size_bytes = mapping.size_bytes
+                data_type = mapping.data_type
                 del self.swapped_sessions[session_id]
                 
                 # Update stats
