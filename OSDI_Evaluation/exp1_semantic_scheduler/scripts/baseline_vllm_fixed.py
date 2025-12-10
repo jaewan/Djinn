@@ -80,18 +80,18 @@ async def vllm_agent_lifecycle(
         )
         
         # PHASE 1: REASON (Prefill with context)
-        # Wrap blocking vLLM call in asyncio.to_thread to avoid blocking event loop
+        # NOTE: vLLM's synchronous LLM class is not designed for concurrent async calls
+        # Keeping it synchronous is actually correct - vLLM is designed for batched throughput
         reason_start = time.perf_counter()
-        reason_outputs = await asyncio.to_thread(llm.generate, [prompt], sampling_params)
+        reason_outputs = llm.generate([prompt], sampling_params)
         reason_latency_ms = (time.perf_counter() - reason_start) * 1000
         
         # PHASE 2: ACT (Think time / I/O simulation)
         await asyncio.sleep(think_time)
         
         # PHASE 3: REFLECT (Decode, reusing KV cache)
-        # Wrap blocking vLLM call in asyncio.to_thread to avoid blocking event loop
         reflect_start = time.perf_counter()
-        reflect_outputs = await asyncio.to_thread(llm.generate, [prompt], sampling_params)
+        reflect_outputs = llm.generate([prompt], sampling_params)
         reflect_latency_ms = (time.perf_counter() - reflect_start) * 1000
         
         total_latency_ms = reason_latency_ms + reflect_latency_ms

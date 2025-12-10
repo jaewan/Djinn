@@ -130,9 +130,9 @@ def validate_result_sanity(result_file: Path, baseline_name: str) -> bool:
             return False
         
         # Serverless should have constant latency (cold start)
-        # Expect 15-40 seconds
-        if p99 < 5000 or p99 > 60000:
-            logger.warning(f"⚠️  P99={p99:.0f}ms seems off for serverless (expected 15-40s)")
+        # With cached measurements: 2 × (30s cold_start + 1.7s inference) = 63.4s
+        if p99 < 50000 or p99 > 70000:
+            logger.warning(f"⚠️  P99={p99:.0f}ms seems off for serverless (expected ~63s with cached values)")
         
         logger.info(f"✅ Serverless result sanity check passed")
         return True

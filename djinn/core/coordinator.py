@@ -1447,7 +1447,8 @@ class DjinnCoordinator:
         """
         Send TCP request to server using message-type protocol.
         
-        Uses connection pooling for persistent connections to reduce handshake overhead.
+        Creates fresh connection for each request (server closes after each response).
+        Connection pooling is disabled because server does not support keep-alive.
         
         Args:
             server_address: Server address (host:port)
@@ -1455,36 +1456,19 @@ class DjinnCoordinator:
             data: Serialized request data
             
         Returns:
-            Response data bytes
+            Tuple of (response_msg_type, response_data)
         """
         import struct
         
-        conn = None
-        success = False
-        
-        # ✅ FIX: Ensure transport is initialized before attempting to use connection pool
-        if 'tcp' not in self.transports:
-            logger.debug("TCP transport not initialized, will create direct connection")
+        host, port = server_address.split(':')
+        port = int(port)
         
         try:
-            # ✅ OPTIMIZATION: Use connection pool if transport is available
-            if 'tcp' in self.transports:
-                try:
-                    conn = await self.transports['tcp']._connection_pool.acquire(server_address)
-                    reader = conn.reader
-                    writer = conn.writer
-                    logger.debug(f"Using pooled connection to {server_address}")
-                except Exception as e:
-                    logger.debug(f"Failed to acquire pooled connection ({e}), falling back to direct connection")
-                    # Fallback to direct connection if pool unavailable
-                    conn = None
-            
-            # Fallback: Create direct connection if no pool available
-            if conn is None:
-                host, port = server_address.split(':')
-                port = int(port)
-                reader, writer = await asyncio.open_connection(host, port)
-                logger.debug(f"Created direct connection to {server_address}")
+            # ✅ FIX: Always create fresh connection
+            # Server explicitly closes connections after each response to prevent buffer pollution
+            # Connection pooling would reuse stale connections causing "0 bytes read" errors
+            reader, writer = await asyncio.open_connection(host, port)
+            logger.debug(f"Created fresh connection to {server_address}")
             
             # Send message type (1 byte)
             writer.write(struct.pack('B', msg_type))
@@ -1519,22 +1503,16 @@ class DjinnCoordinator:
             response_data = await reader.readexactly(response_length)
             logger.debug(f"Read {len(response_data)} bytes response")
             
-            success = True
             return response_msg_type, response_data
             
         finally:
-            # ✅ OPTIMIZATION: Return pooled connection to pool, or close direct connection
-            if conn is not None:
-                # Return to pool
-                await self.transports['tcp']._connection_pool.release(conn, success=success)
-            elif 'writer' in locals() and writer is not None:
-                # Close direct connection
-                try:
-                    if not writer.is_closing():
-                        writer.close()
-                        await writer.wait_closed()
-                except Exception as e:
-                    logger.debug(f"Error closing direct connection: {e}")
+            # ✅ ALWAYS close connection (server closes its end too)
+            try:
+                if 'writer' in locals() and writer is not None and not writer.is_closing():
+                    writer.close()
+                    await writer.wait_closed()
+            except Exception as e:
+                logger.debug(f"Error closing connection: {e}")
     
     async def register_remote_model(
         self,
