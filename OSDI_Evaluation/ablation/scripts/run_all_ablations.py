@@ -65,14 +65,22 @@ class AblationRunner:
         
         # Add ablation-specific arguments
         if ablation_num == 1:
-            cmd.append('--remote')  # Measure Djinn remote
+            pass  # No special args needed
         elif ablation_num == 2:
             cmd.extend([
                 '--arena-sizes', '64', '128', '256', '300',
-                '--modes', 'semantic', 'reactive',
+                '--n-sessions', '1000',
+                '--n-trials', '3',
             ])
         elif ablation_num == 3:
-            cmd.append('--n-tokens=100')
+            cmd.extend([
+                '--n-tokens', '100',
+                '--n-trials', '3',
+            ])
+        elif ablation_num == 4:
+            cmd.extend([
+                '--n-trials', '3',
+            ])
         
         t_start = time.time()
         
