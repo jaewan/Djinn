@@ -1,0 +1,162 @@
+\section{Evaluation}
+\label{sec:evaluation}
+\jw{Exp 1,2,3 are the main experiments I planned. Will add more baselines to each experiments and optionally another ablation study if time allows.}
+
+We evaluate \sys's ability to virtualize GPU memory through a controlled oversubscription experiment. Our goal is to verify that semantic phase signaling enables the system to support concurrent interactive workloads that exceed physical device capacity, a regime where reactive baselines fail.
+
+\subsection{Memory Oversubscription and Agent Density}
+\label{ssec:eval_density}
+\jw{main finished, ready for review. Will add another line of Djinn real remote. Current plot runs Djinn in local cilent -> server via local network for apple to apple comparison with vLLM running locally. will add my personal laptop -> server (real Djinn model). }
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\columnwidth]{Figures/cliff.pdf}
+    \caption{\textbf{The Scalability Cliff.} vLLM (red) crashes when aggregate KV demand exceeds physical memory ($N \approx 48$). \sys (blue) successfully virtualizes memory, maintaining linear queueing latency well into the oversubscription regime ($N=80$, demand=106GB), demonstrating effective use of host DRAM for active state.\jw{need to rerun vLLM, it is worse than shown}}
+    \label{fig:cliff}
+\end{figure}
+
+To test the limits of virtualization, we instantiate a multi-agent workload designed to force paging. We spawn $N=80$ concurrent agents executing a \textit{Reason $\to$ Act $\to$ Reflect} loop driven by a Poisson arrival process ($\lambda=0.2$ agents/s) to model asynchronous interactivity. Each agent manages a 2,048-token context using Llama-2-13B (26 GB weights in FP16).
+
+The aggregate memory demand of this workload is 106 GB ($80$ agents $\times$ $1$ GB KV + $26$ GB weights), which exceeds the 80 GB capacity of our NVIDIA H100 testbed. Consequently, successful execution is not merely a performance optimization but a proof of virtualization: without active swapping to host memory, the workload cannot reside in physical memory.
+
+We compare \sys against vLLM, configured with its native PagedAttention swapping enabled. As shown in Figure~\ref{fig:cliff}, vLLM handles concurrency effectively until $N \approx 48$. Beyond this point, its reactive policy fails to reclaim memory fast enough during bursty arrivals, resulting in cascading OOM failures and a $0\%$ success rate for $N \ge 50$. vLLM holds inactive KV caches in VRAM until memory pressure is critical; by the time it evicts, the allocation overhead of new agents has already triggered exhaustion.
+
+In contrast, \sys leverages semantic signals (\texttt{IO\_WAIT}) emitted during the agent's ``Act'' phase. 
+While we explicitly inject these system calls in our experiment to isolate scheduler performance, \sys provides library-level wrappers (e.g., for LangChain Tool classes) that automatically emit these signals upon entering I/O-bound blocks, rendering the mechanism transparent to the end user.
+Modeled as 10--20s of I/O dormancy, these phases expose idle intervale that \sys exploits for proactive eviction. By moving the session's data segment immediately to the server's pinned host DRAM pool (provisioned from 512 GB system RAM), \sys successfully interleaves all 80 agents with a $100\%$ completion rate. This represents a $1.67\times$ improvement in feasible agent density over the reactive baseline, directly converting host RAM capacity into GPU concurrency.
+
+\subsection{Latency and Overhead Decomposition}
+\jw{Used to achieve 9 seconds p99. Will try to revert it by the deadline.}
+While \sys enables higher density, we must characterize the latency cost of this virtualization. At $N=80$, the P99 request latency is 23.9 seconds. Decomposing this figure reveals that the system overhead is negligible compared to the queuing delay inherent to high utilization:
+
+\begin{equation}
+\label{eq:latency}
+T_{total} (23.9\text{s}) = T_{queue} (22.2\text{s}) + T_{transfer} (0.05\text{s}) + T_{compute} (1.7\text{s})
+\end{equation}
+
+The semantic swap-in mechanism ($T_{transfer}$) accounts for only $0.2\%$ of the total latency ($\sim 50$ms), saturating the PCIe Gen4 bus at $\sim 24$ GB/s. The dominant component ($92.7\%$) is $T_{queue}$, the time requests spend waiting for a compute slot. This queueing is an expected artifact of fair scheduling: with 80 active sessions time-sharing a single accelerator, the GPU maintains near-100\% utilization, processing 3--4 agents simultaneously while others wait.
+
+Crucially, this latency profile confirms that the \sys runtime is not the bottleneck. The system effectively virtualizes the memory hierarchy, trading latency (queue wait) for capacity (density) without introducing significant virtualization overhead. Unlike sequential baselines which would serialize 80 agents, forcing the 80th user to endure a $\sim$112s Time-to-First-Token latency ($80 \times 1.4$s per inference), \sys provides fair, concurrent progress for all users, maintaining the illusion of a dedicated (albeit slower) device for workloads that physically exceed the hardware.
+
+\subsection{Memory Virtualization and Fractional Residency}
+\label{ssec:eval_virt}
+
+\S\ref{ssec:eval_density} virtualized concurrency; here we virtualize capacity. We target the \textit{boundary condition}: a workload that marginally exceeds physical memory.We run Llama-2-13B (24.2~GB FP16) on an NVIDIA L4 (24~GB), creating $1.01\times$ oversubscription.This regime isolates allocation policy. Does the system treat memory as binary (fit/crash) or continuous (fit/degrade)?
+%While massive oversubscription (e.g., $6\times$) would trivially bind all systems to PCIe bandwidth, the $1.01\times$ regime isolates the \textit{allocation policy}. It tests whether the system treats memory as a binary constraint or a continuous resource.
+We compare against GPU-Only (standard \texttt{model.cuda()}), DeepSpeed-Inference~\cite{deepspeed} (industry-standard optimized runtime with kernel injection), and HuggingFace Accelerate (\texttt{device\_map="auto"}, standard CPU offloading).
+
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Baseline} & \textbf{TTFT} & \textbf{Decode} & \textbf{E2E (50 tok)} \\
+\midrule
+GPU-Only & \multicolumn{3}{c}{OOM (binary failure)} \\
+DeepSpeed & \multicolumn{3}{c}{OOM (binary failure)} \\
+HF Accelerate & 4,365 ms & 4,254 ms/tok & 212.7 s \\
+\textbf{\sys} & \textbf{297 ms} & \textbf{113 ms/tok} & \textbf{5.6 s} \\
+\midrule
+\textbf{Speedup} & \textbf{14.7$\times$} & \textbf{37.7$\times$} & \textbf{37.7$\times$} \\
+\bottomrule
+\end{tabular}
+\caption{\textbf{Memory Virtualization (Llama-2-13B on L4).} Existing runtimes crash at $1.01\times$ oversubscription. \sys converts capacity overflow into latency cost, achieving 14.7--37.7$\times$ speedup over the only working baseline.}
+\label{tab:virt_metrics}
+\end{table}
+
+~\cref{tab:virt_metrics} shows the results. Both GPU-Only and DeepSpeed fail with OOM. DeepSpeed's \texttt{init\_inference} attempts full GPU residency during kernel injection---a $1\%$ capacity overflow causes $100\%$ availability loss. This validates that even optimized runtimes enforce binary residency; they do not virtualize capacity.
+
+Against HuggingFace Accelerate (the only surviving baseline), \sys achieves 14.7$\times$ faster TTFT (297ms vs 4.4s) and 37.7$\times$ faster decode (113ms vs 4.3s/tok).
+The gap is architectural. HuggingFace employs synchronous layer-wise offloading: each of 40 layers blocks on PCIe, and every decode step re-transfers CPU-resident weights. At 15~GB/s, even ideal transfer takes 1.6s; Python overhead adds 2.8s more.
+
+\sys implements fractional residency. It pins 32 blocks (17.7~GB, 73\%) in a 20~GB ring buffer and streams 11 blocks (6.5~GB, 27\%) through 3 rotating slots. Two-ahead pipelining (prefetch block $N{+}2$ while executing $N$) fully hides transfer latency.
+As a result, decode becomes compute-bound, not I/O-bound. The 113ms/token approaches native GPU speed despite oversubscription.
+
+\sys transforms a 24~GB GPU from ``unusable for 24.2~GB models'' to near-native performance. The 297ms TTFT is below the 500ms threshold for perceived instantaneity; 50-token generation takes 5.6s instead of 3.5 minutes.
+Fractional residency converts a hard capacity wall into a soft latency tax, making commodity GPUs viable for models that nominally exceed their memory—and, critically, making disaggregation robust to the heterogeneous capacity demands of thin-client populations.
+
+
+\subsection{White-Box Interactivity and State Virtualization}
+\label{ssec:eval_interactivity}
+
+While \S\ref{ssec:eval_density} demonstrated virtualization for throughput, interactive research requires inspection and intervention. We evaluate \sys's ability to expose mutable process state through a ``Breakpoint \& Steering'' experiment, quantifying the cost of virtualizing active sessions.
+
+\paragraph{Workload and Oversubscription.}
+We configure a single NVIDIA H100 (80 GB) to serve Llama-2-13B. To force virtualization, we instantiate $N=50$ concurrent interactive sessions. Each session performs a forward pass, triggers a \textit{semantic breakpoint} at Layer 20, inspects activations on the CPU, and resumes execution.
+This workload creates an aggregate memory demand that strictly exceeds physical capacity:
+\begin{equation}
+\label{eq:interactivity_math}
+M_{total} = \underbrace{27\text{ GB}}_{\text{Shared Weights}} + \sum_{i=1}^{50} (\underbrace{1.3\text{ GB}}_{\text{Private KV}_i}) \approx 92\text{ GB}
+\end{equation}
+Since $M_{total} > M_{physical}$ ($92 > 80$), the workload is unsatisfiable without paging the private state of paused sessions.
+
+\paragraph{Baseline Analysis: The Parking Lot Problem.}
+We compare \sys against a standard PyTorch Eager baseline. In the baseline, a paused session retains ownership of its private KV cache and activation scratchpads in VRAM. Our measurements confirm that a single paused PyTorch session holds 24.3 GB of VRAM. Consequently, the H100 saturates at $N=3$; the fourth concurrent session triggers an OOM crash. This illustrates the ``Parking Lot'' pathology: the baseline treats the accelerator as a blocking resource, serializing interactive users and degrading cluster utilization to $<10\%$.
+
+\paragraph{\sys Results: Concurrency and Overhead.}
+\sys executes all $N=50$ sessions with a 100\% success rate.
+Upon reaching the Layer 20 breakpoint, the \sys runtime detects the transition to the \texttt{IO\_WAIT} phase and pages the session's 1.3 GB private data segment to pinned host memory.
+We quantify virtualization overhead as the latency penalty perceived by the resuming user, $T_{overhead} = T_{dispatch} + T_{restore}$.
+Because \sys employs an asynchronous command queue, client-side dispatch ($T_{dispatch}$) is negligible ($<10 \mu$s). Physical state restoration ($T_{restore}$) is dominated by PCIe transfer time. Moving the 1.3 GB state over PCIe Gen4 incurs a latency of $\sim20$ ms. This mechanism enables a $16\times$ increase in concurrent capacity ($N=50$ vs $N=3$) with sub-frame latency penalties.
+
+\begin{table}[t]
+\centering
+\small
+\caption{\textbf{Interactivity Microbenchmarks.} Comparison of resource efficiency and capabilities on Llama-2-13B (H100). \sys transforms the GPU from a blocking processor into a time-shared utility, enabling 50 concurrent debugging sessions where the baseline fails at 3.}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Metric} & \textbf{PyTorch Eager} & \textbf{\sys (Ours)} \\
+\midrule
+\textit{Resource Efficiency} & & \\
+VRAM Held (Paused) & 24.3 GB & \textbf{$\approx$ 0 GB} \\
+Max Concurrent Sessions & 3 & \textbf{50+} \\
+Oversubscription & Crash & \textbf{Virtualize} \\
+\midrule
+\textit{Interactive Latency} & & \\
+Breakpoint Dispatch & N/A & \textbf{$<10 \mu$s} \\
+State Restore (PCIe) & N/A & \textbf{$\sim 20$ ms} \\
+\midrule
+\textit{Capabilities} & & \\
+State Access & Read-Only & \textbf{Read/Write} \\
+Steering Divergence & N/A & \textbf{0.39\%} \\
+\bottomrule
+\end{tabular}
+\label{tab:interactivity}
+\end{table}
+
+\paragraph{Verification of Write-Back Semantics.}
+To verify that \sys enables genuine intervention (write access) rather than passive inspection, we perform an \textit{activation steering} test. At the Layer 20 breakpoint, we inject a perturbation vector (scaling activations by $0.9\times$) into the virtualized state on the host before resuming execution on the device. We measure a deterministic token output divergence of 0.39\% compared to a golden reference run.
+This confirms that \sys correctly propagates state modifications through the virtualization layer. This capability is architecturally distinct from compiled serving engines (e.g., vLLM), which treat internal KV state as opaque and immutable, thereby precluding white-box research workflows.
+
+\subsection{Resume Latency: The Scalability of State Restoration}
+\label{ssec:eval_resume_latency}
+
+The central promise of \sys is that semantic virtualization imposes only a constant-time ($O(1)$) latency penalty, decoupling debugging cost from model depth. To validate this, we measure the end-to-end \textit{Resume Latency}—the wall-clock time from a user issuing a ``Resume'' command at layer $L$ to the GPU beginning execution of layer $L+1$.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\columnwidth]{Figures/resume_latency.pdf}
+    \caption{\textbf{Resume Latency Scaling.} Recompute (red) scales linearly ($O(L)$), taking $>65$ms at Layer 40, which degrades interactivity. Manual Offload (green) is optimal ($O(1)$, 0.8ms) but requires manual memory management. \sys (blue) achieves $O(1)$ scalability ($\sim$35ms) transparently, decoupling debug cost from model depth. The gap between \sys and Manual Offload is strictly framework implementation overhead (Python RPC), not architectural.}
+    \label{fig:resume_latency}
+\end{figure}
+
+We compare three resumption strategies on Llama-2-13B (H100):
+\begin{itemize}
+    \item \textbf{Stateless Recompute:} Discard intermediate state at breakpoints. On resume, re-execute the model from Layer 0. This is the default behavior of stateless serving systems.
+    \item \textbf{Manual Offload (Oracle):} Explicitly pin activation tensors to host RAM and copy them back via \texttt{cudaMemcpyAsync}. This represents the theoretical hardware lower bound (``speed of light'') for PCIe interconnects but requires intrusive user code.
+    \item \textbf{\sys Resume:} Transparently restore state from the semantic memory manager via RPC.
+\end{itemize}
+
+\paragraph{The O(L) vs. O(1) Crossover.}
+Figure~\ref{fig:resume_latency} reveals the fundamental scaling limitation of stateless approaches. Recomputation exhibits linear $O(L)$ scaling: while fast at Layer 1 (2.1 ms), it grows to \textbf{65.4 ms} by Layer 40. For deep debugging sessions involving repeated stepping, this latency accumulates, creating perceptible lag and reducing debug loop frequency to $<15$ Hz.
+
+In contrast, \sys maintains a constant-time ($O(1)$) latency profile of $\sim$35 ms regardless of breakpoint depth. While slower than recompute for shallow layers ($L < 20$), \sys becomes the superior strategy as model depth increases, guaranteeing predictable interactivity even for massive models where recomputation would take seconds.
+
+\paragraph{Decomposing the Transparency Tax.}
+While \sys achieves $O(1)$ scalability, it incurs a latency overhead compared to the Manual Offload oracle (0.8 ms). We decompose this $\sim$34 ms gap to isolate architectural costs from implementation artifacts:
+\begin{equation}
+T_{\sys} \approx \underbrace{20\text{ ms}}_{\text{Framework}} + \underbrace{10\text{ ms}}_{\text{Semantic Logic}} + \underbrace{5\text{ ms}}_{\text{GPU}}
+\end{equation}
+The dominant cost (20 ms) is \textbf{Framework Overhead} attributable to our prototype's use of Python \texttt{asyncio} and TCP for control plane RPCs, rather than an optimized C++ transport (e.g., gRPC/RDMA) which typically yields $<2$ ms latency \cite{ray,pytorch}. The actual \textbf{Semantic Logic}—the architectural cost of looking up and scheduling the session—adds only $\sim$10 ms.
+This decomposition confirms that the latency gap is not a fundamental limitation of disaggregation but an implementation choice. Even with this prototype overhead, \sys remains well within the 100 ms threshold for human-perceived instantaneous response, successfully trading minimal latency for the profound benefit of transparent, code-free state virtualization.

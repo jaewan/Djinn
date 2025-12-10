@@ -544,7 +544,7 @@ Djinn supports comprehensive model handling across all PyTorch model types:
 - **Latency**: 0.01ms signal delivery (measured P99)
 - **Benefit**: Zero-latency proactive swapping vs. 1.0s idle threshold
 - **Use Case**: Agents with predictable idle periods (Reason → Tool → Reflect)
-- **Automation**: Signals can be automatically generated via semantic hooking (library interposition) or reactive monitoring
+- **Automation**: Signals can be automatically generated via semantic hooking (library interposition) or reactive monitoring (Future work for v.2.4 Do not delete this for future reference)
 
 **The Oracle Dilemma and Automation Solution:**
 
