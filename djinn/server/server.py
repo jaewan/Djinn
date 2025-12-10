@@ -163,10 +163,10 @@ class DjinnServer:
         - Get total GPU memory
         - Reserve 30% for model weights and overhead
         - Allocate remaining 70% for concurrent prefills
-        - Assume ~4GB per prefill for Llama-13B (2048 tokens)
+        - Assume ~3GB per prefill for Llama-13B (2048 tokens)
         
         Returns:
-            Optimal number of concurrent prefills (minimum 2, maximum 12)
+            Optimal number of concurrent prefills (minimum 2, maximum 16)
         """
         try:
             if not torch.cuda.is_available():
@@ -179,18 +179,21 @@ class DjinnServer:
             # Reserve 30% for model weights and overhead
             available_for_prefills_gb = total_memory_gb * 0.70
             
-            # Assume 4GB per concurrent prefill (conservative for Llama-13B @ 2048 tokens)
-            # This includes activation memory + KV cache growth during prefill
-            memory_per_prefill_gb = 4.0
+            # ✅ OPTIMIZATION: Reduced from 4.0 to 3.0 GB per prefill
+            # Llama-13B @ 2048 tokens needs: ~2GB activation + ~1GB KV cache = ~3GB total
+            # This allows more concurrent prefills, reducing queue time
+            memory_per_prefill_gb = 3.0
             
             optimal_concurrency = int(available_for_prefills_gb / memory_per_prefill_gb)
             
-            # Clamp to reasonable bounds: [2, 12]
-            optimal_concurrency = max(2, min(12, optimal_concurrency))
+            # ✅ OPTIMIZATION: Increased cap from 12 to 16 for H100 (80GB)
+            # Clamp to reasonable bounds: [2, 16]
+            optimal_concurrency = max(2, min(16, optimal_concurrency))
             
             logger.info(
                 f"Computed optimal prefill concurrency: {optimal_concurrency} "
-                f"(GPU: {total_memory_gb:.1f}GB, available: {available_for_prefills_gb:.1f}GB)"
+                f"(GPU: {total_memory_gb:.1f}GB, available: {available_for_prefills_gb:.1f}GB, "
+                f"per_prefill: {memory_per_prefill_gb:.1f}GB)"
             )
             
             return optimal_concurrency
@@ -2542,6 +2545,10 @@ class DjinnServer:
                     self.prefill_queue_depth = max(self.prefill_queue_depth, queued_before)
                 await self.prefill_semaphore.acquire()
                 wait_ms = (time.perf_counter() - wait_start) * 1000.0
+                
+                # ✅ FIX: Store queue latency in request so it's returned to client
+                request['_queue_latency_ms'] = wait_ms
+                
                 inflight_prefill = max(
                     0, self.MAX_CONCURRENT_PREFILLS - self.prefill_semaphore._value
                 )

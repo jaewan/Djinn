@@ -426,34 +426,70 @@ async def run_poisson_experiment(
     # - KV restore time is dominated by PCIe transfer
     # - The system is NOT broken - it's working correctly at high load
     
-    # Estimate decomposition
-    # KV restore time ≈ 0.5GB / 24GB/s PCIe bandwidth ≈ 20-50ms per restore
-    # Inference time ≈ model inference latency (same as single-agent baseline)
-    # Queue time ≈ total latency - restore - inference
-    
-    estimated_kv_restore_ms = 50.0  # Typical PCIe transfer for 0.5GB
-    estimated_inference_ms = 1700.0  # Baseline inference time (from baseline measurements)
-    estimated_queue_wait_ms = max(0, p99_lat - estimated_kv_restore_ms - estimated_inference_ms)
-    
-    total_estimate = estimated_queue_wait_ms + estimated_kv_restore_ms + estimated_inference_ms
-    
-    if total_estimate > 0:
-        queue_pct = (estimated_queue_wait_ms / total_estimate) * 100.0
-        restore_pct = (estimated_kv_restore_ms / total_estimate) * 100.0
-        inference_pct = (estimated_inference_ms / total_estimate) * 100.0
+    # ✅ FIX: Use actual server-side metrics instead of hardcoded estimates
+    if success_records:
+        # Extract actual queue latencies from server metrics
+        actual_queue_latencies = [
+            r.get("server_metrics", {}).get("queue_latency_ms", 0.0)
+            for r in success_records
+            if r.get("server_metrics", {}).get("queue_latency_ms") is not None
+        ]
+        
+        # Extract actual executor times (inference time)
+        actual_executor_times = [
+            r.get("server_metrics", {}).get("executor_time_ms", 0.0)
+            for r in success_records
+            if r.get("server_metrics", {}).get("executor_time_ms") is not None
+        ]
+        
+        # Compute P99 for each component
+        if actual_queue_latencies:
+            queue_p99 = actual_queue_latencies[min(int(len(actual_queue_latencies) * 0.99), len(actual_queue_latencies) - 1)]
+        else:
+            queue_p99 = 0.0
+            
+        if actual_executor_times:
+            inference_p99 = actual_executor_times[min(int(len(actual_executor_times) * 0.99), len(actual_executor_times) - 1)]
+        else:
+            inference_p99 = 0.0
+        
+        # KV restore time is derived: Total - Queue - Inference
+        # This includes network overhead, serialization, and actual PCIe transfer
+        restore_p99 = max(0, p99_lat - queue_p99 - inference_p99)
+        
+        total_measured = queue_p99 + restore_p99 + inference_p99
+        
+        if total_measured > 0:
+            queue_pct = (queue_p99 / total_measured) * 100.0
+            restore_pct = (restore_p99 / total_measured) * 100.0
+            inference_pct = (inference_p99 / total_measured) * 100.0
+        else:
+            queue_pct = restore_pct = inference_pct = 0.0
+        
+        latency_decomposition = {
+            "total_ms": p99_lat,
+            "queue_wait_ms": queue_p99,
+            "kv_restore_ms": restore_p99,
+            "inference_ms": inference_p99,
+            "queue_pct": queue_pct,
+            "restore_pct": restore_pct,
+            "inference_pct": inference_pct,
+            "note": "Queue time reflects GPU contention at high N - indicates good utilization, not software inefficiency",
+            "measurement_source": "actual_server_metrics",
+        }
     else:
-        queue_pct = restore_pct = inference_pct = 0.0
-    
-    latency_decomposition = {
-        "total_ms": p99_lat,
-        "queue_wait_ms": estimated_queue_wait_ms,
-        "kv_restore_ms": estimated_kv_restore_ms,
-        "inference_ms": estimated_inference_ms,
-        "queue_pct": queue_pct,
-        "restore_pct": restore_pct,
-        "inference_pct": inference_pct,
-        "note": "Queue time reflects GPU contention at high N - indicates good utilization, not software inefficiency",
-    }
+        # Fallback if no success records
+        latency_decomposition = {
+            "total_ms": p99_lat,
+            "queue_wait_ms": 0.0,
+            "kv_restore_ms": 0.0,
+            "inference_ms": 0.0,
+            "queue_pct": 0.0,
+            "restore_pct": 0.0,
+            "inference_pct": 0.0,
+            "note": "No successful records to decompose",
+            "measurement_source": "none",
+        }
     
     # Prepare results
     payload = {
