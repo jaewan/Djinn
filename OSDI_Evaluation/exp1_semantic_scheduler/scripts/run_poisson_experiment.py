@@ -65,6 +65,7 @@ async def agent_lifecycle_poisson(
     prompt: str,
     config: Dict[str, Any],
     arrival_time: float,
+    think_time: float = None,
 ) -> List[Dict]:
     """
     Run single agent through Reason → Act → Reflect loop with latency tracking.
@@ -77,6 +78,7 @@ async def agent_lifecycle_poisson(
         prompt: Input prompt text
         config: Workload configuration
         arrival_time: When this agent arrived (wall-clock seconds from start)
+        think_time: Think time from trace (if None, generates from config)
     
     Returns:
         List of records per iteration (one record per phase)
@@ -124,9 +126,12 @@ async def agent_lifecycle_poisson(
             
             # PHASE 2: ACT (Simulated Tool Use / Idle Period)
             # Signal that we're entering IO_WAIT - semantic scheduler should evict immediately
-            think_min = config.get("think_time_min", 2.0)
-            think_max = config.get("think_time_max", 10.0)
-            think_time = random.uniform(think_min, think_max)
+            # Use trace think_time if provided, otherwise generate from config
+            if think_time is None:
+                think_min = config.get("think_time_min", 2.0)
+                think_max = config.get("think_time_max", 10.0)
+                think_time = random.uniform(think_min, think_max)
+            
             estimated_resume_ms = int(think_time * 1000)  # Estimate how long until we resume
             
             djinn.signal_phase("IO_WAIT", session_id, estimated_resume_ms=estimated_resume_ms)
@@ -251,8 +256,9 @@ async def spawn_agents_poisson(
                 await asyncio.sleep(arrival_time - current_wall_time)
         
         # Spawn agent as non-blocking task
+        # Pass think_time from trace if available for apple-to-apple comparison
         task = asyncio.create_task(
-            agent_lifecycle_poisson(i, manager, model, tokenizer, prompt, config, arrival_time)
+            agent_lifecycle_poisson(i, manager, model, tokenizer, prompt, config, arrival_time, think_time)
         )
         agent_tasks.append(task)
         
@@ -295,28 +301,33 @@ async def run_poisson_experiment(
     # Initialize manager
     manager = EnhancedModelManager()
     
-    # Create prompt: Use same prompt as in traces (2048 tokens) for consistency
-    # This matches the trace_generator.py which creates 2048-token prompts
-    base_text = """
-    We the People of the United States, in Order to form a more perfect Union, 
-    establish Justice, insure domestic Tranquility, provide for the common defence, 
-    promote the general Welfare, and secure the Blessings of Liberty to ourselves 
-    and our Posterity, do ordain and establish this Constitution for the United States of America.
-    Article I: The Legislative Branch. Congress shall have Power To lay and collect Taxes, 
-    Duties, Imposts and Excises, to pay the Debts and provide for the common Defence and general Welfare.
-    Section 1. All legislative Powers herein granted shall be vested in a Congress of the United States,
-    which shall consist of a Senate and House of Representatives.
-    Section 2. The House of Representatives shall be composed of Members chosen every second Year
-    by the People of the several States, and the Electors in each State shall have the Qualifications
-    requisite for Electors of the most numerous Branch of the State Legislature.
-    """
-    
-    # Repeat to reach target token count (2048 tokens for consistency with trace)
-    repeated = base_text * 15
-    prompt_tokens = tokenizer.encode(repeated)[:2048]
-    prompt_text = tokenizer.decode(prompt_tokens)
-    
-    logger.info(f"Using {len(prompt_tokens)}-token prompt (matching trace format)")
+    # Use prompt from trace if available, otherwise generate locally
+    # This ensures apple-to-apple comparison with vLLM baseline
+    if trace_data is not None and "prompts" in trace_data and len(trace_data["prompts"]) > 0:
+        # Use exact prompt from trace for apple-to-apple comparison
+        prompt_text = trace_data["prompts"][0]
+        logger.info(f"Using prompt from trace (exact match with vLLM baseline)")
+    else:
+        # Fallback: Generate prompt matching trace_generator.py methodology
+        base_text = """
+        We the People of the United States, in Order to form a more perfect Union, 
+        establish Justice, insure domestic Tranquility, provide for the common defence, 
+        promote the general Welfare, and secure the Blessings of Liberty to ourselves 
+        and our Posterity, do ordain and establish this Constitution for the United States of America.
+        Article I: The Legislative Branch. Congress shall have Power To lay and collect Taxes, 
+        Duties, Imposts and Excises, to pay the Debts and provide for the common Defence and general Welfare.
+        Section 1. All legislative Powers herein granted shall be vested in a Congress of the United States,
+        which shall consist of a Senate and House of Representatives.
+        Section 2. The House of Representatives shall be composed of Members chosen every second Year
+        by the People of the several States, and the Electors in each State shall have the Qualifications
+        requisite for Electors of the most numerous Branch of the State Legislature.
+        """
+        
+        # Repeat to reach target token count (2048 tokens for consistency with trace)
+        repeated = base_text * 15
+        prompt_tokens = tokenizer.encode(repeated)[:2048]
+        prompt_text = tokenizer.decode(prompt_tokens)
+        logger.info(f"Generated prompt locally: {len(prompt_tokens)} tokens")
     
     # Run Poisson experiment
     logger.info("=" * 70)

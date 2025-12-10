@@ -66,7 +66,6 @@ HF Accelerate & 4,365 ms & 4,254 ms/tok & 212.7 s \\
 \end{table}
 
 ~\cref{tab:virt_metrics} shows the results. Both GPU-Only and DeepSpeed fail with OOM. DeepSpeed's \texttt{init\_inference} attempts full GPU residency during kernel injection---a $1\%$ capacity overflow causes $100\%$ availability loss. This validates that even optimized runtimes enforce binary residency; they do not virtualize capacity.
-
 Against HuggingFace Accelerate (the only surviving baseline), \sys achieves 14.7$\times$ faster TTFT (297ms vs 4.4s) and 37.7$\times$ faster decode (113ms vs 4.3s/tok).
 The gap is architectural. HuggingFace employs synchronous layer-wise offloading: each of 40 layers blocks on PCIe, and every decode step re-transfers CPU-resident weights. At 15~GB/s, even ideal transfer takes 1.6s; Python overhead adds 2.8s more.
 

@@ -61,12 +61,15 @@ async def vllm_agent_lifecycle(
     2. ACT: Wait (think time, simulating external I/O)
     3. REFLECT: Generate more tokens (decode with cached KV)
     
+    CORRECT METRIC: Measures LLM-only latency (Reason + Reflect phases),
+    EXCLUDING think time to match Djinn's measurement methodology.
+    
     Args:
         agent_idx: Agent identifier
         llm: vLLM engine
         tokenizer: Tokenizer
         prompt: Input prompt
-        arrival_time: Time this agent arrived (seconds from start)
+        arrival_time: Time this agent arrived (seconds from experiment start)
         think_time: Duration of Act phase (seconds)
     
     Returns:
@@ -80,13 +83,14 @@ async def vllm_agent_lifecycle(
         )
         
         # PHASE 1: REASON (Prefill with context)
-        # NOTE: vLLM's synchronous LLM class is not designed for concurrent async calls
-        # Keeping it synchronous is actually correct - vLLM is designed for batched throughput
+        # NOTE: vLLM's synchronous LLM.generate() blocks the GIL
+        # Multiple concurrent agents will serialize through this call
         reason_start = time.perf_counter()
         reason_outputs = llm.generate([prompt], sampling_params)
         reason_latency_ms = (time.perf_counter() - reason_start) * 1000
         
         # PHASE 2: ACT (Think time / I/O simulation)
+        # This is NOT included in the primary latency metric
         await asyncio.sleep(think_time)
         
         # PHASE 3: REFLECT (Decode, reusing KV cache)
@@ -94,7 +98,9 @@ async def vllm_agent_lifecycle(
         reflect_outputs = llm.generate([prompt], sampling_params)
         reflect_latency_ms = (time.perf_counter() - reflect_start) * 1000
         
-        total_latency_ms = reason_latency_ms + reflect_latency_ms
+        # PRIMARY METRIC: LLM-only latency (Reason + Reflect)
+        # This matches Djinn's measurement methodology
+        llm_only_latency_ms = reason_latency_ms + reflect_latency_ms
         
         return {
             "agent_id": agent_idx,
@@ -102,7 +108,7 @@ async def vllm_agent_lifecycle(
             "think_time_s": think_time,
             "reason_latency_ms": reason_latency_ms,
             "reflect_latency_ms": reflect_latency_ms,
-            "total_latency_ms": total_latency_ms,
+            "total_latency_ms": llm_only_latency_ms,  # PRIMARY METRIC
             "status": "success",
         }
     except Exception as e:
@@ -140,19 +146,21 @@ async def spawn_agents_poisson(
     think_times = trace["think_times"][:n_agents]
     
     tasks = []
-    start_wall_time = time.perf_counter()
+    experiment_start_time = time.perf_counter()
     
     for agent_idx, (arrival_time, prompt, think_time) in enumerate(
         zip(arrival_times, prompts, think_times)
     ):
         # Sleep until this agent's arrival time
-        current_wall_time = time.perf_counter() - start_wall_time
+        current_wall_time = time.perf_counter() - experiment_start_time
         if arrival_time > current_wall_time:
             await asyncio.sleep(arrival_time - current_wall_time)
         
         # Spawn agent task
         task = asyncio.create_task(
-            vllm_agent_lifecycle(agent_idx, llm, tokenizer, prompt, arrival_time, think_time)
+            vllm_agent_lifecycle(
+                agent_idx, llm, tokenizer, prompt, arrival_time, think_time
+            )
         )
         tasks.append(task)
         
@@ -202,7 +210,7 @@ def run_vllm_baseline(
             swap_space=0,  # NO SWAPPING - measure pure vLLM
             tensor_parallel_size=1,
             enforce_eager=True,  # Disable CUDA graphs (avoids Triton)
-            max_model_len=2048,  # Allow 2048-token context + 50 output
+            max_model_len=2150,  # Allow 2048-token context + BOS + 50 output + margin
             disable_log_stats=True,  # Reduce logging
         )
         
@@ -243,7 +251,7 @@ def run_vllm_baseline(
                 "error": "All agents failed",
             }
         
-        # Compute latency statistics
+        # Compute latency statistics (LLM-only: Reason + Reflect, excluding think time)
         total_latencies = sorted([r["total_latency_ms"] for r in success_results])
         reason_latencies = sorted([r["reason_latency_ms"] for r in success_results])
         reflect_latencies = sorted([r["reflect_latency_ms"] for r in success_results])
@@ -255,11 +263,15 @@ def run_vllm_baseline(
         p50_total = total_latencies[len(total_latencies) // 2]
         mean_total = np.mean(total_latencies)
         
+        p99_reason = reason_latencies[p99_idx]
+        p99_reflect = reflect_latencies[p99_idx]
+        
         logger.info(f"✅ Experiment completed in {total_duration:.1f}s")
         logger.info(f"   Successful: {len(success_results)}/{n_agents}")
-        logger.info(f"   P50 Total Latency: {p50_total:.1f}ms")
-        logger.info(f"   P99 Total Latency: {p99_total:.1f}ms")
-        logger.info(f"   Mean Total Latency: {mean_total:.1f}ms\n")
+        logger.info(f"   P50 LLM Latency (Reason+Reflect): {p50_total:.1f}ms")
+        logger.info(f"   P99 LLM Latency (Reason+Reflect): {p99_total:.1f}ms")
+        logger.info(f"   Mean LLM Latency: {mean_total:.1f}ms")
+        logger.info(f"   P99 Reason: {p99_reason:.1f}ms, P99 Reflect: {p99_reflect:.1f}ms\n")
         
         result = {
             "system": "vllm",

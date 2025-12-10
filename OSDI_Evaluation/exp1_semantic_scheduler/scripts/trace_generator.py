@@ -86,11 +86,28 @@ def generate_trace(
     requisite for Electors of the most numerous Branch of the State Legislature.
     """
 
-    # Tokenize to get exact context_length
-    tokens = tokenizer.encode(base_prompt)[:context_length]
+    # CRITICAL FIX: Guarantee exactly context_length tokens by repeating content
+    # The base_prompt is only ~237 tokens, but we need 2048 for memory oversubscription
+    # NOTE: We use add_special_tokens=False to avoid BOS token, then decode and re-encode
+    base_tokens = tokenizer.encode(base_prompt, add_special_tokens=False)
+    
+    if len(base_tokens) >= context_length:
+        # Base prompt is already long enough
+        tokens = base_tokens[:context_length]
+    else:
+        # Repeat base tokens until we exceed context_length, then truncate
+        repeat_factor = (context_length // len(base_tokens)) + 1
+        repeated_tokens = base_tokens * repeat_factor
+        tokens = repeated_tokens[:context_length]
+    
+    # Decode and re-encode with special tokens to get final prompt
     prompt_text = tokenizer.decode(tokens)
-
-    logger.info(f"Prompt: {len(tokens)} tokens")
+    final_tokens = tokenizer.encode(prompt_text)
+    
+    logger.info(f"Prompt: {len(final_tokens)} tokens (target: {context_length}, with BOS)")
+    
+    # Store the tokens WITHOUT BOS for consistency, but prompts will have BOS when encoded
+    assert len(tokens) == context_length, f"Expected {context_length} tokens, got {len(tokens)}"
 
     # Create identical prompts for all agents
     prompts = [prompt_text] * n_agents
@@ -134,17 +151,49 @@ def load_trace(trace_path: Path) -> Dict[str, Any]:
 
 def main():
     """Generate traces for all N values."""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Generate workload traces for OSDI experiments")
+    parser.add_argument(
+        "--density",
+        type=str,
+        choices=["standard", "high"],
+        default="standard",
+        help="Workload density: 'standard' (0.2/s) or 'high' (4.0/s)"
+    )
+    parser.add_argument(
+        "--n-agents",
+        type=int,
+        nargs="+",
+        default=[10, 20, 30, 40, 50, 60, 70, 80],
+        help="List of agent counts to generate traces for"
+    )
+    
+    args = parser.parse_args()
+    
     # Use absolute path relative to this script
     script_dir = Path(__file__).parent
     output_dir = script_dir.parent / "traces"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    agent_counts = [10, 20, 30, 40, 50, 60, 70, 80]
-
-    for n in agent_counts:
+    # Set arrival rate based on density
+    if args.density == "standard":
+        arrival_rate = 0.2  # 1 agent per 5 seconds (low contention)
+        density_suffix = ""
+    elif args.density == "high":
+        # 15 agents per second to exceed vLLM's capacity
+        # vLLM capacity: ~26 concurrent sequences
+        # Service time: ~1.7s (Reason + Reflect)
+        # Required rate: 26 / 1.7s ≈ 15.3 agents/sec to saturate
+        arrival_rate = 15.0
+        density_suffix = "_high_density"
+    
+    logger.info(f"Generating {args.density} density traces (arrival_rate={arrival_rate}/s)")
+    
+    for n in args.n_agents:
         trace = generate_trace(
             n_agents=n,
-            arrival_rate=0.2,  # 1 agent per 5 seconds
+            arrival_rate=arrival_rate,
             think_time_min=10.0,
             think_time_max=20.0,
             context_length=2048,
@@ -152,10 +201,10 @@ def main():
             seed=42,  # Fixed seed for reproducibility
         )
 
-        output_path = output_dir / f"trace_{n}.json"
+        output_path = output_dir / f"trace_{n}{density_suffix}.json"
         save_trace(trace, output_path)
 
-    logger.info(f"Generated traces for N={agent_counts}")
+    logger.info(f"Generated {args.density} density traces for N={args.n_agents}")
 
 
 if __name__ == "__main__":
