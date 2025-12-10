@@ -287,44 +287,49 @@ def generate_cache_histogram(results: Dict[str, Dict], output_path: str):
         print("Warning: matplotlib not available, skipping histogram generation")
         return
     
-    # Create histogram
-    fig, ax = plt.subplots(figsize=(12, 6))
+    # Create bar chart for cold vs warm
+    fig, ax = plt.subplots(figsize=(8, 5))
     
-    # Create bins
-    all_latencies = []
     labels = []
+    values = []
+    errors = []
     colors = []
     
-    if 'cache_on' in results:
-        all_latencies.append(results['cache_on']['mean_latency_ms'])
-        labels.append('Cache ON')
-        colors.append('#2ecc71')
-    
-    if 'cache_off' in results:
-        all_latencies.append(results['cache_off']['mean_latency_ms'])
-        labels.append('Cache OFF')
+    if 'cold_cache' in results:
+        labels.append('Cold (meta-sim)')
+        values.append(results['cold_cache'].get('mean_latency_ms', 0))
+        errors.append(results['cold_cache'].get('ci_95_ms', 0))
         colors.append('#e74c3c')
     
-    x_pos = np.arange(len(labels))
-    bars = ax.bar(x_pos, all_latencies, color=colors, alpha=0.7, edgecolor='black', linewidth=2)
+    if 'warm_cache' in results:
+        labels.append('Warm (cached)')
+        values.append(results['warm_cache'].get('mean_latency_ms', 0))
+        errors.append(results['warm_cache'].get('ci_95_ms', 0))
+        colors.append('#2ecc71')
     
-    # Labels
+    if not labels:
+        print("No cache metrics to plot.")
+        return
+    
+    x_pos = np.arange(len(labels))
+    bars = ax.bar(x_pos, values, yerr=errors, color=colors, alpha=0.8,
+                  edgecolor='black', linewidth=1.5, capsize=6)
+    
     ax.set_ylabel('Mean Token Latency (ms)', fontsize=12)
-    ax.set_title('Ablation 3: Plan Cache Effectiveness\nImpact on Per-Token Latency', fontsize=14)
+    ax.set_title('Ablation 3: Plan Cache Effectiveness\nCold (meta-sim) vs Warm (cached)', fontsize=13, fontweight='bold')
     ax.set_xticks(x_pos)
     ax.set_xticklabels(labels, fontsize=11)
     ax.grid(axis='y', alpha=0.3)
     
-    # Add value labels
     for bar in bars:
         height = bar.get_height()
         ax.text(bar.get_x() + bar.get_width()/2., height,
                f'{height:.1f}ms',
-               ha='center', va='bottom', fontsize=11, fontweight='bold')
+               ha='center', va='bottom', fontsize=10, fontweight='bold')
     
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
-    print(f"✅ Histogram saved to {output_path}")
+    print(f"✅ Saved: {output_path}")
 
 
 def generate_latex_table(results: Dict[str, Dict]) -> str:
@@ -424,14 +429,14 @@ def main():
     print("\n" + "="*80)
     print("Summary:")
     print("="*80)
-    if 'cache_on' in results and 'cache_off' in results:
-        mean_on = results['cache_on'].get('mean_latency_ms', 0)
-        mean_off = results['cache_off'].get('mean_latency_ms', 0)
-        hit_rate = results['cache_on'].get('cache_hit_rate_pct', 0)
-        print(f"Cache Hit Rate: {hit_rate:.1f}%")
-        print(f"Mean Latency: {mean_on:.2f}ms (cache ON) vs {mean_off:.2f}ms (cache OFF)")
-        if mean_on > 0:
-            print(f"Speedup: {mean_off/mean_on:.1f}x with caching")
+    cold = results.get('cold_cache', {})
+    warm = results.get('warm_cache', {})
+    impact = results.get('cache_impact', {})
+    if cold and warm:
+        print(f"Cold (meta-sim): {cold.get('mean_latency_ms', 0):.2f} ± {cold.get('ci_95_ms', 0):.2f}ms")
+        print(f"Warm (cached):   {warm.get('mean_latency_ms', 0):.2f} ± {warm.get('ci_95_ms', 0):.2f}ms")
+        if 'speedup' in impact:
+            print(f"Speedup from caching: {impact.get('speedup', 0):.1f}x (latency reduction {impact.get('latency_reduction_pct', 0):.1f}%)")
 
 
 if __name__ == '__main__':

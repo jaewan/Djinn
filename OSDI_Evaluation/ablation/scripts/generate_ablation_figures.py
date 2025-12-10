@@ -105,6 +105,120 @@ def generate_os_tax_figure(results: Dict, output_path: str):
     plt.close()
 
 
+def generate_arena_latency_figure(results: Dict, output_path: str):
+    """Generate figure for Session Arena allocation latency (Ablation 2)."""
+    if not MATPLOTLIB_AVAILABLE or 2 not in results:
+        return
+    
+    print("Generating Session Arena latency figure...")
+    res = results[2]
+    arena_sizes = sorted(res.keys(), key=lambda x: int(x))
+    if not arena_sizes:
+        return
+    
+    means = [res[a].get('mean_us', 0) for a in arena_sizes]
+    ci95 = [res[a].get('ci_95_us', 0) for a in arena_sizes]
+    p99s = [res[a].get('p99_us', 0) for a in arena_sizes]
+    
+    x = np.arange(len(arena_sizes))
+    width = 0.35
+    fig, ax = plt.subplots(figsize=(8, 5))
+    
+    bars = ax.bar(x, means, yerr=ci95, width=width, capsize=6,
+                  label='Mean (95% CI)', color='#3498db', edgecolor='black', linewidth=1.2)
+    ax.plot(x, p99s, marker='o', linestyle='--', color='#e74c3c', label='P99')
+    
+    ax.set_xlabel('Arena Size (MB)', fontsize=12)
+    ax.set_ylabel('Latency (µs)', fontsize=12)
+    ax.set_title('Ablation 2: Session Arena Allocation Latency', fontsize=13, fontweight='bold')
+    ax.set_xticks(x)
+    ax.set_xticklabels([f'{a}MB' for a in arena_sizes])
+    ax.legend(fontsize=10)
+    ax.grid(axis='y', alpha=0.3)
+    
+    for bar in bars:
+        h = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2., h, f'{h:.1f}µs', ha='center', va='bottom', fontsize=9)
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    print(f"✅ Saved: {output_path}")
+    plt.close()
+
+
+def generate_plan_cache_figure(results: Dict, output_path: str):
+    """Generate figure for Plan Cache (Ablation 3) cold vs warm."""
+    if not MATPLOTLIB_AVAILABLE or 3 not in results:
+        return
+    
+    print("Generating Plan Cache figure...")
+    res = results[3]
+    cold = res.get('cold_cache', {})
+    warm = res.get('warm_cache', {})
+    if not cold or not warm:
+        return
+    
+    labels = ['Cold (meta-sim)', 'Warm (cached)']
+    means = [cold.get('mean_latency_ms', 0), warm.get('mean_latency_ms', 0)]
+    ci95 = [cold.get('ci_95_ms', 0), warm.get('ci_95_ms', 0)]
+    colors = ['#e74c3c', '#2ecc71']
+    
+    x = np.arange(len(labels))
+    fig, ax = plt.subplots(figsize=(8, 5))
+    bars = ax.bar(x, means, yerr=ci95, color=colors, alpha=0.85,
+                  edgecolor='black', linewidth=1.2, capsize=6)
+    
+    ax.set_ylabel('Mean Token Latency (ms)', fontsize=12)
+    ax.set_title('Ablation 3: Plan Cache Effectiveness\nCold (meta-sim) vs Warm (cached)', fontsize=13, fontweight='bold')
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=11)
+    ax.grid(axis='y', alpha=0.3)
+    
+    for bar in bars:
+        h = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2., h, f'{h:.1f}ms', ha='center', va='bottom', fontsize=10)
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    print(f"✅ Saved: {output_path}")
+    plt.close()
+
+
+def generate_semantic_signals_figure(results: Dict, output_path: str):
+    """Generate figure for Semantic Signals (Ablation 4)."""
+    if not MATPLOTLIB_AVAILABLE or 4 not in results:
+        return
+    
+    print("Generating Semantic Signals figure...")
+    res = results[4]
+    modes = ['proactive', 'reactive', 'none']
+    labels = ['Proactive', 'Reactive', 'None']
+    
+    agents = [res.get(m, {}).get('max_agents', 0) for m in modes]
+    ci = [res.get(m, {}).get('max_agents_ci_95', 0) for m in modes]
+    latencies = [res.get(m, {}).get('p99_latency_ms', 0) for m in modes]
+    
+    x = np.arange(len(labels))
+    fig, ax = plt.subplots(figsize=(8, 5))
+    
+    bars = ax.bar(x, agents, yerr=ci, color=['#2ecc71', '#f39c12', '#e74c3c'],
+                  edgecolor='black', linewidth=1.2, capsize=6, alpha=0.85)
+    ax.set_ylabel('Max Concurrent Agents', fontsize=12)
+    ax.set_title('Ablation 4: Semantic Signal Value', fontsize=13, fontweight='bold')
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=11)
+    ax.grid(axis='y', alpha=0.3)
+    
+    for bar, lat in zip(bars, latencies):
+        h = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2., h, f'{h:.0f}\nP99 {lat:.0f}ms', ha='center', va='bottom', fontsize=9)
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    print(f"✅ Saved: {output_path}")
+    plt.close()
+
+
 def generate_comparison_figure(results_dir: Path, output_path: str):
     """Generate comparison figure showing all four ablations together."""
     if not MATPLOTLIB_AVAILABLE:
@@ -170,11 +284,11 @@ def generate_summary_latex_document(results_dir: Path, output_path: str):
         "",
         r"See \texttt{ablation\_os\_tax\_table.tex} for results.",
         "",
-        r"\section*{Ablation 2: Session Arena Decomposition}",
+        r"\section*{Ablation 2: Session Arena Allocation Latency}",
         "",
         r"See \texttt{ablation\_arena\_table.tex} for results.",
         "",
-        r"\section*{Ablation 3: Plan Cache Effectiveness}",
+        r"\section*{Ablation 3: Plan Cache Effectiveness (Cold vs Warm)}",
         "",
         r"See \texttt{ablation\_cache\_table.tex} for results.",
         "",
@@ -217,10 +331,12 @@ def main():
         return 1
     
     # Generate individual figures
-    if 1 in results:
-        generate_os_tax_figure(results, str(output_dir / 'ablation_1_os_tax.pdf'))
+    generate_os_tax_figure(results, str(output_dir / 'ablation_1_os_tax.pdf'))
+    generate_arena_latency_figure(results, str(output_dir / 'ablation_2_arena_latency.pdf'))
+    generate_plan_cache_figure(results, str(output_dir / 'ablation_3_plan_cache.pdf'))
+    generate_semantic_signals_figure(results, str(output_dir / 'ablation_4_semantic_signals.pdf'))
     
-    # Generate comparison figure
+    # Generate comparison figure (placeholder)
     generate_comparison_figure(results_dir, str(output_dir / 'ablation_summary.pdf'))
     
     # Generate LaTeX document

@@ -39,15 +39,15 @@ class ArenaBenchmark:
     """Track allocation latency results for different arena sizes."""
     
     def __init__(self):
-        self.results = {}  # arena_mb -> latencies_list
+        self.results = {}  # arena_mb -> metrics dict
     
-    def record(self, arena_mb: int, latencies: List[float]):
-        """Record allocation latencies for an arena size."""
-        self.results[arena_mb] = latencies
+    def record(self, arena_mb: int, metrics: Dict):
+        """Record metrics for an arena size."""
+        self.results[arena_mb] = metrics
     
-    def get_result(self, arena_mb: int) -> List[float]:
-        """Get latencies for an arena size."""
-        return self.results.get(arena_mb, [])
+    def get_result(self, arena_mb: int) -> Dict:
+        """Get metrics for an arena size."""
+        return self.results.get(arena_mb, {})
 
 
 def benchmark_arena_allocation(arena_mb: int, n_sessions: int = 1000, n_trials: int = 3) -> Tuple[List[float], Dict]:
@@ -137,6 +137,7 @@ def benchmark_arena_allocation(arena_mb: int, n_sessions: int = 1000, n_trials: 
                 'std': float(std_latency),
                 'ci_95': float(ci_95),
                 'mean_with_ci': f"{mean_latency:.2f} ± {ci_95:.2f}us",
+                'count': int(len(all_lats)),
             },
             
             'scaling': {
@@ -209,16 +210,23 @@ def run_ablation_study(arena_sizes: List[int], n_sessions: int = 1000, n_trials:
             n_sessions=n_sessions,
             n_trials=n_trials
         )
-        benchmark.record(arena_mb, latencies)
+        # Flatten metrics to a concise summary for downstream consumers
+        latency_stats = metrics.get('latency_us', {})
+        benchmark.record(arena_mb, {
+            'latencies_us': latencies,
+            'mean_us': latency_stats.get('mean', 0),
+            'p99_us': latency_stats.get('p99', 0),
+            'std_us': latency_stats.get('std', 0),
+            'ci_95_us': latency_stats.get('ci_95', 0),
+            'count': latency_stats.get('count', len(latencies)) if isinstance(latency_stats.get('count'), (int, float)) else len(latencies),
+        })
     
     return benchmark.results
 
 
-def generate_decomposition_figure(results: Dict[Tuple[int, str], int], output_path: str):
+def generate_latency_figure(results: Dict[int, Dict], output_path: str):
     """
-    Generate a figure showing arena size vs max agents for both modes.
-    
-    This shows the decomposition of density gains.
+    Generate a figure showing allocation latency vs arena size with error bars.
     """
     try:
         import matplotlib.pyplot as plt
@@ -227,44 +235,45 @@ def generate_decomposition_figure(results: Dict[Tuple[int, str], int], output_pa
         print("Warning: matplotlib not available, skipping figure generation")
         return
     
-    # Extract data
-    arena_sizes = sorted(set(arena for arena, _ in results.keys()))
-    semantic_agents = [results.get((a, 'semantic'), 0) for a in arena_sizes]
-    reactive_agents = [results.get((a, 'reactive'), 0) for a in arena_sizes]
+    arena_sizes = sorted(results.keys())
+    if not arena_sizes:
+        print("No results to plot for arena latency.")
+        return
     
-    # Create figure
-    fig, ax = plt.subplots(figsize=(10, 6))
+    means = [results[a].get('mean_us', 0) for a in arena_sizes]
+    p99s = [results[a].get('p99_us', 0) for a in arena_sizes]
+    ci95 = [results[a].get('ci_95_us', 0) for a in arena_sizes]
     
     x = np.arange(len(arena_sizes))
     width = 0.35
     
-    bars1 = ax.bar(x - width/2, semantic_agents, width, label='Semantic (Proactive Signals)', color='#2ecc71')
-    bars2 = ax.bar(x + width/2, reactive_agents, width, label='Reactive (Timeout)', color='#e74c3c')
+    fig, ax = plt.subplots(figsize=(10, 6))
+    bars = ax.bar(x, means, yerr=ci95, width=width, capsize=6,
+                  label='Mean Allocation Latency (95% CI)', color='#3498db', alpha=0.8, edgecolor='black')
     
-    # Labels and formatting
+    ax.plot(x, p99s, marker='o', linestyle='--', color='#e74c3c', label='P99 Latency')
+    
     ax.set_xlabel('Session Arena Size (MB)', fontsize=12)
-    ax.set_ylabel('Maximum Concurrent Agents', fontsize=12)
-    ax.set_title('Ablation 2: Session Arena Decomposition\nEffect of Arena Size on Agent Density', fontsize=14)
+    ax.set_ylabel('Latency (µs)', fontsize=12)
+    ax.set_title('Ablation 2: Session Arena Allocation Latency', fontsize=14, fontweight='bold')
     ax.set_xticks(x)
     ax.set_xticklabels([f'{a}MB' for a in arena_sizes])
     ax.legend(fontsize=11)
     ax.grid(axis='y', alpha=0.3)
     
-    # Add value labels on bars
-    for bars in [bars1, bars2]:
-        for bar in bars:
-            height = bar.get_height()
-            if height > 0:
-                ax.text(bar.get_x() + bar.get_width()/2., height,
-                       f'{int(height)}',
-                       ha='center', va='bottom', fontsize=10)
+    # Add value labels
+    for bar in bars:
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2., height,
+                f'{height:.1f}µs',
+                ha='center', va='bottom', fontsize=10)
     
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     print(f"✅ Figure saved to {output_path}")
 
 
-def generate_latex_table(results: Dict[int, List[float]]) -> str:
+def generate_latex_table(results: Dict[int, Dict]) -> str:
     """Generate a LaTeX table for arena allocation latency results."""
     lines = [
         r"\begin{table}[h]",
@@ -278,11 +287,11 @@ def generate_latex_table(results: Dict[int, List[float]]) -> str:
     arena_sizes = sorted(results.keys())
     
     for arena_mb in arena_sizes:
-        latencies = np.array(results[arena_mb])
-        mean_us = np.mean(latencies)
-        p99_us = np.percentile(latencies, 99)
-        std_us = np.std(latencies)
-        count = len(latencies)
+        metrics = results[arena_mb]
+        mean_us = metrics.get('mean_us', 0)
+        p99_us = metrics.get('p99_us', 0)
+        std_us = metrics.get('std_us', 0)
+        count = metrics.get('count', 0)
         
         lines.append(
             f"{arena_mb} MB & {mean_us:.2f}$\\mu$s & {p99_us:.2f}$\\mu$s & {std_us:.2f}$\\mu$s & {count} \\\\"
@@ -320,9 +329,7 @@ def main():
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
     with open(output_path, 'w') as f:
-        # Convert tuple keys to strings for JSON serialization
-        json_results = {f"{arena}_{mode}": agents for (arena, mode), agents in results.items()}
-        json.dump(json_results, f, indent=2)
+        json.dump(results, f, indent=2)
     print(f"\n✅ Results saved to {output_path}")
     
     # Generate LaTeX table
@@ -339,8 +346,8 @@ def main():
     print(f"\n✅ LaTeX table saved to {latex_path}")
     
     # Generate figure
-    figure_path = str(output_path.parent / 'ablation_arena_decomposition.pdf')
-    generate_decomposition_figure(results, figure_path)
+    figure_path = str(output_path.parent / 'ablation_arena_latency.pdf')
+    generate_latency_figure(results, figure_path)
     
     # Summary
     print("\n" + "="*80)
