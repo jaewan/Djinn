@@ -160,6 +160,219 @@ class WeightStreamer:
         
         logger.info("✅ Weight streamer stopped")
     
+    def prefetch_block(self, model_id: str, block_idx: int) -> None:
+        """
+        Trigger prefetch of an entire transformer block into a streaming slot.
+        
+        This is the NEW block-granularity interface. Entire transformer blocks
+        are the atomic unit of streaming.
+        
+        For resident blocks: no-op (already in buffer)
+        For streamed blocks: async H2D copy of concatenated block buffer into slot
+        
+        Args:
+            model_id: Model ID
+            block_idx: Block index (0-based)
+        """
+        registration = self.ring_buffer.registrations.get(model_id)
+        if not registration:
+            logger.warning(f"Model {model_id} not registered in ring buffer")
+            return
+        
+        # Check if block exists
+        if block_idx >= len(registration.blocks):
+            logger.warning(f"Block {block_idx} out of range (have {len(registration.blocks)} blocks)")
+            return
+        
+        block = registration.blocks[block_idx]
+        
+        # If block is resident, no prefetch needed
+        if block.is_resident:
+            return
+        
+        # Check if already prefetched
+        if block_idx in registration.block_to_slot:
+            # Already in a slot
+            return
+        
+        # Get slot for this block (circular: block_idx % num_slots)
+        if not registration.streaming_slots:
+            logger.error(f"No streaming slots available for block {block_idx}")
+            return
+        
+        slot_id = block_idx % len(registration.streaming_slots)
+        slot = registration.streaming_slots[slot_id]
+        
+        # Wait for previous block in this slot to finish (if any)
+        if slot.current_block_idx is not None and slot.done_event is not None:
+            # Synchronize to ensure previous compute is done
+            slot.done_event.synchronize()
+        
+        # Async copy entire block buffer to slot
+        if block.host_buffer is None:
+            logger.error(f"Block {block_idx} has no host buffer")
+            return
+        
+        # Create byte view into slot
+        slot_view = self.ring_buffer.buffer[
+            slot.offset : slot.offset + block.total_bytes
+        ]
+        
+        # Async copy on prefetch stream
+        if self.prefetch_stream is not None:
+            with torch.cuda.stream(self.prefetch_stream):
+                slot_view.copy_(block.host_buffer, non_blocking=True)
+                slot.ready_event.record(self.prefetch_stream)
+        else:
+            # CPU fallback
+            slot_view.copy_(block.host_buffer)
+        
+        # Update slot tracking
+        slot.current_block_idx = block_idx
+        registration.block_to_slot[block_idx] = slot_id
+        
+        self.stats['total_prefetch_jobs'] += 1
+        self.stats['prefetch_success'] += 1
+        self.stats['total_bytes_prefetched'] += block.total_bytes
+        
+        logger.debug(
+            f"Prefetched block {block_idx} ({block.block_name}, {block.total_bytes / 1024**2:.1f}MB) "
+            f"into slot {slot_id}"
+        )
+    
+    def prefetch_layer(self, model_id: str, layer_idx: int, layer_name: str) -> None:
+        """
+        LEGACY: Trigger prefetch of a specific layer into streaming slots.
+        
+        This is kept for backward compatibility. New code should use prefetch_block().
+        
+        For resident layers: no-op (already in buffer)
+        For streamed layers: async H2D copy into next available slot
+        
+        Args:
+            model_id: Model ID
+            layer_idx: Layer index
+            layer_name: Layer name (can be parameter name or module name)
+        """
+        registration = self.ring_buffer.registrations.get(model_id)
+        if not registration:
+            logger.warning(f"Model {model_id} not registered in ring buffer")
+            return
+        
+        # Check if layer_name is a parameter name
+        allocation = registration.layer_allocations.get(layer_name)
+        if allocation:
+            # Direct parameter name - prefetch this single parameter
+            self._prefetch_single_param(registration, layer_name, allocation)
+            return
+        
+        # Not a parameter name - try as module name
+        # Use module_to_params mapping to find all parameters for this module
+        param_names = registration.module_to_params.get(layer_name, [])
+        if not param_names:
+            # Also try with common suffixes
+            for suffix in ['.weight', '.bias']:
+                param_name = layer_name + suffix
+                if param_name in registration.layer_allocations:
+                    allocation = registration.layer_allocations[param_name]
+                    self._prefetch_single_param(registration, param_name, allocation)
+            return
+        
+        # Prefetch all parameters of this module
+        for param_name in param_names:
+            allocation = registration.layer_allocations.get(param_name)
+            if allocation:
+                self._prefetch_single_param(registration, param_name, allocation)
+    
+    def _prefetch_single_param(self, registration, param_name: str, allocation) -> None:
+        """Prefetch a single parameter into a streaming slot."""
+        if allocation.is_resident:
+            # Layer is permanently resident, no prefetch needed
+            return
+        
+        # Layer needs streaming - check if already in a slot
+        if param_name in registration.layer_to_slot:
+            # Already prefetched
+            return
+        
+        # Layer not yet streamed - find or allocate a slot
+        slot = self._get_available_slot(registration, param_name)
+        if slot is None:
+            logger.warning(f"No available slot for {param_name}, inference may block")
+            return
+        
+        # Async copy from pinned host memory to slot
+        host_tensor = registration.host_weights.get(param_name)
+        if host_tensor is None:
+            logger.error(f"No host weight found for streamed layer {param_name}")
+            return
+        
+        # Create view into the slot
+        slot_view = self.ring_buffer.buffer[
+            slot.offset : slot.offset + allocation.size_bytes
+        ].view(allocation.dtype).view(allocation.shape)
+        
+        # Async copy on prefetch stream
+        if self.prefetch_stream is not None:
+            with torch.cuda.stream(self.prefetch_stream):
+                slot_view.copy_(host_tensor, non_blocking=True)
+                slot.ready_event.record(self.prefetch_stream)
+        else:
+            # CPU fallback (should not happen in practice)
+            slot_view.copy_(host_tensor)
+        
+        # Update slot tracking
+        slot.current_layer = param_name
+        registration.layer_to_slot[param_name] = slot.slot_id
+        
+        self.stats['total_prefetch_jobs'] += 1
+        self.stats['prefetch_success'] += 1
+        self.stats['total_bytes_prefetched'] += allocation.size_bytes
+        
+        logger.debug(
+            f"Prefetched {param_name} ({allocation.size_bytes / 1024**2:.1f}MB) "
+            f"into slot {slot.slot_id}"
+        )
+    
+    def _get_available_slot(self, registration, layer_name):
+        """
+        Find a free slot or evict LRU slot.
+        
+        Returns:
+            StreamingSlot or None if no slots available
+        """
+        if not registration.streaming_slots:
+            return None
+        
+        # Check if layer already in a slot
+        if layer_name in registration.layer_to_slot:
+            slot_id = registration.layer_to_slot[layer_name]
+            return registration.streaming_slots[slot_id]
+        
+        # Find a free slot
+        for slot in registration.streaming_slots:
+            if slot.current_layer is None:
+                return slot
+        
+        # All slots occupied - evict LRU (first slot for simplicity)
+        # Wait for its done_event to ensure compute is finished
+        slot = registration.streaming_slots[0]
+        
+        if slot.done_event is not None:
+            # This is a CPU-side sync, but should be rare and brief
+            # since we're evicting the oldest slot
+            slot.done_event.synchronize()
+        
+        # Evict
+        if slot.current_layer:
+            old_layer = slot.current_layer
+            if old_layer in registration.layer_to_slot:
+                del registration.layer_to_slot[old_layer]
+            slot.current_layer = None
+            logger.debug(f"Evicted {old_layer} from slot {slot.slot_id}")
+        
+        return slot
+    
     def queue_prefetch(
         self,
         model_id: str,
