@@ -1,0 +1,277 @@
+{
+  "n_agents": 30,
+  "arrival_rate": 0.5,
+  "context_length": 512,
+  "think_time_range": [
+    5.0,
+    15.0
+  ],
+  "seed": 42,
+  "agents": [
+    {
+      "agent_id": 0,
+      "model": "mistral-7b",
+      "task_type": "medium",
+      "arrival_time": 0.9385361799537182,
+      "think_time": 11.394267984578837,
+      "prompt_text": "Explain the following concept in detail: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. "
+    },
+    {
+      "agent_id": 1,
+      "model": "llama-7b",
+      "task_type": "complex",
+      "arrival_time": 6.958779041788761,
+      "think_time": 5.25010755222667,
+      "prompt_text": "Analyze the following complex scenario and provide a detailed reasoning: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. "
+    },
+    {
+      "agent_id": 2,
+      "model": "llama-7b",
+      "task_type": "complex",
+      "arrival_time": 9.59227042887966,
+      "think_time": 7.750293183691193,
+      "prompt_text": "Analyze the following complex scenario and provide a detailed reasoning: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. "
+    },
+    {
+      "agent_id": 3,
+      "model": "phi-2",
+      "task_type": "simple",
+      "arrival_time": 11.418155536431566,
+      "think_time": 7.232107381488228,
+      "prompt_text": "Answer the following question briefly: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. "
+    },
+    {
+      "agent_id": 4,
+      "model": "phi-2",
+      "task_type": "simple",
+      "arrival_time": 11.75740527735626,
+      "think_time": 12.364712141640124,
+      "prompt_text": "Answer the following question briefly: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. "
+    },
+    {
+      "agent_id": 5,
+      "model": "phi-2",
+      "task_type": "simple",
+      "arrival_time": 12.096597861185469,
+      "think_time": 11.766994874229113,
+      "prompt_text": "Answer the following question briefly: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. "
+    },
+    {
+      "agent_id": 6,
+      "model": "llama-7b",
+      "task_type": "complex",
+      "arrival_time": 12.21627539840283,
+      "think_time": 13.921795677048454,
+      "prompt_text": "Analyze the following complex scenario and provide a detailed reasoning: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. "
+    },
+    {
+      "agent_id": 7,
+      "model": "llama-7b",
+      "task_type": "complex",
+      "arrival_time": 16.23873712736271,
+      "think_time": 5.869388326294161,
+      "prompt_text": "Analyze the following complex scenario and provide a detailed reasoning: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. "
+    },
+    {
+      "agent_id": 8,
+      "model": "mistral-7b",
+      "task_type": "medium",
+      "arrival_time": 18.07690143461724,
+      "think_time": 9.219218196852704,
+      "prompt_text": "Explain the following concept in detail: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. "
+    },
+    {
+      "agent_id": 9,
+      "model": "mistral-7b",
+      "task_type": "medium",
+      "arrival_time": 20.539401558026423,
+      "think_time": 5.297972194380703,
+      "prompt_text": "Explain the following concept in detail: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. "
+    },
+    {
+      "agent_id": 10,
+      "model": "llama-7b",
+      "task_type": "complex",
+      "arrival_time": 20.5810001740247,
+      "think_time": 7.186379748036034,
+      "prompt_text": "Analyze the following complex scenario and provide a detailed reasoning: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. "
+    },
+    {
+      "agent_id": 11,
+      "model": "mistral-7b",
+      "task_type": "medium",
+      "arrival_time": 27.588115124341325,
+      "think_time": 10.053552881033625,
+      "prompt_text": "Explain the following concept in detail: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. "
+    },
+    {
+      "agent_id": 12,
+      "model": "llama-7b",
+      "task_type": "complex",
+      "arrival_time": 31.160974211050675,
+      "think_time": 5.265359696838637,
+      "prompt_text": "Analyze the following complex scenario and provide a detailed reasoning: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. "
+    },
+    {
+      "agent_id": 13,
+      "model": "phi-2",
+      "task_type": "simple",
+      "arrival_time": 31.638349461548568,
+      "think_time": 6.988376506866485,
+      "prompt_text": "Answer the following question briefly: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. "
+    },
+    {
+      "agent_id": 14,
+      "model": "llama-7b",
+      "task_type": "complex",
+      "arrival_time": 32.039707439047895,
+      "think_time": 11.498844377795232,
+      "prompt_text": "Analyze the following complex scenario and provide a detailed reasoning: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. "
+    },
+    {
+      "agent_id": 15,
+      "model": "mistral-7b",
+      "task_type": "medium",
+      "arrival_time": 32.444930284712406,
+      "think_time": 10.449414806032166,
+      "prompt_text": "Explain the following concept in detail: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. "
+    },
+    {
+      "agent_id": 16,
+      "model": "llama-7b",
+      "task_type": "complex",
+      "arrival_time": 33.17043774363336,
+      "think_time": 7.204406220406967,
+      "prompt_text": "Analyze the following complex scenario and provide a detailed reasoning: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. "
+    },
+    {
+      "agent_id": 17,
+      "model": "mistral-7b",
+      "task_type": "medium",
+      "arrival_time": 34.65829340535507,
+      "think_time": 10.892656838759088,
+      "prompt_text": "Explain the following concept in detail: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. "
+    },
+    {
+      "agent_id": 18,
+      "model": "mistral-7b",
+      "task_type": "medium",
+      "arrival_time": 35.78936753891574,
+      "think_time": 13.094304566778266,
+      "prompt_text": "Explain the following concept in detail: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. "
+    },
+    {
+      "agent_id": 19,
+      "model": "llama-7b",
+      "task_type": "complex",
+      "arrival_time": 36.477813524023624,
+      "think_time": 5.06498759678061,
+      "prompt_text": "Analyze the following complex scenario and provide a detailed reasoning: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. "
+    },
+    {
+      "agent_id": 20,
+      "model": "phi-2",
+      "task_type": "simple",
+      "arrival_time": 38.37055527182322,
+      "think_time": 13.05819251832808,
+      "prompt_text": "Answer the following question briefly: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. "
+    },
+    {
+      "agent_id": 21,
+      "model": "mistral-7b",
+      "task_type": "medium",
+      "arrival_time": 38.6710243292779,
+      "think_time": 11.981393949882268,
+      "prompt_text": "Explain the following concept in detail: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. "
+    },
+    {
+      "agent_id": 22,
+      "model": "phi-2",
+      "task_type": "simple",
+      "arrival_time": 39.362055353282706,
+      "think_time": 8.40250516517992,
+      "prompt_text": "Answer the following question briefly: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. "
+    },
+    {
+      "agent_id": 23,
+      "model": "phi-2",
+      "task_type": "simple",
+      "arrival_time": 40.2746097897244,
+      "think_time": 6.554794998117815,
+      "prompt_text": "Answer the following question briefly: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. "
+    },
+    {
+      "agent_id": 24,
+      "model": "mistral-7b",
+      "task_type": "medium",
+      "arrival_time": 41.49247916544395,
+      "think_time": 14.572130722067811,
+      "prompt_text": "Explain the following concept in detail: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. "
+    },
+    {
+      "agent_id": 25,
+      "model": "phi-2",
+      "task_type": "simple",
+      "arrival_time": 44.568351187505776,
+      "think_time": 8.365945451126269,
+      "prompt_text": "Answer the following question briefly: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. "
+    },
+    {
+      "agent_id": 26,
+      "model": "llama-7b",
+      "task_type": "complex",
+      "arrival_time": 45.01382291176316,
+      "think_time": 5.927458433801479,
+      "prompt_text": "Analyze the following complex scenario and provide a detailed reasoning: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. "
+    },
+    {
+      "agent_id": 27,
+      "model": "llama-7b",
+      "task_type": "complex",
+      "arrival_time": 46.45788122182941,
+      "think_time": 5.96716376833464,
+      "prompt_text": "Analyze the following complex scenario and provide a detailed reasoning: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. "
+    },
+    {
+      "agent_id": 28,
+      "model": "llama-7b",
+      "task_type": "complex",
+      "arrival_time": 48.252890664448934,
+      "think_time": 13.474943663474598,
+      "prompt_text": "Analyze the following complex scenario and provide a detailed reasoning: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. "
+    },
+    {
+      "agent_id": 29,
+      "model": "llama-7b",
+      "task_type": "complex",
+      "arrival_time": 48.34801836396175,
+      "think_time": 11.037260313668911,
+      "prompt_text": "Analyze the following complex scenario and provide a detailed reasoning: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. "
+    }
+  ],
+  "model_configs": {
+    "llama-7b": {
+      "model_id": "meta-llama/Llama-2-7b-hf",
+      "size_gb": 14,
+      "task_type": "complex",
+      "description": "Complex reasoning tasks"
+    },
+    "mistral-7b": {
+      "model_id": "mistralai/Mistral-7B-v0.1",
+      "size_gb": 14,
+      "task_type": "medium",
+      "description": "Medium complexity tasks"
+    },
+    "phi-2": {
+      "model_id": "microsoft/phi-2",
+      "size_gb": 5,
+      "task_type": "simple",
+      "description": "Simple/fast tasks"
+    }
+  },
+  "model_distribution": {
+    "llama-7b": 0.4,
+    "mistral-7b": 0.4,
+    "phi-2": 0.2
+  }
+}

@@ -86,6 +86,9 @@ class RingBufferModelCache:
         self.hook_managers: Dict[str, RingBufferHookManager] = {}
         self.models_using_ring_buffer: set = set()
         
+        # Model switch coordinator for multi-model support (lazy init)
+        self.switch_coordinator: Optional['ModelSwitchCoordinator'] = None
+        
         logger.info(
             f"RingBufferModelCache initialized "
             f"(device={device}, max_vram_gb={max_vram_gb}, "
@@ -185,6 +188,22 @@ class RingBufferModelCache:
                 self.weight_streamer.start()
                 logger.info("✅ Started weight streamer (async pipelining)")
             
+            # Initialize model switch coordinator if needed
+            if self.switch_coordinator is None:
+                from .model_weight_swap_pool import get_model_swap_pool
+                from .model_switch_coordinator import ModelSwitchCoordinator
+                from ..policies.model_lru import ModelLRUPolicy
+                
+                swap_pool = get_model_swap_pool(pool_size_gb=64.0)
+                policy = ModelLRUPolicy()
+                
+                self.switch_coordinator = ModelSwitchCoordinator(
+                    ring_buffer=self.ring_buffer,
+                    swap_pool=swap_pool,
+                    eviction_policy=policy
+                )
+                logger.info("✅ Model switch coordinator initialized")
+            
             # Register model in ring buffer
             logger.info(f"Registering {fingerprint[:16]}... in ring buffer...")
             registration = self.ring_buffer.register_model(
@@ -194,7 +213,8 @@ class RingBufferModelCache:
             logger.info(
                 f"✅ Ring buffer registration complete: "
                 f"{len(registration.layer_names)} layers, "
-                f"skip-end allocation at {registration.skip_end_offset} bytes"
+                f"buffer range: {registration.buffer_start_offset / 1024**2:.1f}MB - "
+                f"{registration.buffer_end_offset / 1024**2:.1f}MB"
             )
             
             # Install weight hooks on model
@@ -253,7 +273,7 @@ class RingBufferModelCache:
         result['method'] = 'standard_cache'
         return result
     
-    def execute(
+    async def execute(
         self,
         fingerprint: str,
         inputs: Dict[str, torch.Tensor],
@@ -262,13 +282,21 @@ class RingBufferModelCache:
         """
         Execute model (ring buffer or standard).
         
-        For ring buffer models: Weight hooks handle swapping during forward pass.
+        For ring buffer models: Ensures model is resident before execution.
         For standard models: Standard execution path.
         """
         
         if fingerprint in self.models_using_ring_buffer:
-            # Ring buffer model - just call forward (hooks handle weight swapping)
+            # Ring buffer model - ensure resident first
             logger.debug(f"Executing {fingerprint[:16]}... via ring buffer")
+            
+            # Ensure model is resident (may trigger model switching)
+            if self.switch_coordinator:
+                success = await self.switch_coordinator.ensure_model_resident(fingerprint)
+                if not success:
+                    raise RuntimeError(
+                        f"Failed to ensure model {fingerprint[:16]}... is resident"
+                    )
             
             # Get model from standard cache (it's stored there after being created)
             model = self.standard_cache.models.get(fingerprint)
@@ -298,8 +326,12 @@ class RingBufferModelCache:
                 'models_registered': len(self.ring_buffer.registrations),
                 'total_layers': sum(
                     len(m.layer_names) for m in self.ring_buffer.registrations.values()
-                )
+                ),
+                'resident_models': len(self.ring_buffer.get_resident_models()),
             }
+        
+        if self.switch_coordinator:
+            stats['switch_coordinator_stats'] = self.switch_coordinator.get_stats()
         
         return stats
     

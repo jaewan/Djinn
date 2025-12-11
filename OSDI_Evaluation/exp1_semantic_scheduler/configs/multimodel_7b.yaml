@@ -1,0 +1,46 @@
+# OSDI Multi-Model Experiment Configuration
+# Uses 7B-class models to demonstrate realistic multi-model serving
+
+models:
+  llama-7b:
+    model_id: "meta-llama/Llama-2-7b-hf"
+    size_gb: 14
+    task_type: "complex"
+    description: "Complex reasoning tasks"
+  
+  mistral-7b:
+    model_id: "mistralai/Mistral-7B-v0.1"
+    size_gb: 14
+    task_type: "medium"
+    description: "Medium complexity tasks"
+  
+  phi-2:
+    model_id: "microsoft/phi-2"
+    size_gb: 5
+    task_type: "simple"
+    description: "Simple/fast tasks"
+
+buffer:
+  capacity_gb: 25  # Forces swapping (33GB models > 25GB buffer = 1.32x oversubscription)
+  swap_pool_gb: 64  # Host RAM for swapped models
+
+experiment:
+  n_agents: 50
+  arrival_rate: 0.5  # agents/sec
+  think_time_range: [5.0, 15.0]  # seconds
+  max_tokens: 50
+  context_length: 512  # Input context length
+  
+  # Agent distribution across models
+  model_distribution:
+    llama-7b: 0.40  # 40% complex tasks
+    mistral-7b: 0.40  # 40% medium tasks
+    phi-2: 0.20  # 20% simple tasks
+
+# Expected memory usage:
+# - Llama-7B: 14GB
+# - Mistral-7B: 14GB
+# - Phi-2: 5GB
+# Total: 33GB
+# Buffer: 25GB
+# Oversubscription: 1.32x (forces model swapping)

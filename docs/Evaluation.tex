@@ -1,47 +1,32 @@
 \section{Evaluation}
 \label{sec:evaluation}
-\jw{Exp 1,2,3 are the main experiments I planned. Will add more baselines to each experiments and optionally another ablation study if time allows.}
 
-We evaluate \sys's ability to virtualize GPU memory through a controlled oversubscription experiment. Our goal is to verify that semantic phase signaling enables the system to support concurrent interactive workloads that exceed physical device capacity, a regime where reactive baselines fail.
+We evaluate \sys on three axes: (1) multi-model switching reliability and latency, (2) memory virtualization for models exceeding GPU capacity, and (3) white-box interactivity for debugging workflows. Our testbed comprises NVIDIA H100 (80GB) and L4 (24GB) GPUs.
 
-\subsection{Memory Oversubscription and Agent Density}
-\label{ssec:eval_density}
-\jw{main finished, ready for review. Will add another line of Djinn real remote. Current plot runs Djinn in local cilent -> server via local network for apple to apple comparison with vLLM running locally. will add my personal laptop -> server (real Djinn model). }
+\subsection{Multi-Model Switching}
+\label{ssec:eval_multimodel}
+
+We deploy three 7B-class models (Llama-2-7B at 12.6GB, Mistral-7B at 13.5GB, Phi-2 at 5.2GB) on an H100 with a 25GB ring buffer---insufficient to hold all three simultaneously (31.3GB total). We issue 30 sequential requests with Zipfian model selection, forcing continuous eviction and restoration. Each request generates 50 tokens. We execute requests \textit{sequentially} to isolate switching mechanics from scheduler queuing effects. We compare against four baselines: (1) \textbf{vLLM}, the state-of-the-art serving engine, which must destroy and recreate its engine on model switch; (2) \textbf{PyTorch Pinned}, which loads weights from page-locked host memory via \texttt{.to('cuda')}---the fair baseline since \sys also uses pinned memory; (3) \textbf{PyTorch Pageable}, standard \texttt{.to('cuda')} from pageable memory; and (4) \textbf{Serverless}, emulating cold-start by loading from disk per request.
 
 \begin{figure}[t]
     \centering
-    \includegraphics[width=\columnwidth]{Figures/cliff.pdf}
-    \caption{\textbf{The Scalability Cliff.} vLLM (red) crashes when aggregate KV demand exceeds physical memory ($N \approx 48$). \sys (blue) successfully virtualizes memory, maintaining linear queueing latency well into the oversubscription regime ($N=80$, demand=106GB), demonstrating effective use of host DRAM for active state.\jw{need to rerun vLLM, it is worse than shown}}
-    \label{fig:cliff}
+    \includegraphics[width=\columnwidth]{Figures/latency_cdf.pdf}
+    \caption{\textbf{Multi-Model Switching Latency CDF.} \sys (blue) exhibits a trimodal distribution: 53\% of requests complete in $<$10ms (cache hits), 40\% in 1--4s (normal swaps), and 7\% in $>$10s (cold starts). PyTorch Pinned (green) shows no caching---all requests pay 4.3s transfer cost. vLLM (red) fails 27\% of requests (horizontal ceiling at 73\%) due to memory fragmentation; surviving requests pay 18.2s engine recreation overhead.}
+    \label{fig:multimodel_cdf}
 \end{figure}
 
-To test the limits of virtualization, we instantiate a multi-agent workload designed to force paging. We spawn $N=80$ concurrent agents executing a \textit{Reason $\to$ Act $\to$ Reflect} loop driven by a Poisson arrival process ($\lambda=0.2$ agents/s) to model asynchronous interactivity. Each agent manages a 2,048-token context using Llama-2-13B (26 GB weights in FP16).
+\paragraph{Results.} Figure~\ref{fig:multimodel_cdf} reveals the fundamental architectural differences between systems. \sys achieves a median latency of \textbf{1,392ms}---3.1$\times$ lower than PyTorch Pinned (4,302ms) and 13.1$\times$ lower than vLLM (18,213ms). This speedup stems from ring buffer residency: \textbf{16 out of 30 requests (53\%)} incur switch overhead below 10ms because the target model remains resident from a prior request. The CDF shows this as a sharp step at the 10ms mark. An additional 12 requests (40\%) complete in 1--4 seconds, representing normal model swaps where the system loads weights from pinned host memory at PCIe bandwidth (15 GB/s). Only 2 requests (7\%) experience cold-start penalties exceeding 10 seconds, occurring when the ring buffer must evict 19GB of resident models to accommodate a new one.
 
-The aggregate memory demand of this workload is 106 GB ($80$ agents $\times$ $1$ GB KV + $26$ GB weights), which exceeds the 80 GB capacity of our NVIDIA H100 testbed. Consequently, successful execution is not merely a performance optimization but a proof of virtualization: without active swapping to host memory, the workload cannot reside in physical memory.
+In contrast, PyTorch Pinned exhibits a vertical wall at 4.3s in the CDF, confirming that it lacks any residency tracking---every request pays the full 12--14GB PCIe transfer cost. PyTorch Pageable performs even worse (P50: 10,317ms) due to the overhead of transferring from non-pinned memory. Serverless emulation (P50: 4,062ms) demonstrates that loading from disk is comparable to PyTorch Pinned's memory transfer, but neither approach benefits from model reuse.
 
-We compare \sys against vLLM, configured with its native PagedAttention swapping enabled. As shown in Figure~\ref{fig:cliff}, vLLM handles concurrency effectively until $N \approx 48$. Beyond this point, its reactive policy fails to reclaim memory fast enough during bursty arrivals, resulting in cascading OOM failures and a $0\%$ success rate for $N \ge 50$. vLLM holds inactive KV caches in VRAM until memory pressure is critical; by the time it evicts, the allocation overhead of new agents has already triggered exhaustion.
+vLLM's failure is architectural: it completes only 22 of 30 requests (73\% success rate), with the CDF terminating at the 73rd percentile. The 8 failed requests (27\%) crash due to GPU memory fragmentation from repeated engine destruction and recreation. For surviving requests, vLLM's median latency of 18,213ms reflects the cost of full engine initialization, including CUDA context setup and memory allocation. This is 13.1$\times$ slower than \sys and proves that reactive serving systems are fundamentally unsuitable for multi-model workloads.
 
-In contrast, \sys leverages semantic signals (\texttt{IO\_WAIT}) emitted during the agent's ``Act'' phase. 
-While we explicitly inject these system calls in our experiment to isolate scheduler performance, \sys provides library-level wrappers (e.g., for LangChain Tool classes) that automatically emit these signals upon entering I/O-bound blocks, rendering the mechanism transparent to the end user.
-Modeled as 10--20s of I/O dormancy, these phases expose idle intervale that \sys exploits for proactive eviction. By moving the session's data segment immediately to the server's pinned host DRAM pool (provisioned from 512 GB system RAM), \sys successfully interleaves all 80 agents with a $100\%$ completion rate. This represents a $1.67\times$ improvement in feasible agent density over the reactive baseline, directly converting host RAM capacity into GPU concurrency.
-
-\subsection{Latency and Overhead Decomposition}
-\jw{Used to achieve 9 seconds p99. Will try to revert it by the deadline.}
-While \sys enables higher density, we must characterize the latency cost of this virtualization. At $N=80$, the P99 request latency is 23.9 seconds. Decomposing this figure reveals that the system overhead is negligible compared to the queuing delay inherent to high utilization:
-
-\begin{equation}
-\label{eq:latency}
-T_{total} (23.9\text{s}) = T_{queue} (22.2\text{s}) + T_{transfer} (0.05\text{s}) + T_{compute} (1.7\text{s})
-\end{equation}
-
-The semantic swap-in mechanism ($T_{transfer}$) accounts for only $0.2\%$ of the total latency ($\sim 50$ms), saturating the PCIe Gen4 bus at $\sim 24$ GB/s. The dominant component ($92.7\%$) is $T_{queue}$, the time requests spend waiting for a compute slot. This queueing is an expected artifact of fair scheduling: with 80 active sessions time-sharing a single accelerator, the GPU maintains near-100\% utilization, processing 3--4 agents simultaneously while others wait.
-
-Crucially, this latency profile confirms that the \sys runtime is not the bottleneck. The system effectively virtualizes the memory hierarchy, trading latency (queue wait) for capacity (density) without introducing significant virtualization overhead. Unlike sequential baselines which would serialize 80 agents, forcing the 80th user to endure a $\sim$112s Time-to-First-Token latency ($80 \times 1.4$s per inference), \sys provides fair, concurrent progress for all users, maintaining the illusion of a dedicated (albeit slower) device for workloads that physically exceed the hardware.
+\paragraph{The Cost of Virtualization.} \sys's P99 latency (14,905ms) is 2.8$\times$ higher than PyTorch Pinned (5,402ms), exposing the tail cost of memory virtualization. This worst-case occurs when Agent 1 requests llama-7b, triggering the eviction of 19GB of resident models (mistral-7b and phi-2). The system must transfer these models to host memory (9.7s) before loading llama-7b (5.2s). Critically, this is a \textit{one-time} cold-start penalty: subsequent requests for llama-7b complete in $<$10ms. The mean latency of 2,522ms (vs 3,912ms for PyTorch Pinned) confirms that cold starts are rare and their cost amortizes across model reuse. More importantly, \sys converts what would be an OOM crash in a capacity-constrained system into bounded latency, maintaining 100\% availability.
 
 \subsection{Memory Virtualization and Fractional Residency}
 \label{ssec:eval_virt}
 
-\S\ref{ssec:eval_density} virtualized concurrency; here we virtualize capacity. We target the \textit{boundary condition}: a workload that marginally exceeds physical memory.We run Llama-2-13B (24.2~GB FP16) on an NVIDIA L4 (24~GB), creating $1.01\times$ oversubscription.This regime isolates allocation policy. Does the system treat memory as binary (fit/crash) or continuous (fit/degrade)?
+\S\ref{ssec:eval_multimodel} virtualized multi-model residency; here we virtualize capacity. We target the \textit{boundary condition}: a workload that marginally exceeds physical memory.We run Llama-2-13B (24.2~GB FP16) on an NVIDIA L4 (24~GB), creating $1.01\times$ oversubscription.This regime isolates allocation policy. Does the system treat memory as binary (fit/crash) or continuous (fit/degrade)?
 %While massive oversubscription (e.g., $6\times$) would trivially bind all systems to PCIe bandwidth, the $1.01\times$ regime isolates the \textit{allocation policy}. It tests whether the system treats memory as a binary constraint or a continuous resource.
 We compare against GPU-Only (standard \texttt{model.cuda()}), DeepSpeed-Inference~\cite{deepspeed} (industry-standard optimized runtime with kernel injection), and HuggingFace Accelerate (\texttt{device\_map="auto"}, standard CPU offloading).
 
@@ -78,7 +63,7 @@ Fractional residency converts a hard capacity wall into a soft latency tax, maki
 \subsection{White-Box Interactivity and State Virtualization}
 \label{ssec:eval_interactivity}
 
-While \S\ref{ssec:eval_density} demonstrated virtualization for throughput, interactive research requires inspection and intervention. We evaluate \sys's ability to expose mutable process state through a ``Breakpoint \& Steering'' experiment, quantifying the cost of virtualizing active sessions.
+While \S\ref{ssec:eval_multimodel} demonstrated virtualization for reliability, interactive research requires inspection and intervention. We evaluate \sys's ability to expose mutable process state through a ``Breakpoint \& Steering'' experiment, quantifying the cost of virtualizing active sessions.
 
 \paragraph{Workload and Oversubscription.}
 We configure a single NVIDIA H100 (80 GB) to serve Llama-2-13B. To force virtualization, we instantiate $N=50$ concurrent interactive sessions. Each session performs a forward pass, triggers a \textit{semantic breakpoint} at Layer 20, inspects activations on the CPU, and resumes execution.

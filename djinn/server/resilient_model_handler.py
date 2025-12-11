@@ -56,8 +56,8 @@ class ResilientModelHandler:
             
             use_ring_buffer = (
                 vmu_config and 
-                hasattr(vmu_config, 'use_ring_buffer_text_segment') and 
-                vmu_config.use_ring_buffer_text_segment
+                hasattr(vmu_config, 'enable_ring_buffer') and 
+                vmu_config.enable_ring_buffer
             )
             
             if use_ring_buffer:

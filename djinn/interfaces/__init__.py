@@ -5,12 +5,14 @@ These abstract base classes define the contract for pluggable components:
 - SwappableState: Any state that can be swapped GPU<->CPU
 - PhaseHandler: Workload-specific phase signal handling
 - EvictionPolicy: Policy for selecting which sessions to evict
+- ModelEvictionPolicy: Policy for selecting which models to evict
 - InferenceBackend: Framework-agnostic inference execution
 """
 
 from .swappable_state import SwappableState
 from .phase_handler import PhaseHandler
 from .eviction_policy import EvictionPolicy, EvictionCandidate
+from .model_eviction_policy import ModelEvictionPolicy, ModelEvictionCandidate
 from .inference_backend import InferenceBackend
 
 __all__ = [
@@ -18,6 +20,8 @@ __all__ = [
     "PhaseHandler",
     "EvictionPolicy",
     "EvictionCandidate",
+    "ModelEvictionPolicy",
+    "ModelEvictionCandidate",
     "InferenceBackend",
 ]
 

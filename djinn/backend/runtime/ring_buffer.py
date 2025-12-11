@@ -38,11 +38,20 @@ Usage:
 import logging
 import torch
 import threading
+import time
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
 
 logger = logging.getLogger(__name__)
+
+
+class ModelState(Enum):
+    """Lifecycle state of a model in the ring buffer."""
+    RESIDENT = "resident"        # Weights in GPU ring buffer
+    SWAPPING_OUT = "swapping"    # Being evicted to host
+    SWAPPED = "swapped"          # Weights in host RAM (not in buffer)
+    RESTORING = "restoring"      # Being restored to GPU
 
 
 class RingBufferConfig(Enum):
@@ -146,6 +155,14 @@ class ModelRegistration:
     layer_names: List[str] = field(default_factory=list)  # Ordered layer names (parameter names)
     total_bytes: int = 0
     
+    # Model lifecycle state
+    state: ModelState = ModelState.RESIDENT
+    swap_timestamp: Optional[float] = None
+    
+    # Buffer allocation tracking (for defragmentation)
+    buffer_start_offset: int = 0  # Start of this model's allocation in buffer
+    buffer_end_offset: int = 0    # End of this model's allocation in buffer
+    
     # Block-level tracking (NEW: for layer-granularity streaming)
     blocks: List[TransformerBlock] = field(default_factory=list)  # Ordered list of transformer blocks
     block_to_slot: Dict[int, int] = field(default_factory=dict)  # block_idx -> slot_id for streamed blocks
@@ -203,7 +220,9 @@ class WeightRingBuffer:
         
         self.device = device
         self.capacity_bytes = capacity_bytes
-        self.lock = threading.Lock()
+        # Use RLock (reentrant) to allow nested lock acquisition
+        # Required for restore_model -> can_fit_model -> get_resident_bytes chain
+        self.lock = threading.RLock()
         
         # Configuration for this instance (for ablation studies)
         if isinstance(config, RingBufferConfig):
@@ -230,6 +249,10 @@ class WeightRingBuffer:
         
         # Per-model state for runtime
         self.active_model_id: Optional[str] = None
+        
+        # Global allocation offset for multi-model support
+        self._global_allocation_offset: int = 0
+        
         self.stats = {
             'models_registered': 0,
             'total_writes': 0,
@@ -394,7 +417,9 @@ class WeightRingBuffer:
         All layers are allocated as resident with fixed offsets.
         """
         registration = ModelRegistration(model_id=model_id)
-        current_offset = 0
+        
+        # Use global allocation offset for multi-model support
+        current_offset = self._global_allocation_offset
         
         for layer_idx, layer_name in enumerate(layer_order):
             if layer_name not in state_dict:
@@ -438,6 +463,13 @@ class WeightRingBuffer:
         registration.total_bytes = total_bytes
         registration.resident_bytes = total_bytes
         registration.streamed_bytes = 0
+        
+        # Track buffer allocation range
+        registration.buffer_start_offset = self._global_allocation_offset
+        registration.buffer_end_offset = current_offset
+        
+        # Update global allocation offset
+        self._global_allocation_offset = current_offset
         
         # Copy all weights to ring buffer
         logger.info(f"Copying weights to ring buffer...")
@@ -606,6 +638,10 @@ class WeightRingBuffer:
         registration.total_bytes = total_bytes
         registration.resident_bytes = resident_bytes
         registration.streamed_bytes = total_bytes - resident_bytes
+        
+        # Track buffer allocation range (only resident portion)
+        registration.buffer_start_offset = 0
+        registration.buffer_end_offset = current_offset
         
         # Count resident and streamed blocks
         resident_blocks = [b for b in blocks if b.is_resident]
@@ -947,9 +983,400 @@ class WeightRingBuffer:
         with self.lock:
             self.registrations.clear()
             self.active_model_id = None
+            self._global_allocation_offset = 0
             # Reset stats
             self.stats['buffer_wraps'] = 0
             self.stats['total_writes'] = 0
             self.stats['bytes_transferred'] = 0
             logger.info("✅ Ring buffer cleared")
+    
+    # ============================================================================
+    # MULTI-MODEL SUPPORT: Eviction, Restoration, and Defragmentation
+    # ============================================================================
+    
+    def is_model_resident(self, model_id: str) -> bool:
+        """Check if model is currently resident in GPU buffer."""
+        with self.lock:
+            if model_id not in self.registrations:
+                return False
+            return self.registrations[model_id].state == ModelState.RESIDENT
+    
+    def get_resident_models(self) -> List[str]:
+        """Get list of resident model IDs."""
+        with self.lock:
+            return [
+                model_id for model_id, reg in self.registrations.items()
+                if reg.state == ModelState.RESIDENT
+            ]
+    
+    def get_resident_bytes(self) -> int:
+        """Get total bytes used by resident models."""
+        with self.lock:
+            return sum(
+                reg.total_bytes for reg in self.registrations.values()
+                if reg.state == ModelState.RESIDENT
+            )
+    
+    def can_fit_model(self, model_size_bytes: int) -> bool:
+        """
+        Check if a model of given size can fit in buffer.
+        
+        Considers both total capacity and current resident models.
+        Does NOT trigger defragmentation - just checks feasibility.
+        
+        Args:
+            model_size_bytes: Size of model to fit
+            
+        Returns:
+            True if model can fit (possibly after defragmentation)
+        """
+        with self.lock:
+            resident_bytes = self.get_resident_bytes()
+            free_bytes = self.capacity_bytes - resident_bytes
+            return free_bytes >= model_size_bytes
+    
+    def evict_model(self, model_id: str) -> int:
+        """
+        Mark model as evicted and free its buffer space.
+        
+        This does NOT actually move weights to host - that's done by ModelWeightSwapPool.
+        This just updates the ring buffer's internal state to mark the space as free.
+        
+        Args:
+            model_id: Model to evict
+            
+        Returns:
+            Bytes freed, or 0 if model not found/not resident
+        """
+        with self.lock:
+            if model_id not in self.registrations:
+                logger.warning(f"Cannot evict: model {model_id} not registered")
+                return 0
+            
+            reg = self.registrations[model_id]
+            
+            if reg.state != ModelState.RESIDENT:
+                logger.warning(
+                    f"Cannot evict: model {model_id} not resident (state={reg.state})"
+                )
+                return 0
+            
+            # Mark as swapped
+            reg.state = ModelState.SWAPPED
+            reg.swap_timestamp = time.time()
+            
+            bytes_freed = reg.total_bytes
+            
+            logger.info(
+                f"Evicted model {model_id[:16]}... from ring buffer: "
+                f"freed {bytes_freed / 1024**3:.1f}GB"
+            )
+            
+            return bytes_freed
+    
+    def restore_model(
+        self,
+        model_id: str,
+        weights: Dict[str, torch.Tensor]
+    ) -> int:
+        """
+        Restore model weights to ring buffer.
+        
+        Allocates space in buffer and copies weights from host to GPU.
+        May trigger defragmentation if needed.
+        
+        Includes state recovery: if restore fails mid-way, state is rolled back to SWAPPED.
+        
+        Args:
+            model_id: Model to restore
+            weights: Dict of param_name -> GPU tensor (already on GPU)
+            
+        Returns:
+            Bytes restored, or 0 if failed
+            
+        Raises:
+            RuntimeError: If cannot allocate space
+        """
+        with self.lock:
+            if model_id not in self.registrations:
+                logger.warning(f"Cannot restore: model {model_id} not registered")
+                return 0
+            
+            reg = self.registrations[model_id]
+            
+            if reg.state == ModelState.RESIDENT:
+                logger.debug(f"Model {model_id} already resident")
+                return 0
+            
+            # Save original state for recovery
+            original_state = reg.state
+            
+            # Mark as restoring
+            reg.state = ModelState.RESTORING
+            
+            try:
+                # Check if we have space
+                if not self.can_fit_model(reg.total_bytes):
+                    raise RuntimeError(
+                        f"Cannot restore model {model_id}: insufficient space "
+                        f"({reg.total_bytes / 1024**3:.1f}GB needed, "
+                        f"{(self.capacity_bytes - self.get_resident_bytes()) / 1024**3:.1f}GB available)"
+                    )
+                
+                # Allocate space (may trigger defragmentation)
+                start_offset = self._allocate_contiguous_space(reg.total_bytes)
+                
+                # Copy weights to buffer
+                current_offset = start_offset
+                for layer_name in reg.layer_names:
+                    if layer_name not in weights:
+                        continue
+                    
+                    alloc = reg.layer_allocations[layer_name]
+                    tensor = weights[layer_name]
+                    
+                    # Update allocation offset
+                    alloc.offset = current_offset
+                    
+                    # Copy to buffer
+                    ring_view = self.buffer[
+                        alloc.offset : alloc.offset + alloc.size_bytes
+                    ].view(alloc.dtype).view(alloc.shape)
+                    ring_view.copy_(tensor)
+                    
+                    current_offset += alloc.size_bytes
+                
+                # Update registration (success)
+                reg.state = ModelState.RESIDENT
+                reg.buffer_start_offset = start_offset
+                reg.buffer_end_offset = current_offset
+                reg.swap_timestamp = None
+                
+                logger.info(
+                    f"✅ Restored model {model_id[:16]}... to ring buffer: "
+                    f"{reg.total_bytes / 1024**3:.1f}GB at offset {start_offset / 1024**2:.1f}MB"
+                )
+                
+                return reg.total_bytes
+                
+            except Exception as e:
+                # Restore failed - roll back state
+                reg.state = original_state
+                logger.error(
+                    f"❌ Failed to restore model {model_id[:16]}..., "
+                    f"rolled back to state {original_state}: {e}"
+                )
+                raise
+    
+    def _allocate_contiguous_space(self, size_bytes: int, _defrag_attempted: bool = False) -> int:
+        """
+        Allocate contiguous space in buffer, potentially triggering defragmentation.
+        
+        MUST be called with lock held.
+        
+        Args:
+            size_bytes: Size to allocate
+            _defrag_attempted: Internal flag to prevent infinite recursion
+            
+        Returns:
+            Start offset of allocated space
+            
+        Raises:
+            RuntimeError: If cannot allocate even after defragmentation
+        """
+        # Find contiguous free space
+        resident_models = [
+            (reg.buffer_start_offset, reg.buffer_end_offset, model_id)
+            for model_id, reg in self.registrations.items()
+            if reg.state == ModelState.RESIDENT
+        ]
+        
+        # Sort by start offset
+        resident_models.sort(key=lambda x: x[0])
+        
+        # Check gaps between models
+        last_end = 0
+        for start, end, _ in resident_models:
+            gap_size = start - last_end
+            if gap_size >= size_bytes:
+                # Found a gap
+                logger.debug(f"Found gap at offset {last_end}: {gap_size / 1024**2:.1f}MB")
+                return last_end
+            last_end = end
+        
+        # Check space at end
+        if self.capacity_bytes - last_end >= size_bytes:
+            logger.debug(f"Found space at end: offset {last_end}, {(self.capacity_bytes - last_end) / 1024**2:.1f}MB available")
+            return last_end
+        
+        # No contiguous space - need defragmentation
+        if _defrag_attempted:
+            # Already tried defragmentation, still no space
+            raise RuntimeError(
+                f"Cannot allocate {size_bytes / 1024**3:.1f}GB even after defragmentation. "
+                f"Resident: {sum(reg.total_bytes for reg in self.registrations.values() if reg.state == ModelState.RESIDENT) / 1024**3:.1f}GB, "
+                f"Capacity: {self.capacity_bytes / 1024**3:.1f}GB"
+            )
+        
+        logger.info(
+            f"No contiguous space for {size_bytes / 1024**2:.1f}MB, "
+            f"triggering defragmentation..."
+        )
+        self._defragment()
+        
+        # After defragmentation, space should be at end
+        resident_bytes = sum(
+            reg.total_bytes for reg in self.registrations.values()
+            if reg.state == ModelState.RESIDENT
+        )
+        
+        if self.capacity_bytes - resident_bytes < size_bytes:
+            raise RuntimeError(
+                f"Cannot allocate {size_bytes / 1024**3:.1f}GB even after defragmentation. "
+                f"Need {size_bytes / 1024**3:.1f}GB, have {(self.capacity_bytes - resident_bytes) / 1024**3:.1f}GB"
+            )
+        
+        # Return the space at the end (after compacted models)
+        return resident_bytes
+    
+    def _defragment(self) -> None:
+        """
+        Compact resident models to start of buffer to create contiguous free space.
+        
+        Uses Device-to-Device copy (2TB/s on H100) which is cheap compared to PCIe.
+        
+        HANDLES WRAPPED MODELS: If a model wraps around buffer end (old_end < old_start),
+        we copy it in two parts: [old_start:capacity] and [0:old_end].
+        
+        MUST be called with lock held.
+        """
+        logger.info("Starting ring buffer defragmentation...")
+        
+        # Get all resident models sorted by current start offset
+        resident_models = [
+            (reg.buffer_start_offset, model_id, reg)
+            for model_id, reg in self.registrations.items()
+            if reg.state == ModelState.RESIDENT
+        ]
+        resident_models.sort(key=lambda x: x[0])
+        
+        if not resident_models:
+            logger.info("No resident models to defragment")
+            return
+        
+        # Compact models to start of buffer
+        new_offset = 0
+        models_moved = 0
+        
+        for old_start, model_id, reg in resident_models:
+            old_end = reg.buffer_end_offset
+            
+            # Check if model wraps around buffer (skip-end case)
+            is_wrapped = old_end < old_start
+            
+            if is_wrapped:
+                # Model wraps: [old_start:capacity] + [0:old_end]
+                model_size = (self.capacity_bytes - old_start) + old_end
+                
+                logger.debug(
+                    f"Model {model_id} is wrapped: [{old_start}:{self.capacity_bytes}] + [0:{old_end}], "
+                    f"total size: {model_size / 1024**2:.1f}MB"
+                )
+                
+                # Copy in two parts
+                # Part 1: [old_start:capacity] -> [new_offset:new_offset+part1_size]
+                part1_size = self.capacity_bytes - old_start
+                src_view1 = self.buffer[old_start:self.capacity_bytes]
+                dst_view1 = self.buffer[new_offset:new_offset + part1_size]
+                dst_view1.copy_(src_view1)
+                
+                # Part 2: [0:old_end] -> [new_offset+part1_size:new_offset+model_size]
+                src_view2 = self.buffer[0:old_end]
+                dst_view2 = self.buffer[new_offset + part1_size:new_offset + model_size]
+                dst_view2.copy_(src_view2)
+                
+            else:
+                # Normal contiguous model
+                if old_start == new_offset:
+                    # Already at correct position
+                    new_offset += reg.total_bytes
+                    continue
+                
+                model_size = old_end - old_start
+                
+                # Device-to-device copy (fast!)
+                src_view = self.buffer[old_start:old_end]
+                dst_view = self.buffer[new_offset:new_offset + model_size]
+                dst_view.copy_(src_view)
+            
+            # Update all layer allocations for this model
+            # All layers now start from new_offset (no wrapping after defrag)
+            layer_offset = new_offset
+            for layer_name in reg.layer_names:
+                alloc = reg.layer_allocations[layer_name]
+                if alloc.is_resident and alloc.offset != -1:
+                    alloc.offset = layer_offset
+                    layer_offset += alloc.size_bytes
+            
+            # Update model's buffer tracking
+            reg.buffer_start_offset = new_offset
+            reg.buffer_end_offset = new_offset + model_size
+            
+            new_offset += model_size
+            models_moved += 1
+        
+        # Update global allocation offset to end of compacted models
+        self._global_allocation_offset = new_offset
+        
+        logger.info(
+            f"✅ Defragmentation complete: moved {models_moved} models, "
+            f"freed {(self.capacity_bytes - new_offset) / 1024**3:.1f}GB contiguous space, "
+            f"new allocation offset: {new_offset / 1024**2:.1f}MB"
+        )
+    
+    def get_model_state(self, model_id: str) -> Optional[ModelState]:
+        """Get current state of a model."""
+        with self.lock:
+            if model_id not in self.registrations:
+                return None
+            return self.registrations[model_id].state
+    
+    def get_model_weights_from_buffer(self, model_id: str) -> Dict[str, torch.Tensor]:
+        """
+        Extract model weights from ring buffer as GPU tensors.
+        
+        Used when evicting a model - need to get current GPU weights.
+        
+        Args:
+            model_id: Model identifier
+            
+        Returns:
+            Dict of param_name -> GPU tensor (views into buffer)
+        """
+        with self.lock:
+            if model_id not in self.registrations:
+                raise ValueError(f"Model {model_id} not registered")
+            
+            reg = self.registrations[model_id]
+            
+            if reg.state != ModelState.RESIDENT:
+                raise RuntimeError(
+                    f"Cannot extract weights: model {model_id} not resident "
+                    f"(state={reg.state})"
+                )
+            
+            weights = {}
+            for layer_name in reg.layer_names:
+                alloc = reg.layer_allocations[layer_name]
+                
+                # Only extract resident layers (skip streamed layers)
+                if alloc.is_resident and alloc.offset != -1:
+                    ring_view = self.buffer[
+                        alloc.offset : alloc.offset + alloc.size_bytes
+                    ].view(alloc.dtype).view(alloc.shape)
+                    
+                    # Clone to create independent tensor (not a view)
+                    weights[layer_name] = ring_view.clone()
+            
+            return weights
 
