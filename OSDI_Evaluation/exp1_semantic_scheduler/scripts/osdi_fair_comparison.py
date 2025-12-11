@@ -102,12 +102,20 @@ class DjinnBaseline:
                 resident = self.ring_buffer.get_resident_models()
                 if resident:
                     victim = resident[0]
-                    weights = self.ring_buffer.get_model_weights_from_buffer(victim)
+                    # Try direct eviction method for better performance
+                    bytes_swapped = self.swap_pool.evict_model_direct(victim, self.ring_buffer)
+                    if bytes_swapped == 0:
+                        # Direct method failed (e.g., wrapped model), use per-tensor fallback
+                        logger.info(f"Direct eviction failed for {victim}, using fallback")
+                        weights = self.ring_buffer.get_model_weights_from_buffer(victim)
+                        self.swap_pool.evict_model_to_host(victim, weights)
                     self.ring_buffer.evict_model(victim)
-                    self.swap_pool.evict_model_to_host(victim, weights)
             
             # Register in ring buffer
             self.ring_buffer.register_model(model_name, state_dict)
+            
+            # Pre-allocate pinned buffer for fast eviction/restoration
+            self.swap_pool.preallocate_pinned_buffer(model_name, model_size)
             
             load_time = time.perf_counter() - load_start
             logger.info(f"  ✅ {model_name}: {model_size / 1024**3:.2f}GB in {load_time:.1f}s")

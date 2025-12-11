@@ -29,9 +29,22 @@ vLLM's failure is architectural: it completes only 22 of 30 requests (73\% succe
 
 \sys's P99 latency (14,905ms) is 2.8$\times$ higher than PyTorch Pinned (5,402ms), exposing the tail cost of memory virtualization. This worst-case occurs when the ring buffer must evict 19GB of resident models before loading a new 12.6GB model. Critically, this is a \textit{one-time} cold-start penalty: subsequent requests complete in $<$10ms. The mean latency of 2,522ms (vs 3,912ms for PyTorch Pinned) confirms that cold starts are rare and amortize across reuse.
 
-\textbf{Takeaway:} \sys converts the binary failure mode of existing systems (OOM/crash) into a continuous latency gradient, maintaining 100\% availability under capacity contention while achieving 3.1--13.1$\times$ speedup over working baselines.
+\sys converts the binary failure mode of existing systems (OOM/crash) into a continuous latency gradient, maintaining 100\% availability under capacity contention while achieving 3.1--13.1$\times$ speedup over working baselines.
 
+\paragraph{Ring Buffer Sensitivity Analysis.}
 
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\columnwidth]{Figures/buffer_sensitivity.pdf}
+    \caption{\textbf{Ring Buffer Sensitivity Analysis.} (a) P50 latency vs. buffer size shows \sys (blue) consistently outperforms PyTorch Pinned (green, constant at 4.3s) across all configurations with stable 3.07--3.13$\times$ speedup. The 25GB point (red circle) achieves 3.10$\times$ speedup. (b) Cache hit rate scales predictably from 53\% (20--25GB, constrained) to 100\% (32--40GB, sufficient capacity), validating that 25GB is a balanced operating point, not a cherry-picked optimum. All configurations achieved 100\% reliability.}
+    \label{fig:buffer_sensitivity}
+\end{figure}
+
+We conducted a sensitivity sweep, varying the ring buffer capacity from 20GB (1.57$\times$, highly constrained) to 40GB (0.78$\times$, under-subscribed), while maintaining the same workload.
+
+Figure~\ref{fig:buffer_sensitivity} presents the results. \sys demonstrates remarkable performance stability, with speedups over PyTorch Pinned ranging from \textbf{3.07$\times$ to 3.13$\times$} across the entire sweep. This consistency confirms that the performance gain is architectural---stemming from the ring buffer's zero-copy mechanism---rather than an artifact of parameter tuning.
+
+The cache hit rate (Figure~\ref{fig:buffer_sensitivity}b)\jw{make reference to this} scales predictably with capacity, exhibiting a phase transition at 32GB. Below this threshold (20--25GB), the system operates in a thrashing regime with $\sim$53\% cache hits, effectively managing partial residency. Above 32GB, the aggregate working set (31.3GB) fits entirely in the ring buffer, yielding 100\% cache hits. Critically, \sys achieved \textbf{100\% request reliability} even at the most constrained 20GB configuration, validating the robustness of the semantic scheduler under severe memory pressure.
 
 \subsection{Memory Virtualization and Fractional Residency}
 \label{ssec:eval_virt}

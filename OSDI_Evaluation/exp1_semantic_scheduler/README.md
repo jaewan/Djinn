@@ -61,6 +61,30 @@ exp1_semantic_scheduler/
         └── comparison_summary.json
 ```
 
+## Ring Buffer Sensitivity Analysis
+
+To validate that the 25GB configuration was not cherry-picked, we conducted a sensitivity sweep across multiple buffer sizes (20GB, 25GB, 32GB, 40GB).
+
+**Key Findings**:
+- Speedup is consistent: 3.07× to 3.13× across all buffer sizes
+- Cache hits scale predictably: 53% (constrained) → 100% (abundant)
+- 100% reliability at all configurations (30/30 requests completed)
+
+**Run the sensitivity sweep**:
+```bash
+cd scripts
+python3 run_buffer_sweep_isolated.py \
+  --buffer-sizes "20,25,32,40" \
+  --output-dir ../results/buffer_sweep_isolated
+
+# Generate figure
+python3 plot_buffer_sensitivity_real.py
+```
+
+**Important**: Use `run_buffer_sweep_isolated.py` (not `run_buffer_sweep.py`) to ensure process isolation and prevent memory leaks between baselines.
+
+---
+
 ## Quick Start
 
 ### 1. Generate Trace (Optional - already provided)

@@ -243,7 +243,16 @@ class ModelSwitchCoordinator:
                             eviction_count += 1
                     profile['eviction_ms'] = (time.perf_counter() - eviction_start) * 1000
                     
-                    # Restore model
+                    # CRITICAL: Wait for all evictions to complete before restoration
+                    # to avoid PCIe bandwidth contention between GPU->CPU and CPU->GPU
+                    if eviction_count > 0:
+                        evict_sync_start = time.perf_counter()
+                        await asyncio.to_thread(self.swap_pool.synchronize_all_evictions)
+                        profile['evict_sync_ms'] = (time.perf_counter() - evict_sync_start) * 1000
+                    else:
+                        profile['evict_sync_ms'] = 0.0
+                    
+                    # Restore model (now with full PCIe bandwidth)
                     restoration_start = time.perf_counter()
                     success = await self._restore_model(model_id)
                     profile['restoration_ms'] = (time.perf_counter() - restoration_start) * 1000
@@ -253,10 +262,12 @@ class ModelSwitchCoordinator:
                     
                     # Log detailed profile
                     total_ms = (time.perf_counter() - overall_start) * 1000
+                    evict_sync = profile.get('evict_sync_ms', 0.0)
                     logger.info(
                         f"Model switch {model_id[:16]}...: {total_ms:.1f}ms total "
                         f"(lock_wait={profile['lock_wait_ms']:.1f}ms, "
                         f"eviction={profile['eviction_ms']:.1f}ms [{eviction_count} models], "
+                        f"evict_sync={evict_sync:.1f}ms, "
                         f"restoration={profile['restoration_ms']:.1f}ms)"
                     )
                     
@@ -334,7 +345,8 @@ class ModelSwitchCoordinator:
     
     async def _evict_model(self, model_id: str) -> bool:
         """
-        Evict a model from ring buffer to swap pool.
+        Evict a model from ring buffer to swap pool using DIRECT streaming.
+        Falls back to per-tensor method if direct fails (e.g., wrapped models).
         
         Args:
             model_id: Model to evict
@@ -344,54 +356,67 @@ class ModelSwitchCoordinator:
         """
         # PROFILING: Track eviction timing
         evict_start = time.perf_counter()
-        profile = {
-            'get_weights_ms': 0,
-            'ring_buffer_evict_ms': 0,
-            'swap_pool_transfer_ms': 0,
-        }
         
         try:
-            # Get model weights from ring buffer
-            get_weights_start = time.perf_counter()
-            weights = self.ring_buffer.get_model_weights_from_buffer(model_id)
-            profile['get_weights_ms'] = (time.perf_counter() - get_weights_start) * 1000
+            # OPTIMIZED: Try direct stream from ring buffer to pinned buffer (single bulk copy)
+            bytes_swapped = await asyncio.to_thread(
+                self.swap_pool.evict_model_direct,
+                model_id,
+                self.ring_buffer,
+                0  # gpu_device
+            )
             
-            if not weights:
-                logger.error(f"Cannot get weights for {model_id[:16]}...")
-                return False
+            if bytes_swapped == 0:
+                # Direct method failed (e.g., wrapped model), fall back to per-tensor method
+                logger.info(f"Direct eviction not available for {model_id[:16]}..., using fallback")
+                
+                # Get weights and use old method
+                weights = self.ring_buffer.get_model_weights_from_buffer(model_id)
+                if not weights:
+                    logger.error(f"Cannot get weights for {model_id[:16]}...")
+                    return False
+                
+                # Evict from ring buffer first
+                bytes_freed = self.ring_buffer.evict_model(model_id)
+                if bytes_freed == 0:
+                    logger.error(f"Ring buffer eviction returned 0 bytes for {model_id[:16]}...")
+                    return False
+                
+                # Move to swap pool using old method
+                bytes_swapped = await asyncio.to_thread(
+                    self.swap_pool.evict_model_to_host,
+                    model_id,
+                    weights,
+                    0  # gpu_device
+                )
+                
+                if bytes_swapped == 0:
+                    logger.error(f"Swap pool rejected {model_id[:16]}...")
+                    return False
+                
+                total_ms = (time.perf_counter() - evict_start) * 1000
+                bandwidth_gbps = (bytes_freed / 1024**3) / (total_ms / 1000) if total_ms > 0 else 0
+                logger.info(
+                    f"✅ Evicted model {model_id[:16]}... (FALLBACK): "
+                    f"{bytes_freed / 1024**3:.1f}GB freed from GPU in {total_ms:.1f}ms "
+                    f"({bandwidth_gbps:.1f} GB/s)"
+                )
+                return True
             
-            # Evict from ring buffer (marks as SWAPPED)
-            rb_evict_start = time.perf_counter()
+            # Direct method succeeded
+            # Mark model as evicted in ring buffer (just updates state)
             bytes_freed = self.ring_buffer.evict_model(model_id)
-            profile['ring_buffer_evict_ms'] = (time.perf_counter() - rb_evict_start) * 1000
             
             if bytes_freed == 0:
                 logger.error(f"Ring buffer eviction returned 0 bytes for {model_id[:16]}...")
                 return False
             
-            # Move to swap pool
-            swap_start = time.perf_counter()
-            bytes_swapped = await asyncio.to_thread(
-                self.swap_pool.evict_model_to_host,
-                model_id,
-                weights,
-                0  # gpu_device
-            )
-            profile['swap_pool_transfer_ms'] = (time.perf_counter() - swap_start) * 1000
-            
-            if bytes_swapped == 0:
-                logger.error(f"Swap pool rejected {model_id[:16]}...")
-                # Try to restore ring buffer state
-                # (This is best-effort recovery)
-                return False
-            
             total_ms = (time.perf_counter() - evict_start) * 1000
+            bandwidth_gbps = (bytes_freed / 1024**3) / (total_ms / 1000) if total_ms > 0 else 0
             logger.info(
-                f"✅ Evicted model {model_id[:16]}...: "
+                f"✅ Evicted model {model_id[:16]}... (DIRECT): "
                 f"{bytes_freed / 1024**3:.1f}GB freed from GPU in {total_ms:.1f}ms "
-                f"(get_weights={profile['get_weights_ms']:.1f}ms, "
-                f"rb_evict={profile['ring_buffer_evict_ms']:.1f}ms, "
-                f"swap_transfer={profile['swap_pool_transfer_ms']:.1f}ms)"
+                f"({bandwidth_gbps:.1f} GB/s)"
             )
             
             return True
@@ -402,7 +427,7 @@ class ModelSwitchCoordinator:
     
     async def _restore_model(self, model_id: str) -> bool:
         """
-        Restore a model from swap pool to ring buffer.
+        Restore a model from swap pool to ring buffer using DIRECT streaming.
         
         Args:
             model_id: Model to restore
@@ -411,48 +436,31 @@ class ModelSwitchCoordinator:
             True if successful, False otherwise
         """
         # PROFILING: Track restoration timing
-        restore_overall_start = time.perf_counter()
-        profile = {
-            'swap_pool_fetch_ms': 0,
-            'ring_buffer_restore_ms': 0,
-        }
+        restore_start = time.perf_counter()
         
         try:
-            restore_start = time.perf_counter()
-            
-            # Restore from swap pool
-            swap_fetch_start = time.perf_counter()
-            gpu_weights = await asyncio.to_thread(
-                self.swap_pool.restore_model_from_host,
+            # OPTIMIZED: Direct stream from pinned buffer to ring buffer (single bulk copy)
+            bytes_restored = await asyncio.to_thread(
+                self.swap_pool.restore_model_direct,
                 model_id,
+                self.ring_buffer,
                 self.ring_buffer.device
             )
-            profile['swap_pool_fetch_ms'] = (time.perf_counter() - swap_fetch_start) * 1000
-            
-            if not gpu_weights:
-                logger.error(f"Swap pool returned empty weights for {model_id[:16]}...")
-                return False
-            
-            # Restore to ring buffer
-            rb_restore_start = time.perf_counter()
-            bytes_restored = self.ring_buffer.restore_model(model_id, gpu_weights)
-            profile['ring_buffer_restore_ms'] = (time.perf_counter() - rb_restore_start) * 1000
             
             if bytes_restored == 0:
-                logger.error(f"Ring buffer restore returned 0 bytes for {model_id[:16]}...")
+                logger.error(f"Direct restoration failed for {model_id[:16]}...")
                 return False
             
             restore_ms = (time.perf_counter() - restore_start) * 1000
-            total_ms = (time.perf_counter() - restore_overall_start) * 1000
+            bandwidth_gbps = (bytes_restored / 1024**3) / (restore_ms / 1000) if restore_ms > 0 else 0
             
             self.stats['restorations_performed'] += 1
             self.stats['total_switch_latency_ms'] += restore_ms
             
             logger.info(
-                f"✅ Restored model {model_id[:16]}...: "
-                f"{bytes_restored / 1024**3:.1f}GB in {total_ms:.1f}ms "
-                f"(swap_fetch={profile['swap_pool_fetch_ms']:.1f}ms, "
-                f"rb_restore={profile['ring_buffer_restore_ms']:.1f}ms)"
+                f"✅ Restored model {model_id[:16]}... (DIRECT): "
+                f"{bytes_restored / 1024**3:.1f}GB in {restore_ms:.1f}ms "
+                f"({bandwidth_gbps:.1f} GB/s)"
             )
             
             return True
