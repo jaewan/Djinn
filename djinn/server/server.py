@@ -3538,6 +3538,14 @@ class DjinnServer:
                     }
             except Exception as e:
                 logger.debug(f"Could not collect QoS scheduler metrics: {e}")
+            
+            # ✅ Add plan cache stats for ablation study
+            try:
+                from .meta_simulator import get_meta_simulator
+                simulator = get_meta_simulator()
+                snapshot["plan_cache"] = simulator.get_cache_stats()
+            except Exception as e:
+                logger.debug(f"Could not collect plan cache metrics: {e}")
         except Exception as exc:  # pragma: no cover - defensive
             snapshot["status"] = "error"
             snapshot["error"] = str(exc)

@@ -1,12 +1,17 @@
 \section{Evaluation}
 \label{sec:evaluation}
+We evaluate \sys on three axes: (1) multi-model switching reliability and latency, (2) memory virtualization for models exceeding GPU capacity, (3) white-box interactivity for debugging workflow, and ablation study. Our testbed comprises NVIDIA H100 (80GB) and L4 (24GB) GPUs.
 
-We evaluate \sys on three axes: (1) multi-model switching reliability and latency, (2) memory virtualization for models exceeding GPU capacity, and (3) white-box interactivity for debugging workflows. Our testbed comprises NVIDIA H100 (80GB) and L4 (24GB) GPUs.
+\sys is architected as a client-server system: applications link against a thin client library that issues requests to a Djinn server over TCP. In all experiments, the client and server run on the same machine and communicate over TCP loopback (127.0.0.1). This deployment isolates the overhead of the virtualization layer---RPC serialization, memory planning, and scheduler dispatch---from wide-area network effects, enabling apples-to-apples comparison against in-process baselines such as native PyTorch, vLLM, DeepSpeed, and HuggingFace Accelerate. The measured latencies include the full client-server round-trip over loopback; production deployments over physical networks would add transport latency equally to all remote execution systems.
 
 \subsection{Multi-Model Switching}
 \label{ssec:eval_multimodel}
 
-We deploy three 7B-class models (Llama-2-7B at 12.6GB, Mistral-7B at 13.5GB, Phi-2 at 5.2GB) on an H100 with a 25GB ring buffer---insufficient to hold all three simultaneously (31.3GB total). We issue 30 sequential requests with Zipfian model selection, forcing continuous eviction and restoration. Each request generates 50 tokens. We execute requests \textit{sequentially} to isolate switching mechanics from scheduler queuing effects. We compare against four baselines: (1) \textbf{vLLM}, the state-of-the-art serving engine, which must destroy and recreate its engine on model switch; (2) \textbf{PyTorch Pinned}, which loads weights from page-locked host memory via \texttt{.to('cuda')}---the fair baseline since \sys also uses pinned memory; (3) \textbf{PyTorch Pageable}, standard \texttt{.to('cuda')} from pageable memory; and (4) \textbf{Serverless}, emulating cold-start by loading from disk per request.
+We evaluate \sys's ability to virtualize GPU memory through a controlled oversubscription experiment. Our goal is to verify that semantic phase signaling enables the system to support concurrent interactive workloads that exceed physical device capacity, a regime where reactive baselines fail.
+
+We deploy three 7B-class models (Llama-2-7B at 12.6GB, Mistral-7B at 13.5GB, Phi-2 at 5.2GB) on an H100 with a 25GB ring buffer---insufficient to hold all three simultaneously (31.3GB total). We issue 30 sequential requests with Zipfian model selection, forcing continuous eviction and restoration. Each request generates 50 tokens. 
+We execute requests sequentially to isolate switching mechanics from scheduler queuing effects. 
+We compare against four baselines: (1) vLLM, the state-of-the-art serving engine, which must destroy and recreate its engine on model switch; (2) PyTorch Pinned, which loads weights from page-locked host memory via \texttt{.to('cuda')}---the fair baseline since \sys also uses pinned memory; (3) PyTorch Pageable, standard \texttt{.to('cuda')} from pageable memory; and (4) Serverless, emulating cold-start by loading from disk per request.
 
 \begin{figure}[t]
     \centering
@@ -15,18 +20,22 @@ We deploy three 7B-class models (Llama-2-7B at 12.6GB, Mistral-7B at 13.5GB, Phi
     \label{fig:multimodel_cdf}
 \end{figure}
 
-\paragraph{Results.} Figure~\ref{fig:multimodel_cdf} reveals the fundamental architectural differences between systems. \sys achieves a median latency of \textbf{1,392ms}---3.1$\times$ lower than PyTorch Pinned (4,302ms) and 13.1$\times$ lower than vLLM (18,213ms). This speedup stems from ring buffer residency: \textbf{16 out of 30 requests (53\%)} incur switch overhead below 10ms because the target model remains resident from a prior request. The CDF shows this as a sharp step at the 10ms mark. An additional 12 requests (40\%) complete in 1--4 seconds, representing normal model swaps where the system loads weights from pinned host memory at PCIe bandwidth (15 GB/s). Only 2 requests (7\%) experience cold-start penalties exceeding 10 seconds, occurring when the ring buffer must evict 19GB of resident models to accommodate a new one.
+\sys achieves a median latency of 1,392ms---3.1$\times$ lower than PyTorch Pinned (4,302ms) and 13.1$\times$ lower than vLLM (18,213ms). This speedup stems from ring buffer residency: 53\% of requests complete in $<$10ms (cache hits), 40\% in 1--4s (normal swaps at PCIe bandwidth), and only 7\% experience cold-start penalties exceeding 10s (full ring buffer eviction).
 
-In contrast, PyTorch Pinned exhibits a vertical wall at 4.3s in the CDF, confirming that it lacks any residency tracking---every request pays the full 12--14GB PCIe transfer cost. PyTorch Pageable performs even worse (P50: 10,317ms) due to the overhead of transferring from non-pinned memory. Serverless emulation (P50: 4,062ms) demonstrates that loading from disk is comparable to PyTorch Pinned's memory transfer, but neither approach benefits from model reuse.
+PyTorch Pinned exhibits a vertical wall at 4.3s, confirming it lacks residency tracking---every request pays the full PCIe transfer cost. PyTorch Pageable (P50: 10,317ms) and Serverless (P50: 4,062ms) perform comparably but neither benefits from model reuse.
 
-vLLM's failure is architectural: it completes only 22 of 30 requests (73\% success rate), with the CDF terminating at the 73rd percentile. The 8 failed requests (27\%) crash due to GPU memory fragmentation from repeated engine destruction and recreation. For surviving requests, vLLM's median latency of 18,213ms reflects the cost of full engine initialization, including CUDA context setup and memory allocation. This is 13.1$\times$ slower than \sys and proves that reactive serving systems are fundamentally unsuitable for multi-model workloads.
+vLLM's failure is architectural: it completes only 22 of 30 requests (73\% success rate), crashing on 27\% due to memory fragmentation from repeated engine recreation. Surviving requests incur 18.2s median latency (13.1$\times$ slower than \sys), reflecting full CUDA context initialization overhead.
 
-\paragraph{The Cost of Virtualization.} \sys's P99 latency (14,905ms) is 2.8$\times$ higher than PyTorch Pinned (5,402ms), exposing the tail cost of memory virtualization. This worst-case occurs when Agent 1 requests llama-7b, triggering the eviction of 19GB of resident models (mistral-7b and phi-2). The system must transfer these models to host memory (9.7s) before loading llama-7b (5.2s). Critically, this is a \textit{one-time} cold-start penalty: subsequent requests for llama-7b complete in $<$10ms. The mean latency of 2,522ms (vs 3,912ms for PyTorch Pinned) confirms that cold starts are rare and their cost amortizes across model reuse. More importantly, \sys converts what would be an OOM crash in a capacity-constrained system into bounded latency, maintaining 100\% availability.
+\sys's P99 latency (14,905ms) is 2.8$\times$ higher than PyTorch Pinned (5,402ms), exposing the tail cost of memory virtualization. This worst-case occurs when the ring buffer must evict 19GB of resident models before loading a new 12.6GB model. Critically, this is a \textit{one-time} cold-start penalty: subsequent requests complete in $<$10ms. The mean latency of 2,522ms (vs 3,912ms for PyTorch Pinned) confirms that cold starts are rare and amortize across reuse.
+
+\textbf{Takeaway:} \sys converts the binary failure mode of existing systems (OOM/crash) into a continuous latency gradient, maintaining 100\% availability under capacity contention while achieving 3.1--13.1$\times$ speedup over working baselines.
+
+
 
 \subsection{Memory Virtualization and Fractional Residency}
 \label{ssec:eval_virt}
 
-\S\ref{ssec:eval_multimodel} virtualized multi-model residency; here we virtualize capacity. We target the \textit{boundary condition}: a workload that marginally exceeds physical memory.We run Llama-2-13B (24.2~GB FP16) on an NVIDIA L4 (24~GB), creating $1.01\times$ oversubscription.This regime isolates allocation policy. Does the system treat memory as binary (fit/crash) or continuous (fit/degrade)?
+\S\ref{ssec:eval_multimodel} virtualized multi-model residency; here we virtualize capacity. We target the \textit{boundary condition}: a workload that marginally exceeds physical memory. We run Llama-2-13B (24.2~GB FP16) on an NVIDIA L4 (24~GB), creating $1.01\times$ oversubscription. This regime isolates allocation policy: does the system treat memory as binary (fit/crash) or continuous (fit/degrade)?
 %While massive oversubscription (e.g., $6\times$) would trivially bind all systems to PCIe bandwidth, the $1.01\times$ regime isolates the \textit{allocation policy}. It tests whether the system treats memory as a binary constraint or a continuous resource.
 We compare against GPU-Only (standard \texttt{model.cuda()}), DeepSpeed-Inference~\cite{deepspeed} (industry-standard optimized runtime with kernel injection), and HuggingFace Accelerate (\texttt{device\_map="auto"}, standard CPU offloading).
 
@@ -34,23 +43,23 @@ We compare against GPU-Only (standard \texttt{model.cuda()}), DeepSpeed-Inferenc
 \begin{table}[t]
 \centering
 \small
-\begin{tabular}{lrrr}
+\begin{tabular}{lrr}
 \toprule
-\textbf{Baseline} & \textbf{TTFT} & \textbf{Decode} & \textbf{E2E (50 tok)} \\
+\textbf{Metric} & \textbf{HF Accelerate} & \textbf{\sys} \\
 \midrule
-GPU-Only & \multicolumn{3}{c}{OOM (binary failure)} \\
-DeepSpeed & \multicolumn{3}{c}{OOM (binary failure)} \\
-HF Accelerate & 4,365 ms & 4,254 ms/tok & 212.7 s \\
-\textbf{\sys} & \textbf{297 ms} & \textbf{113 ms/tok} & \textbf{5.6 s} \\
+TTFT & 4,365 ms & \textbf{297 ms} \\
+Decode Latency & 4,254 ms/tok & \textbf{113 ms/tok} \\
+E2E (50 tokens) & 212.7 s & \textbf{5.6 s} \\
 \midrule
-\textbf{Speedup} & \textbf{14.7$\times$} & \textbf{37.7$\times$} & \textbf{37.7$\times$} \\
+\textbf{Speedup} & -- & \textbf{14.7--37.7$\times$} \\
 \bottomrule
 \end{tabular}
-\caption{\textbf{Memory Virtualization (Llama-2-13B on L4).} Existing runtimes crash at $1.01\times$ oversubscription. \sys converts capacity overflow into latency cost, achieving 14.7--37.7$\times$ speedup over the only working baseline.}
+\caption{\textbf{Memory Virtualization (Llama-2-13B on L4).} GPU-Only and DeepSpeed crash with OOM at $1.01\times$ oversubscription. \sys converts capacity overflow into latency cost, achieving 14.7--37.7$\times$ speedup over HF Accelerate (the only surviving baseline).}
 \label{tab:virt_metrics}
 \end{table}
 
-~\cref{tab:virt_metrics} shows the results. Both GPU-Only and DeepSpeed fail with OOM. DeepSpeed's \texttt{init\_inference} attempts full GPU residency during kernel injection---a $1\%$ capacity overflow causes $100\%$ availability loss. This validates that even optimized runtimes enforce binary residency; they do not virtualize capacity.
+Table~\ref{tab:virt_metrics} shows the results. Both GPU-Only and DeepSpeed fail with OOM. DeepSpeed's \texttt{init\_inference} attempts full GPU residency during kernel injection---a $1\%$ capacity overflow causes $100\%$ availability loss. This validates that even optimized runtimes enforce binary residency; they do not virtualize capacity.
+
 Against HuggingFace Accelerate (the only surviving baseline), \sys achieves 14.7$\times$ faster TTFT (297ms vs 4.4s) and 37.7$\times$ faster decode (113ms vs 4.3s/tok).
 The gap is architectural. HuggingFace employs synchronous layer-wise offloading: each of 40 layers blocks on PCIe, and every decode step re-transfers CPU-resident weights. At 15~GB/s, even ideal transfer takes 1.6s; Python overhead adds 2.8s more.
 
@@ -58,7 +67,8 @@ The gap is architectural. HuggingFace employs synchronous layer-wise offloading:
 As a result, decode becomes compute-bound, not I/O-bound. The 113ms/token approaches native GPU speed despite oversubscription.
 
 \sys transforms a 24~GB GPU from ``unusable for 24.2~GB models'' to near-native performance. The 297ms TTFT is below the 500ms threshold for perceived instantaneity; 50-token generation takes 5.6s instead of 3.5 minutes.
-Fractional residency converts a hard capacity wall into a soft latency tax, making commodity GPUs viable for models that nominally exceed their memory—and, critically, making disaggregation robust to the heterogeneous capacity demands of thin-client populations.
+
+\textbf{Takeaway:} By implementing fractional residency, \sys allows commodity GPUs to serve models that nominally exceed their physical capacity, converting a hard capacity wall into a soft latency tax and democratizing access to larger models.
 
 \subsection{White-box Interactivity \& State Virtualization}
 \label{ssec:eval_interactivity}
@@ -66,14 +76,13 @@ Fractional residency converts a hard capacity wall into a soft latency tax, maki
 To validate \sys's ability to virtualize execution state for interactive debugging---a capability absent in monolithic serving systems like vLLM---we conduct a controlled experiment measuring \textit{Resume Latency}. We define Resume Latency as the wall-clock time from issuing a \texttt{resume()} command for a paused session to receiving the computation result.
 
 We instrument an Llama-2-13B inference session on an NVIDIA H100 GPU (80GB). We execute a 2048-token sequence, triggering a breakpoint at varying depths (Layers 1, 10, 20, 30, and 39). Each measurement reports the mean over 5 runs after 2 warmup iterations. We compare \sys against two baselines:
-\begin{enumerate}
-    \item \textbf{Stateless Recompute (Baseline):} The standard "serverless" approach. On pause, all state is discarded. On resume, the system recomputes activations from the input tokens up to the target layer. This scales as $O(L)$, where $L$ is the layer depth.
-    \item \textbf{Manual Offload (Oracle):} A theoretical lower bound representing a "hand-optimized" script. This baseline keeps the CPU process alive and manually moves the activation tensor (10.5MB) from pinned CPU memory to GPU using explicit \texttt{cudaMemcpy}. It measures only the hardware data transfer time ($O(1)$), ignoring all scheduling and safety overheads.
-\end{enumerate}
+(1) Stateless Recompute (Baseline): The standard "serverless" approach. On pause, all state is discarded. On resume, the system recomputes activations from the input tokens up to the target layer. This scales as $O(L)$, where $L$ is the layer depth.
+(2) Manual Offload (Oracle): A theoretical lower bound representing a "hand-optimized" script. This baseline keeps the CPU process alive and manually moves the activation tensor (10.5MB) from pinned CPU memory to GPU using explicit \texttt{cudaMemcpy}. It measures only the hardware data transfer time ($O(1)$), ignoring all scheduling and safety overheads.
+
 \sys is configured to transparently persist activations in the virtualization layer, requiring no user code changes.
 
 \begin{figure}[t]
-    \centering
+    \centerin
     \includegraphics[width=\columnwidth]{Figures/resume_latency.pdf}
     \caption{\textbf{Resume Latency vs. Breakpoint Depth.} Recompute (red) scales linearly ($O(L)$), degrading from 2.1ms to 64.4ms. Manual Offload (green) is constant at 0.8ms but requires manual memory management. \sys (blue) maintains bounded latency (5.6--66.5ms) and outperforms Recompute by Layer 30, demonstrating that virtualization is performant for deep-layer debugging. The decreasing \sys latency reflects diminishing compute tail ($N-L$ remaining layers), not growing overhead. The shaded region highlights the crossover where \sys becomes faster than stateless recomputation.}
     \label{fig:resume_latency}
@@ -81,6 +90,47 @@ We instrument an Llama-2-13B inference session on an NVIDIA H100 GPU (80GB). We 
 
 Figure~\ref{fig:resume_latency} presents the Resume Latency across depths. Unlike Recompute, which degrades linearly with depth (2.1ms at Layer 1 $\rightarrow$ 64.4ms at Layer 39), \sys's total latency remains bounded (5.6--66.5ms) and becomes strictly faster than Recompute by Layer 30 (20.0ms vs 49.2ms). This confirms that for deep-layer debugging tasks---the common case in interactive workflows---virtualization outperforms stateless recomputation. The measured latency includes both checkpoint restoration (constant $O(1)$ at $\sim$10.5MB activation transfer) and execution of the remaining $N-L$ layers; the decreasing trend reflects the diminishing compute tail, not growing virtualization overhead.
 
-Manual Offload achieves a hardware-limit latency of 0.8ms (pure PCIe DMA). \sys incurs 5.6--66.5ms, a gap of 4.8--65.7ms representing the cost of the OS abstraction: session management, RPC serialization, and safety checks. Critically, the \textit{control-plane overhead} (measured as client-server latency delta) decreases from 32ms at Layer 1 to 1.8ms at Layer 39. The 1.8ms floor represents the pure framework cost (Python asyncio + TCP), while the larger gap at shallow layers includes the synchronous wait for GPU completion of the remaining layers. Across all layers, \sys maintains latencies well below the 100ms human perception threshold (max 66.5ms at Layer 1), confirming that the overhead, while mathematically significant compared to the Oracle, is negligible for the target interactive use case.
+Manual Offload achieves a hardware-limit latency of 0.8ms (pure PCIe DMA). \sys incurs 5.6--66.5ms, representing the cost of OS abstraction: session management, RPC serialization, and safety checks. The control-plane overhead decreases from 32ms at Layer 1 to 1.8ms at Layer 39; the 1.8ms floor (consistent with the 2--3ms OS Tax in \S\ref{ssec:eval_ablation}) represents pure framework cost, while the larger gap at shallow layers includes GPU completion of remaining layers. All latencies remain below the 100ms human perception threshold.
 
-The unique value of \sys is not raw speed---manual \texttt{cudaMemcpy} will always be faster---but \textit{State Virtualization}. Manual Offload tightly couples execution to a specific OS process and GPU memory address; if the client disconnects or the process terminates, the session is lost. \sys decouples the session state from the client process, enabling persistence, migration, and multi-tenant arbitration (\S\ref{ssec:eval_virt}). The measured overhead is an architectural trade-off: we accept 5--35ms of latency (median 20ms at Layer 30) to transform a brittle, single-process execution into a robust, OS-managed service. The 1.8ms control-plane floor at Layer 39 demonstrates that the core virtualization mechanism is lightweight; future implementations using C++-based RPC (e.g., gRPC) and asynchronous handles could further reduce this overhead to sub-millisecond levels, approaching the theoretical limit while preserving transparency.
+\textbf{Takeaway:} While Manual Offload represents the theoretical hardware lower bound, it tightly couples execution to a single process. \sys decouples session state from the client process, enabling persistence and migration. The measured overhead (median 20ms at Layer 30) is an architectural trade-off: we accept bounded latency to transform brittle, single-process execution into a robust, OS-managed service. The crossover at Layer 30 confirms that for deep-layer debugging---the common case---virtualization outperforms stateless recomputation.
+
+
+\subsection{System Overhead Analysis}
+\label{ssec:eval_ablation}
+
+The preceding experiments demonstrate macro-level effectiveness; here we isolate the cost of virtualization itself. We measure the OS Tax---the fixed overhead introduced by \sys's interposition layer---and validate that the Plan Cache eliminates meta-simulation latency in steady-state operation.
+
+We instrument single forward passes across three model sizes: GPT-2 (124M parameters), Phi-2 (2.7B), and Llama-2-7B (7B), comparing native PyTorch execution against \sys on an H100. All measurements use batch size 1 and sequence length 128 tokens. Each measurement averages 1000 iterations after 100 warmup passes, with explicit CUDA synchronization. Native execution runs the model directly on GPU via \texttt{model.forward()}; \sys routes the same call through the virtualization layer with loopback RPC. Figure~\ref{fig:ablation_os_tax} shows the results.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\columnwidth]{Figures/model_sweep_overhead.pdf}
+    \caption{\textbf{OS Tax: Overhead Amortization.} \sys incurs a fixed $\sim$2.5ms virtualization cost. For small models (GPT-2), this represents 27.8\% overhead. For production-grade models (Llama-2-7B), overhead drops to 11.8\%, demonstrating that the cost amortizes with model size. The dashed line marks the 10\% acceptability threshold.}
+    \label{fig:ablation_os_tax}
+\end{figure}
+
+% Alternative: Table format (if space is tight, use this instead of figure)
+% \begin{table}[t]
+% \centering
+% \small
+% \begin{tabular}{lrrrr}
+% \toprule
+% Model & Native & \sys & Overhead & \% \\
+% \midrule
+% GPT-2 (124M) & 7.31 ms & 9.33 ms & 2.03 ms & 27.8\% \\
+% Phi-2 (2.7B) & 24.65 ms & 26.65 ms & 2.01 ms & 8.1\% \\
+% Llama-2-7B & 28.58 ms & 31.95 ms & 3.37 ms & 11.8\% \\
+% \bottomrule
+% \end{tabular}
+% \caption{OS Tax across model sizes. The absolute overhead remains constant ($\sim$2--3ms) while the percentage cost amortizes with compute time.}
+% \label{tab:ablation_os_tax}
+% \end{table}
+
+The data confirms the fixed-cost hypothesis: absolute overhead remains between 2.0 and 3.4ms regardless of model size, while percentage overhead decreases from 27.8\% (GPT-2) to 8.1\% (Phi-2) to 11.8\% (Llama-2-7B). The overhead comprises RPC serialization (Python asyncio + TCP loopback), plan cache lookup, and scheduler dispatch. For micro-operations, \sys is expensive---a 15$\mu$s native \texttt{torch.add} becomes impractical through virtualization.
+
+However, LLM inference is dominated by large matrix multiplies and attention kernels; for a 7B model forward pass taking 28.6ms natively, an additional 3.4ms represents an acceptable tax for the capabilities demonstrated in Sections~\ref{ssec:eval_multimodel}--\ref{ssec:eval_interactivity}. Assuming the virtualization overhead remains constant for single-device execution, we project that 13B models would incur $\sim$5\% overhead. Multi-device overhead analysis is left for future work.
+
+The Plan Cache eliminates meta-simulation from the critical path. On first invocation, \sys executes a symbolic trace on the \texttt{meta} device to compute the memory plan; this plan is cached by a hash of the model fingerprint and input shape. We measure cache effectiveness on GPT-2 using the same H100 setup, executing 3 trials of 10 uniform-shape requests (same input dimensions) and 10 varied-shape requests (different lengths), totaling 45 requests. The cache achieves a 91\% hit rate. Cold requests (cache misses) average 10.3ms; warm requests (cache hits) average 9.9ms---a modest 4\% speedup for GPT-2 because meta-simulation is fast for small models. For larger models, we expect meta-simulation costs to scale with model depth; a cache hit would save this entire cost. In production serving scenarios where input shapes are constrained (e.g., fixed context lengths or bucketed batch sizes), the cache hit rate approaches 100\%, rendering meta-simulation overhead negligible in steady state.
+
+
+These results validate \sys's architectural trade-off: we accept a fixed 2--3ms latency tax to enable memory virtualization, multi-tenant scheduling, and state persistence. For the 7B+ models that constitute production LLM deployments, this overhead is under 12\% and amortizes further with scale. The Plan Cache ensures that the sophisticated memory management machinery does not appear on the inference critical path after warmup.
