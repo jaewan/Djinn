@@ -3,6 +3,7 @@
 We evaluate \sys on three axes: (1) multi-model switching reliability and latency, (2) memory virtualization for models exceeding GPU capacity, (3) white-box interactivity for debugging workflow, and ablation study. Our testbed comprises NVIDIA H100 (80GB) and L4 (24GB) GPUs.
 
 \sys is architected as a client-server system: applications link against a thin client library that issues requests to a Djinn server over TCP. In all experiments, the client and server run on the same machine and communicate over TCP loopback (127.0.0.1). This deployment isolates the overhead of the virtualization layer---RPC serialization, memory planning, and scheduler dispatch---from wide-area network effects, enabling apples-to-apples comparison against in-process baselines such as native PyTorch, vLLM, DeepSpeed, and HuggingFace Accelerate. The measured latencies include the full client-server round-trip over loopback; production deployments over physical networks would add transport latency equally to all remote execution systems.
+All experiments use batch size 1 and sequence length 128 tokens unless otherwise specified. GPU memory allocation follows PyTorch's default device placement; explicit CUDA synchronization ensures accurate timing measurements.
 
 \subsection{Multi-Model Switching}
 \label{ssec:eval_multimodel}
@@ -10,7 +11,7 @@ We evaluate \sys on three axes: (1) multi-model switching reliability and latenc
 We evaluate \sys's ability to virtualize GPU memory through a controlled oversubscription experiment. Our goal is to verify that semantic phase signaling enables the system to support concurrent interactive workloads that exceed physical device capacity, a regime where reactive baselines fail.
 
 We deploy three 7B-class models (Llama-2-7B at 12.6GB, Mistral-7B at 13.5GB, Phi-2 at 5.2GB) on an H100 with a 25GB ring buffer---insufficient to hold all three simultaneously (31.3GB total). We issue 30 sequential requests with Zipfian model selection, forcing continuous eviction and restoration. Each request generates 50 tokens. 
-We execute requests sequentially to isolate switching mechanics from scheduler queuing effects. 
+We configure a 25GB ring buffer to create controlled 1.25× oversubscription, isolating the switching mechanism from raw capacity limits. The PCIe transfer overhead (measured at 15GB/s) scales linearly with model size; our cache hit rates and relative speedups generalize because the cost of a full reload vs. a cache hit remains proportional regardless of absolute model size. §4.2 validates the capacity axis with natural oversubscription (13B on 24GB L4).
 We compare against four baselines: (1) vLLM, the state-of-the-art serving engine, which must destroy and recreate its engine on model switch; (2) PyTorch Pinned, which loads weights from page-locked host memory via \texttt{.to('cuda')}---the fair baseline since \sys also uses pinned memory; (3) PyTorch Pageable, standard \texttt{.to('cuda')} from pageable memory; and (4) Serverless, emulating cold-start by loading from disk per request.
 
 \begin{figure}[t]
@@ -82,7 +83,7 @@ We instrument an Llama-2-13B inference session on an NVIDIA H100 GPU (80GB). We 
 \sys is configured to transparently persist activations in the virtualization layer, requiring no user code changes.
 
 \begin{figure}[t]
-    \centerin
+    \centering
     \includegraphics[width=\columnwidth]{Figures/resume_latency.pdf}
     \caption{\textbf{Resume Latency vs. Breakpoint Depth.} Recompute (red) scales linearly ($O(L)$), degrading from 2.1ms to 64.4ms. Manual Offload (green) is constant at 0.8ms but requires manual memory management. \sys (blue) maintains bounded latency (5.6--66.5ms) and outperforms Recompute by Layer 30, demonstrating that virtualization is performant for deep-layer debugging. The decreasing \sys latency reflects diminishing compute tail ($N-L$ remaining layers), not growing overhead. The shaded region highlights the crossover where \sys becomes faster than stateless recomputation.}
     \label{fig:resume_latency}
